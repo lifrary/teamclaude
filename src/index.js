@@ -1,13 +1,21 @@
 #!/usr/bin/env node
 
 import { spawnSync } from 'node:child_process';
-import { unlinkSync } from 'node:fs';
 import { createInterface } from 'node:readline';
-import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getServerStatePath, writeServerState, readServerState, clearServerState, readQuotaCache, writeQuotaCacheSync } from './config.js';
+import net from 'node:net';
+import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, loadState, saveState } from './config.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
+import { sameIdentity, orgKey, matchAccounts } from './identity.js';
+import * as alias from './alias.js';
+import { ensureCerts } from './mitm.js';
+import { Prober } from './prober.js';
+import { Warmer } from './warmer.js';
 import { TUI } from './tui.js';
+import { SxManager } from './sx.js';
+import { autoUpdate, checkForUpdate, currentVersion, runUpdate, installKind, PKG_NAME } from './updater.js';
+import { renderStatus } from './status-renderer.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -15,13 +23,6 @@ const command = args[0];
 switch (command) {
   case 'server':
     await serverCommand();
-    break;
-  case 'stop':
-    await stopCommand();
-    process.exit(0);
-    break;
-  case 'restart':
-    await restartCommand();
     break;
   case 'run':
     await runCommand();
@@ -50,20 +51,47 @@ switch (command) {
     await removeCommand();
     process.exit(0);
     break;
+  case 'priority':
+    await priorityCommand();
+    process.exit(0);
+    break;
   case 'disable':
-    await setEnabledCommand(false);
+    await setDisabledCommand(true);
     process.exit(0);
     break;
   case 'enable':
-    await setEnabledCommand(true);
-    process.exit(0);
-    break;
-  case 'priority':
-    await setPriorityCommand();
+    await setDisabledCommand(false);
     process.exit(0);
     break;
   case 'api':
     await apiCommand();
+    process.exit(0);
+    break;
+  case 'alias':
+    aliasCommand();
+    process.exit(0);
+    break;
+  case 'probe':
+    await probeCommand();
+    process.exit(0);
+    break;
+  case 'warmup':
+    await warmupCommand();
+    process.exit(0);
+    break;
+  case 'route':
+  case 'routes':
+    await routeCommand();
+    process.exit(0);
+    break;
+  case 'update':
+    await updateCommand();
+    process.exit(0);
+    break;
+  case 'version':
+  case '--version':
+  case '-V':
+    console.log(currentVersion() || 'unknown');
     process.exit(0);
     break;
   case 'help':
@@ -107,69 +135,49 @@ async function serverCommand() {
   }
 
   const threshold = config.switchThreshold || 0.98;
-  // An explicit numeric `reevalIntervalMs: 0` (or any number <= 0) disables the
-  // 5-minute periodic account re-switching. Require a finite number so a
-  // malformed value (false, "", "abc", null, ...) falls back to the default
-  // rather than silently disabling switching.
-  const reevalIntervalMs = Number.isFinite(config.reevalIntervalMs)
-    ? config.reevalIntervalMs
-    : 5 * 60 * 1000;
-  // Default per-account concurrency cap (max simultaneous in-flight requests an
-  // account handles before load spreads to the next account). A per-account
-  // `maxConcurrent` overrides this. Must be a positive number, else default 3.
-  const maxConcurrentDefault = Number.isFinite(config.maxConcurrentPerAccount) && config.maxConcurrentPerAccount >= 1
-    ? config.maxConcurrentPerAccount
-    : 3;
-  // Hard cap on the overflow wait-queue (requests waiting for a free slot when
-  // every account is at its cap). Bounds memory/FDs under a request flood.
-  const overflowQueueMaxDepth = Number.isFinite(config.overflowQueueMaxDepth) && config.overflowQueueMaxDepth >= 0
-    ? config.overflowQueueMaxDepth
-    : 256;
-  const accountManager = new AccountManager(accounts, threshold, reevalIntervalMs, maxConcurrentDefault, overflowQueueMaxDepth);
+  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp });
 
-  // Restore the last run's quota snapshot so a restart doesn't blank the
-  // dashboard (quota otherwise lives only in memory and is re-learned from
-  // traffic). Stale-safe: the proxy takes no traffic while down, expired
-  // windows are lazily swept, and a still-future throttle is re-applied.
-  const quotaCache = await readQuotaCache();
-  if (quotaCache?.accounts) {
-    accountManager.importQuotaState(quotaCache.accounts);
-    // Restore the active-account marker too (identity by name) so the sticky
-    // primary — and its warm prompt cache — carries across the restart.
-    const cur = quotaCache.currentAccount
-      && accountManager.accounts.find(a => a.name === quotaCache.currentAccount);
-    if (cur) accountManager.currentIndex = cur.index;
-    console.log(`[TeamClaude] Restored quota snapshot for ${quotaCache.accounts.length} account(s)`);
-  }
-  const saveQuotaSnapshot = () => writeQuotaCacheSync({
-    savedAt: new Date().toISOString(),
-    currentAccount: accountManager.accounts[accountManager.currentIndex]?.name || null,
-    accounts: accountManager.exportQuotaState(),
+  // Restore quota observed in a previous run so a restart doesn't lose rotation
+  // state (passive — we never call the API to re-learn it). Stale windows are
+  // cleared automatically on first use by _clearExpiredQuotas.
+  const savedState = await loadState().catch(err => {
+    console.error(`[TeamClaude] Could not read saved state: ${err.message}`);
+    return null;
   });
+  if (savedState?.quota) accountManager.restoreQuotaState(savedState.quota);
+
+  // With quota restored, pick the best account up front (highest priority /
+  // soonest-resetting weekly window) instead of defaulting to the first one.
+  accountManager.selectActiveAccount();
+
+  // Periodically persist quota (and once more on shutdown) to the state file.
+  const persistQuotaState = () =>
+    saveState({ quota: accountManager.exportQuotaState() })
+      .catch(err => console.error(`[TeamClaude] Failed to save quota state: ${err.message}`));
+  let quotaSaveInterval = null;
 
   // Persist refreshed tokens back to config (re-read from disk to avoid clobbering
   // accounts added externally, e.g. by `teamclaude import` while server is running)
   accountManager.onTokenRefresh((idx, newTokens) => {
     const account = accountManager.accounts[idx];
     if (!account) return;
-    // Keep the in-memory config.accounts in sync so a TUI saveConfig doesn't
-    // clobber fresh tokens. Match by IDENTITY (UUID first, then name) — not by the
-    // AccountManager index `idx`, which can point at a different config entry when
-    // a tokenless config account was skipped at load.
-    const memIdx = findConfigAccount(config, account);
-    if (memIdx >= 0) {
-      config.accounts[memIdx].accessToken = newTokens.accessToken;
-      config.accounts[memIdx].refreshToken = newTokens.refreshToken;
-      config.accounts[memIdx].expiresAt = newTokens.expiresAt;
+    // Keep config.accounts in sync so TUI saveConfig doesn't clobber fresh tokens
+    if (config.accounts[idx]) {
+      config.accounts[idx].accessToken = newTokens.accessToken;
+      config.accounts[idx].refreshToken = newTokens.refreshToken;
+      config.accounts[idx].expiresAt = newTokens.expiresAt;
     }
     atomicConfigUpdate(diskConfig => {
-      // Persist ONLY the refreshed account's tokens. We deliberately do NOT ingest
-      // disk-only accounts here: that loop existed to keep the old INDEX-based
-      // matching aligned, but matching is identity-based now (findConfigAccount),
-      // so it's unnecessary — and re-adding every disk account would resurrect one
-      // the TUI just deleted (whose save may not have committed yet). External
-      // account discovery stays in syncAccountsFromDisk (TUI R / restart).
-      // Match by UUID first, then by name — index may have shifted.
+      // Pick up any new accounts from disk so index matching stays correct
+      // (only add, don't refresh credentials — we're about to write the authoritative tokens)
+      for (const diskAcct of diskConfig.accounts) {
+        const known = config.accounts.some(a => sameIdentity(a, diskAcct));
+        if (!known) {
+          config.accounts.push(diskAcct);
+          accountManager.addAccount(diskAcct);
+        }
+      }
+      // Match by UUID first, then by name — index may have shifted
       const cfgIdx = findConfigAccount(diskConfig, account);
       if (cfgIdx >= 0) {
         diskConfig.accounts[cfgIdx].accessToken = newTokens.accessToken;
@@ -179,94 +187,159 @@ async function serverCommand() {
     }).catch(err => console.error(`[TeamClaude] Failed to save refreshed token: ${err.message}`));
   });
   const port = config.proxy.port;
-  const useTUI = process.stdout.isTTY && process.stdin.isTTY;
+  // Bind loopback by default so the proxy isn't reachable off-box (it injects
+  // account tokens and — via CONNECT — can relay arbitrarily). Opt into a wider
+  // bind explicitly with TEAMCLAUDE_HOST or config.proxy.host (e.g. '0.0.0.0'),
+  // in which case set proxy.apiKey so the auth gate protects remote clients.
+  const bindHost = process.env.TEAMCLAUDE_HOST || config.proxy.host || '127.0.0.1';
+  const headless = args.includes('--headless') || args.includes('--no-tui');
+  const useTUI = !headless && process.stdout.isTTY && process.stdin.isTTY;
+
+  // Opt-in background quota probe (config.quotaProbeSeconds, default 0 = off).
+  let prober = null;
+  // Opt-in keep-warm scheduler (config.warmupSeconds, default 0 = off).
+  let warmer = null;
+  const serverStartedAt = Date.now();
+
+  // sx.org proxy (IP-based-429 workaround). Dormant unless an API key is set in
+  // config.sx.apiKey; when set we provision a proxy and route upstream through it.
+  const sx = new SxManager({ log: console.error });
+  if (config.sx?.apiKey) {
+    const r = await sx.configure(config.sx.apiKey, config.sx.mode);
+    if (!r.ok) console.error(`[TeamClaude] sx.org disabled: ${r.error}`);
+  } else if (config.sx?.mode) {
+    await sx.setMode(config.sx.mode);
+  }
+
+  // Re-sync accounts from disk without a restart. The TUI's 'R' key, the
+  // POST /teamclaude/reload endpoint, and the CLI notify after add/change all
+  // funnel through here. Returns the number of newly added accounts. Also picks
+  // up a changed probe interval so `teamclaude probe` applies live.
+  const reloadAccounts = async () => {
+    const diskConfig = await loadConfig();
+    if (!diskConfig) return 0;
+    const added = await syncAccountsFromDisk(diskConfig, config, accountManager);
+    // Pick up route table edits (teamclaude route …, TUI editor, or a hand edit).
+    config.routes = diskConfig.routes || [];
+    accountManager.setRoutes(config.routes);
+    // Apply an sx.org key/mode change made on disk (e.g. via POST /teamclaude/reload).
+    const diskSxKey = diskConfig.sx?.apiKey || null;
+    const diskSxMode = diskConfig.sx?.mode || 'always';
+    if (diskSxKey !== sx.apiKey || diskSxMode !== sx.mode) {
+      config.sx = diskConfig.sx;
+      if (diskSxKey) await sx.configure(diskSxKey, diskSxMode);
+      else { sx.disable(); await sx.setMode(diskSxMode); }
+    }
+    if (prober) {
+      const ms = (diskConfig.quotaProbeSeconds || 0) * 1000;
+      if (ms !== prober.intervalMs) {
+        config.quotaProbeSeconds = diskConfig.quotaProbeSeconds || 0;
+        prober.reschedule(ms);
+      }
+    }
+    if (warmer) {
+      const ms = (diskConfig.warmupSeconds || 0) * 1000;
+      if (ms !== warmer.intervalMs) {
+        config.warmupSeconds = diskConfig.warmupSeconds || 0;
+        warmer.reschedule(ms);
+      }
+    }
+    return added;
+  };
 
   let tui = null;
   let hooks = {};
 
   if (useTUI) {
     tui = new TUI({
-      accountManager, config,
+      accountManager, config, sx,
       saveConfig: () => atomicConfigUpdate(async diskConfig => {
         // Write in-memory accounts as the authoritative state, preserving
         // extra disk-only fields (e.g. importFrom) where the account still exists.
         // Use live tokens from AccountManager (not the stale config.accounts copy).
-        const mapped = config.accounts.map(a => {
-          // Match the live account by IDENTITY — never by array index:
-          // resolveAccounts() can skip a tokenless/bad config entry, so
-          // config.accounts and accountManager.accounts are not index-aligned, and
-          // an index map would overlay the wrong account's credentials. Two-phase
-          // (UUID first, then name): a single `uuid===x || name===x` find could
-          // return an earlier same-name account before reaching the real UUID match.
-          const am = (a.accountUuid && accountManager.accounts.find(x => x.accountUuid === a.accountUuid))
-            || accountManager.accounts.find(x => x.name === a.name);
+        diskConfig.accounts = config.accounts.map((a, i) => {
+          const am = accountManager.accounts[i];
           const live = am ? {
             ...a,
             accessToken: am.credential,
             refreshToken: am.refreshToken,
             expiresAt: am.expiresAt,
           } : a;
-          const diskAcct = (a.accountUuid && diskConfig.accounts.find(d => d.accountUuid === a.accountUuid))
-            || diskConfig.accounts.find(d => d.name === a.name);
+          const diskAcct = diskConfig.accounts.find(d => sameIdentity(d, a));
           return diskAcct ? { ...diskAcct, ...live } : live;
         });
-        // The TUI's in-memory config is authoritative for the account SET (an
-        // account it deleted must stay deleted, not be resurrected from the disk
-        // copy this atomic update re-read). An account added to disk by an external
-        // `teamclaude import/login` while the TUI runs is reconciled on the next
-        // reload (R) / restart via syncAccountsFromDisk — not merged here, since we
-        // can't distinguish "added externally" from "deleted locally" at save time.
-        diskConfig.accounts = mapped;
+        // Persist sx.org settings (set/cleared from the TUI settings screen).
+        if (config.sx) diskConfig.sx = config.sx; else delete diskConfig.sx;
+        // Persist other runtime-tunable settings edited from the TUI.
+        if (config.switchThreshold != null) diskConfig.switchThreshold = config.switchThreshold;
+        if (config.quotaProbeSeconds != null) diskConfig.quotaProbeSeconds = config.quotaProbeSeconds;
+        if (config.warmupSeconds != null) diskConfig.warmupSeconds = config.warmupSeconds;
+        // Persist the route table (edited from the TUI routes screen).
+        if (config.routes != null) diskConfig.routes = config.routes;
       }),
-      syncAccounts: async () => {
-        const diskConfig = await loadConfig();
-        if (!diskConfig) return 0;
-        return syncAccountsFromDisk(diskConfig, config, accountManager);
-      },
-      // R also forces a fleet-wide quota re-measure. `server` is assigned below
-      // (before listen), and the TUI only starts inside the listen callback, so
-      // this closure never runs before the binding is initialized.
-      refreshQuota: () => server.refreshQuotaAll(),
-      onQuit: () => { server.close(() => process.exit(0)); },
+      syncAccounts: reloadAccounts,
+      // ctrl-c / q from the TUI: funnel through the same idempotent shutdown as
+      // POSIX signals (defined below). In raw mode ctrl-c never reaches the OS as
+      // a signal, so without this the process would only tear down via keypress.
+      onQuit: () => shutdown(),
     });
     hooks = {
       onRequestStart: (id, info) => tui.onRequestStart(id, info),
+      onRequestModel: (id, info) => tui.onRequestModel(id, info),
       onRequestRouted: (id, info) => tui.onRequestRouted(id, info),
       onRequestEnd: (id, info) => tui.onRequestEnd(id, info),
     };
   }
 
-  // If a TeamClaude server is already running on this config's port, don't try to
-  // bind on top of it — point the user at stop/restart instead of a raw EADDRINUSE.
-  const existing = await findRunningServer(config);
-  if (existing && existing.port === port) {
-    console.error(`[TeamClaude] A server is already running on port ${port}${existing.pid ? ` (pid ${existing.pid})` : ''}.`);
-    console.error('  See it:      teamclaude status');
-    console.error('  Stop it:     teamclaude stop');
-    console.error('  Restart it:  teamclaude restart');
-    process.exit(1);
-  }
+  // Expose reload to the proxy's control endpoint (works with or without TUI).
+  hooks.reload = reloadAccounts;
+  hooks.getStatusExtra = () => ({
+    server: {
+      startedAt: new Date(serverStartedAt).toISOString(),
+      uptimeSeconds: Math.round((Date.now() - serverStartedAt) / 1000),
+      port,
+      upstream: config.upstream || 'https://api.anthropic.com',
+    },
+    probe: prober?.getStatus() || {
+      enabled: false,
+      intervalSeconds: config.quotaProbeSeconds || 0,
+      running: false,
+      accounts: accountManager.accounts.map(account => ({
+        name: account.name,
+        status: account.type === 'oauth' ? 'never' : 'not-applicable',
+        lastProbedAt: null,
+        startedAt: null,
+        durationMs: null,
+        error: null,
+      })),
+    },
+    warm: warmer?.getStatus() || {
+      enabled: false,
+      intervalSeconds: config.warmupSeconds || 0,
+      running: false,
+      accounts: accountManager.accounts.map(account => ({
+        name: account.name,
+        status: (account.type === 'oauth' && !account.upstream) ? 'never' : 'not-applicable',
+        lastWarmedAt: null,
+        startedAt: null,
+        durationMs: null,
+        error: null,
+      })),
+    },
+  });
 
-  const server = createProxyServer(accountManager, config, hooks);
+  const server = createProxyServer(accountManager, config, hooks, sx);
   // Catch bind-time errors (e.g. EADDRINUSE) only. Once the socket is bound we
   // remove this handler so a later runtime 'error' isn't misreported as a
   // listen failure and exit the whole proxy.
   const onListenError = err => handleServerListenError(err, port);
   server.once('error', onListenError);
 
-  server.listen(port, () => {
+  server.listen(port, bindHost, () => {
+    // Bind succeeded: stop treating errors as listen failures, but keep a
+    // benign runtime handler so a later 'error' is logged rather than thrown.
     server.removeListener('error', onListenError);
-    // Record runtime state so `teamclaude status/stop/restart` can find us, and
-    // remove it on process exit (covers SIGINT/SIGTERM/TUI quit/normal exit). A
-    // SIGKILL leaves a stale file, which stop/server detect as dead and clean up.
-    writeServerState({ pid: process.pid, port, startedAt: new Date().toISOString(), config: getConfigPath() }).catch(() => {});
-    const stateP = getServerStatePath();
-    process.on('exit', () => { try { unlinkSync(stateP); } catch { /* already gone */ } });
-    // Persist the quota snapshot on every exit path (TUI quit, SIGINT/SIGTERM
-    // → server.close → process.exit) and every minute as a crash backstop
-    // (a SIGKILL loses at most the last interval). The 'exit' write is sync.
-    process.on('exit', saveQuotaSnapshot);
-    setInterval(saveQuotaSnapshot, 60_000).unref();
+    server.on('error', err => console.error(`[TeamClaude] Server error: ${err.message}`));
     if (tui) {
       tui.start();
       console.log(`Listening on port ${port} with ${accounts.length} account(s)`);
@@ -276,7 +349,7 @@ async function serverCommand() {
       console.log(sep);
       console.log('  TeamClaude Proxy');
       console.log(sep);
-      console.log(`  Port:       ${port}`);
+      console.log(`  Bind:       ${bindHost}:${port}${bindHost === '127.0.0.1' ? ' (localhost only)' : ' (reachable off-box — ensure proxy.apiKey is set)'}`);
       console.log(`  Accounts:   ${accounts.length}`);
       console.log(`  Threshold:  ${(threshold * 100).toFixed(0)}%`);
       console.log(`  Upstream:   ${config.upstream || 'https://api.anthropic.com'}`);
@@ -292,181 +365,54 @@ async function serverCommand() {
     }
   });
 
-  if (!tui) {
-    process.on('SIGINT', () => {
-      console.log('\n[TeamClaude] Shutting down...');
-      server.close(() => process.exit(0));
-    });
-    process.on('SIGTERM', () => {
-      console.log('\n[TeamClaude] Shutting down...');
-      server.close(() => process.exit(0));
-    });
+  // Persist quota every minute; unref so it never keeps the process alive.
+  quotaSaveInterval = setInterval(persistQuotaState, 60_000);
+  quotaSaveInterval.unref?.();
+
+  // Start the opt-in quota probe (no-op when quotaProbeSeconds is 0).
+  prober = new Prober(accountManager, { intervalMs: (config.quotaProbeSeconds || 0) * 1000 });
+  prober.start();
+
+  // Start the opt-in keep-warm scheduler (no-op when warmupSeconds is 0). It
+  // spawns a minimal `claude` per idle account through this proxy, pinned via
+  // /tc-acct/<index>, so needs our own port and proxy key.
+  warmer = new Warmer(accountManager, {
+    intervalMs: (config.warmupSeconds || 0) * 1000,
+    port,
+    apiKey: config.proxy?.apiKey,
+  });
+  warmer.start();
+
+  // Background self-update for a backgrounded (headless) server. Skipped under
+  // the TUI, where npm's install output would corrupt the display — interactive
+  // users update via `teamclaude run` (post-session) or `teamclaude update`.
+  if (!tui) autoUpdate({ config }).catch(() => {});
+
+  // One idempotent shutdown funnel for BOTH modes and BOTH triggers: POSIX
+  // signals (SIGINT/SIGTERM) and the TUI's ctrl-c / q keypress (which in raw mode
+  // never reaches the OS as a signal). Guards re-entry: a second ctrl-c — an
+  // impatient user, or a signal racing the keypress — forces an immediate exit
+  // instead of re-running teardown, which would re-arm server.close() and leak a
+  // 'close' listener on the server each time (MaxListenersExceededWarning).
+  let shuttingDown = false;
+  async function shutdown() {
+    if (shuttingDown) process.exit(0); // second ctrl-c: stop waiting, just go
+    shuttingDown = true;
+    try { tui?.stop(); } catch { /* terminal already restored */ }
+    if (!tui) console.log('\n[TeamClaude] Shutting down...');
+    prober?.stop();
+    warmer?.stop();
+    if (quotaSaveInterval) clearInterval(quotaSaveInterval);
+    await persistQuotaState();
+    // Don't linger waiting on keep-alive / streaming connections: actively
+    // destroy them so server.close() can complete promptly, and hard-exit after a
+    // short grace period in case anything still hangs.
+    setTimeout(() => process.exit(0), 2000).unref?.();
+    server.closeAllConnections?.();
+    server.close(() => process.exit(0));
   }
-}
-
-// ── server lifecycle: discover / stop / restart ─────────────
-
-// Function declaration (not a const arrow) so it is hoisted — these helpers run
-// from the top-level command switch, which executes before later `const` lines
-// in this module are initialized (temporal dead zone).
-function delay(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-/** Is a pid alive? EPERM = alive but not ours; ESRCH = gone. */
-function isPidAlive(pid) {
-  if (!pid) return false;
-  try { process.kill(pid, 0); return true; }
-  catch (e) { return e.code === 'EPERM'; }
-}
-
-async function waitForExit(pid, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (!isPidAlive(pid)) return true;
-    await delay(150);
-  }
-  return !isPidAlive(pid);
-}
-
-/**
- * Does a *TeamClaude* proxy answer on this port? Verifies the status endpoint
- * returns our JSON shape, not just any 200 — so a foreign process occupying the
- * port is NOT mistaken for our server (it falls through to the EADDRINUSE path).
- */
-async function probeServer(port, timeoutMs = 1500) {
-  if (!port) return false;
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-  try {
-    const res = await fetch(`http://127.0.0.1:${port}/teamclaude/status`, { signal: ctrl.signal });
-    if (!res.ok) return false;
-    const data = await res.json();
-    return Array.isArray(data?.accounts) && typeof data?.switchThreshold === 'number';
-  } catch { return false; }
-  finally { clearTimeout(timer); }
-}
-
-/** Best-effort: the pid listening on a TCP port (macOS/Linux via lsof). */
-function lsofPid(port) {
-  if (process.platform === 'win32') return null;
-  try {
-    const r = spawnSync('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-t'], { encoding: 'utf8' });
-    const pid = parseInt((r.stdout || '').trim().split('\n')[0], 10);
-    return Number.isInteger(pid) ? pid : null;
-  } catch { return null; }
-}
-
-/**
- * Locate a running TeamClaude server for this config's port, returning the pid
- * that ACTUALLY owns the listening socket — never a pid taken on faith from the
- * state file. That matters because a state file can be stale (the recorded pid
- * died and the OS recycled it for an unrelated process) or hand-written; trusting
- * it would let `stop` signal the wrong pid. So: confirm a TeamClaude-shaped server
- * answers on the port, then resolve the owner via `lsof`. The state file is only a
- * fallback for the pid when lsof can't determine it (and only if it's alive and
- * for this same port). Returns { pid, port } (pid may be null if undeterminable),
- * or null when nothing is listening.
- */
-async function findRunningServer(config) {
-  const configPort = config?.proxy?.port;
-  const state = await readServerState();
-
-  // Try the port the server ACTUALLY bound (recorded in the state file) first —
-  // it may differ from the current config port after the config was edited, and
-  // probing only the config port would miss (and then orphan) the live server.
-  const candidates = [];
-  if (state?.port) candidates.push(state.port);
-  if (configPort && configPort !== state?.port) candidates.push(configPort);
-
-  for (const port of candidates) {
-    if (!(await probeServer(port))) continue;
-    const ownerPid = lsofPid(port); // authoritative: who actually holds the socket
-    if (ownerPid) return { pid: ownerPid, port };
-    // lsof unavailable: trust the recorded pid only if alive AND recorded for THIS port.
-    if (state?.pid && state.port === port && isPidAlive(state.pid)) return { pid: state.pid, port };
-    return { pid: null, port };
-  }
-
-  // Nothing TeamClaude-shaped answers on any candidate port. Only drop the state
-  // file if its recorded pid is also gone — don't delete the discovery record for
-  // a server that's merely unreachable for a moment.
-  if (state && !(state.pid && isPidAlive(state.pid))) await clearServerState();
-  return null;
-}
-
-/**
- * Stop the running server: SIGTERM, wait for graceful exit, escalate to SIGKILL.
- * Returns { stopped, reason?, pid?, port? }.
- */
-async function stopRunningServer() {
-  const config = await loadConfig();
-  if (!config) return { stopped: false, reason: 'not-running' };
-
-  const found = await findRunningServer(config);
-  if (!found) { await clearServerState(); return { stopped: false, reason: 'not-running' }; }
-
-  const { pid, port } = found;
-  if (!pid) return { stopped: false, reason: 'no-pid', port };
-
-  try {
-    process.kill(pid, 'SIGTERM');
-  } catch (e) {
-    if (e.code === 'ESRCH') { await clearServerState(); return { stopped: true, pid, port }; }
-    if (e.code === 'EPERM') return { stopped: false, reason: 'eperm', pid, port };
-    throw e;
-  }
-
-  if (!(await waitForExit(pid, 6000))) {
-    try { process.kill(pid, 'SIGKILL'); } catch { /* may have just exited */ }
-    await waitForExit(pid, 2000);
-  }
-  if (isPidAlive(pid)) return { stopped: false, reason: 'failed', pid, port };
-
-  await clearServerState();
-  return { stopped: true, pid, port };
-}
-
-async function stopCommand() {
-  const r = await stopRunningServer();
-  if (r.stopped) {
-    console.log(`Stopped TeamClaude server (pid ${r.pid}, port ${r.port}).`);
-    return;
-  }
-  switch (r.reason) {
-    case 'not-running':
-      console.log('No TeamClaude server is running.');
-      return;
-    case 'no-pid':
-      console.error(`A server is responding on port ${r.port} but its PID is unknown (lsof unavailable).`);
-      console.error(`Stop it once with:  kill $(lsof -nP -iTCP:${r.port} -sTCP:LISTEN -t)`);
-      process.exit(1);
-      break;
-    case 'eperm':
-      console.error(`No permission to signal pid ${r.pid}.`);
-      process.exit(1);
-      break;
-    default:
-      console.error(`Failed to stop pid ${r.pid} on port ${r.port}.`);
-      process.exit(1);
-  }
-}
-
-async function restartCommand() {
-  const r = await stopRunningServer();
-  if (r.stopped) {
-    console.log(`Stopped previous server (pid ${r.pid}).`);
-  } else if (r.reason !== 'not-running') {
-    console.error(`Could not stop the existing server (${r.reason}); aborting restart.`);
-    if (r.reason === 'no-pid') {
-      console.error(`Stop it manually first:  kill $(lsof -nP -iTCP:${r.port} -sTCP:LISTEN -t)`);
-    }
-    process.exit(1);
-  }
-  // Wait for the port to be released before re-binding.
-  const port = (await loadConfig())?.proxy?.port;
-  for (let i = 0; i < 20 && await probeServer(port, 500); i++) await delay(150);
-  await serverCommand();
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
 }
 
 // ── import ──────────────────────────────────────────────────
@@ -560,10 +506,8 @@ async function loginApiCommand() {
   }
 
   if (!name) {
-    // First FREE api-N (not `count + 1`, which collides after a delete) — a unique
-    // name is the identity key for credential-less API-key accounts.
-    let n = 1;
-    do { name = `api-${n++}`; } while (config.accounts.some(a => a.name === name));
+    const n = config.accounts.filter(a => a.name.startsWith('api-')).length + 1;
+    name = `api-${n}`;
   }
 
   config.accounts.push({ name, type: 'apikey', apiKey: apiKey.trim() });
@@ -605,20 +549,51 @@ async function envCommand() {
 async function runCommand() {
   const config = await loadOrCreateConfig();
 
-  // Everything after 'run' (skip -- separator if present)
-  const claudeArgs = args.slice(1);
-  if (claudeArgs[0] === '--') claudeArgs.shift();
+  // Args after 'run'. teamclaude flags (e.g. --no-mitm) are recognized only
+  // before an optional `--` separator; everything after `--` goes verbatim to
+  // claude. MITM forward-proxy mode is the default so hardcoded api.anthropic.com
+  // endpoints are intercepted too; --no-mitm opts back into base-URL-only routing.
+  // --mitm is still accepted (now a no-op) for backward compatibility.
+  const rest = args.slice(1);
+  const sep = rest.indexOf('--');
+  const tcFlags = sep >= 0 ? rest.slice(0, sep) : rest;
+  const useMitm = !tcFlags.includes('--no-mitm');
+  const claudeArgs = sep >= 0
+    ? rest.slice(sep + 1)
+    : rest.filter(a => a !== '--mitm' && a !== '--no-mitm');
 
-  // Only set ANTHROPIC_BASE_URL — Claude Code keeps its own OAuth token
-  // which the proxy accepts from localhost. Not setting ANTHROPIC_API_KEY
-  // lets Claude Code stay in subscription mode (full model access).
+  // Route through the proxy only when it's actually up; otherwise launch claude
+  // directly so a stopped proxy doesn't break `claude`. This is what lets the
+  // shell alias (`claude='teamclaude run --'`) be a dumb passthrough.
+  const port = config.proxy.port;
+  const env = { ...process.env };
+  if (await isProxyUp(port)) {
+    if (useMitm) {
+      // Route ALL of claude's traffic through us as an HTTPS forward proxy, so
+      // even hardcoded api.anthropic.com endpoints (e.g. the design MCP) get the
+      // real token injected. claude trusts our MITM leaf via NODE_EXTRA_CA_CERTS.
+      const host = upstreamHost(config);
+      const { caPath } = await ensureCerts(host);
+      const proxyUrl = `http://127.0.0.1:${port}`;
+      env.HTTPS_PROXY = env.HTTP_PROXY = env.https_proxy = env.http_proxy = proxyUrl;
+      env.NO_PROXY = env.no_proxy = 'localhost,127.0.0.1,::1';
+      env.NODE_EXTRA_CA_CERTS = caPath;
+      delete env.ANTHROPIC_BASE_URL;
+    } else {
+      // Only set ANTHROPIC_BASE_URL — Claude Code keeps its own OAuth token
+      // which the proxy accepts from localhost. Not setting ANTHROPIC_API_KEY
+      // lets Claude Code stay in subscription mode (full model access).
+      env.ANTHROPIC_BASE_URL = `http://localhost:${port}`;
+    }
+  } else {
+    console.error(`[TeamClaude] Proxy not running on port ${port} — launching claude directly (start it with: teamclaude server)`);
+  }
+
   // Use spawnSync so the Node process blocks entirely — behaves like execvp.
   const result = spawnSync('claude', claudeArgs, {
     stdio: 'inherit',
-    env: {
-      ...process.env,
-      ANTHROPIC_BASE_URL: `http://localhost:${config.proxy.port}`,
-    },
+    shell: process.platform === 'win32',
+    env,
   });
 
   if (result.error) {
@@ -630,6 +605,11 @@ async function runCommand() {
     process.exit(1);
   }
 
+  // Session over — check for a newer teamclaude and (for a global npm install)
+  // self-update. Throttled to once/day, so this is a no-op on almost every run;
+  // it applies to the NEXT launch, never the session that just ran.
+  await autoUpdate({ config }).catch(() => {});
+
   process.exit(result.status ?? 1);
 }
 
@@ -637,65 +617,24 @@ async function runCommand() {
 
 async function statusCommand() {
   const config = await loadOrCreateConfig();
-  // Locate the actual running server (its bound port may differ from the current
-  // config port after an edit). findRunningServer handles stale-state cleanup; do
-  // NOT clear state here, or a momentary blip would orphan a live server.
-  const running = await findRunningServer(config);
-  if (!running) {
-    console.log(`Server:         not running (no proxy on port ${config.proxy.port})`);
-    console.log('Start it with:  teamclaude server');
-    process.exit(1);
-  }
-  const url = `http://127.0.0.1:${running.port}/teamclaude/status`;
+  const url = `http://localhost:${config.proxy.port}/teamclaude/status`;
+  const json = args.includes('--json');
+  const colorArg = argValue('--color') || args.find(arg => arg.startsWith('--color='))?.slice('--color='.length);
+  const color = colorArg === 'always'
+    || (colorArg !== 'never' && process.stdout.isTTY);
 
   try {
     const res = await fetch(url, { headers: { 'x-api-key': config.proxy.apiKey } });
     const data = await res.json();
-
-    const pidStr = running.pid ? `pid ${running.pid}, ` : '';
-    console.log(`Server:         running (${pidStr}port ${running.port})`);
-    console.log(`Active account: ${data.currentAccount}`);
-    console.log(`Switch at:      ${(data.switchThreshold * 100).toFixed(0)}% usage\n`);
-
-    for (const acct of data.accounts) {
-      const q = acct.quota;
-      const current = acct.name === data.currentAccount ? ' *' : '';
-
-      const disabledTag = acct.enabled === false ? ' [disabled]' : '';
-      console.log(`  ${acct.name} (${acct.type})${current}${disabledTag}`);
-      console.log(`    Status:   ${acct.status}${acct.enabled === false ? ' (disabled — out of rotation)' : ''}`);
-      if (acct.priority != null) console.log(`    Priority: ${acct.priority} (lower = preferred)`);
-      if (acct.maxConcurrent != null) {
-        console.log(`    In flight: ${acct.inflight ?? 0}/${acct.maxConcurrent} concurrent`);
-      }
-
-      if (q.unified5h != null || q.unified7d != null || Object.keys(q.modelWeekly ?? {}).length > 0) {
-        const ses = q.unified5h != null ? (q.unified5h * 100).toFixed(1) + '%' : '-';
-        const wk = q.unified7d != null ? (q.unified7d * 100).toFixed(1) + '%' : '-';
-        let line = `    Session:  ${ses} used    Weekly: ${wk} used`;
-        // Model-scoped weekly windows (7d_oi = the Fable weekly limit). Guarded
-        // with ?. so a status from an older running server (no modelWeekly
-        // field) still prints. Unknown labels print as-is.
-        for (const [label, w] of Object.entries(q.modelWeekly ?? {})) {
-          if (w?.utilization == null) continue;
-          const name = label === '7d_oi' ? 'Fable wk' : label;
-          line += `    ${name}: ${(w.utilization * 100).toFixed(1)}% used`;
-        }
-        console.log(line);
-      } else {
-        const tok = q.tokensLimit ? ((1 - q.tokensRemaining / q.tokensLimit) * 100).toFixed(1) + '%' : '-';
-        const req = q.requestsLimit ? ((1 - q.requestsRemaining / q.requestsLimit) * 100).toFixed(1) + '%' : '-';
-        console.log(`    Tokens:   ${tok} used    Requests: ${req} used`);
-      }
-
-      console.log(`    Total:    ${acct.usage.totalInputTokens + acct.usage.totalOutputTokens} tokens, ${acct.usage.totalRequests} requests`);
-      if (acct.rateLimitedUntil) console.log(`    Throttled until: ${acct.rateLimitedUntil}`);
-      console.log('');
+    if (json) {
+      console.log(JSON.stringify(data, null, 2));
+      return;
     }
-  } catch {
-    // findRunningServer just confirmed a server answered; a failure here is a
-    // transient blip, not a reason to delete the discovery record.
-    console.log(`Server:         unreachable (port ${running.port}) — try again`);
+    console.log(renderStatus(data, { color }));
+  } catch (err) {
+    console.error('Cannot connect to proxy at localhost:' + config.proxy.port);
+    console.error('Is the server running? Start with: teamclaude server');
+    if (err?.message) console.error(`Details: ${err.message}`);
     process.exit(1);
   }
 }
@@ -723,7 +662,7 @@ async function accountsCommand() {
       a.refreshToken = newTokens.refreshToken;
       a.expiresAt = newTokens.expiresAt;
       configDirty = true;
-    } catch (err) {
+    } catch {
       // refresh failed — fetchProfile will report the specific error
     }
   }));
@@ -736,31 +675,50 @@ async function accountsCommand() {
     )
   );
 
-  // Deduplicate by accountUuid — keep the last (most recently added) entry
+  // Backfill account+org identity from profiles, then deduplicate by
+  // (accountUuid, org): the same person in a different org is a distinct
+  // account, not a duplicate. Keep the last (most recently added) entry.
   const seen = new Map();
   let removed = 0;
+  let touched = false;
   for (let i = config.accounts.length - 1; i >= 0; i--) {
     const a = config.accounts[i];
-    const uuid = profiles[i]?.accountUuid || a.accountUuid;
-    if (uuid) {
-      if (seen.has(uuid)) {
-        config.accounts.splice(i, 1);
-        profiles.splice(i, 1);
-        removed++;
-      } else {
-        seen.set(uuid, i);
-        // Update stored UUID and name from profile
-        if (profiles[i] && !profiles[i].error) {
-          a.accountUuid = profiles[i].accountUuid;
-          if (profiles[i].email) a.name = profiles[i].email;
-        }
-      }
+    const p = profiles[i];
+    if (p && !p.error) {
+      if (p.accountUuid && a.accountUuid !== p.accountUuid) { a.accountUuid = p.accountUuid; touched = true; }
+      if (p.orgUuid && a.orgUuid !== p.orgUuid) { a.orgUuid = p.orgUuid; touched = true; }
+      if (p.orgName && a.orgName !== p.orgName) { a.orgName = p.orgName; touched = true; }
+    }
+    const uuid = a.accountUuid;
+    if (!uuid) continue;
+    const key = `${uuid}::${orgKey(a) || ''}`;
+    if (seen.has(key)) {
+      config.accounts.splice(i, 1);
+      profiles.splice(i, 1);
+      removed++;
+      touched = true;
+    } else {
+      seen.set(key, i);
     }
   }
-  if (removed > 0) {
-    await saveConfig(config);
-    console.log(`Removed ${removed} duplicate account(s)\n`);
+
+  // Name accounts from their email: plain when the person has a single org,
+  // "email (Org)" when the same person spans multiple orgs. Names must stay
+  // unique — they are the user-facing key for remove/api/selection.
+  const orgCount = new Map();
+  for (const a of config.accounts) {
+    if (a.accountUuid) orgCount.set(a.accountUuid, (orgCount.get(a.accountUuid) || 0) + 1);
   }
+  for (const [i, a] of config.accounts.entries()) {
+    const p = profiles[i];
+    const email = (p && !p.error && p.email) ? p.email : null;
+    if (!email) continue;
+    const newName = orgCount.get(a.accountUuid) > 1 ? `${email} (${orgLabel(a)})` : email;
+    if (a.name !== newName) { a.name = newName; touched = true; }
+  }
+
+  if (touched) await saveConfig(config);
+  if (removed > 0) console.log(`Removed ${removed} duplicate account(s)\n`);
 
   for (const [i, a] of config.accounts.entries()) {
     const p = profiles[i];
@@ -812,7 +770,7 @@ async function apiCommand() {
   const accounts = await resolveAccounts(config);
   let account;
   if (accountName) {
-    account = accounts.find(a => a.name === accountName);
+    account = resolveAccount(accounts, accountName, argValue('--org'));
     if (!account) { console.error(`Account "${accountName}" not found`); process.exit(1); }
   } else {
     account = accounts.find(a => a.type === 'oauth') || accounts[0];
@@ -852,86 +810,315 @@ async function apiCommand() {
   }
 }
 
+// ── alias ───────────────────────────────────────────────────
+
+function aliasCommand() {
+  const shell = argValue('--shell') || undefined;
+  if (args.includes('--uninstall')) {
+    alias.uninstallAlias({ shell });
+  } else if (args.includes('--install')) {
+    alias.installAlias({ shell });
+  } else {
+    alias.printAlias({ shell });
+  }
+}
+
+// ── probe ───────────────────────────────────────────────────
+
+async function probeCommand() {
+  const config = await loadOrCreateConfig();
+  const arg = args[1];
+
+  if (arg === undefined) {
+    const cur = config.quotaProbeSeconds || 0;
+    console.log(cur > 0 ? `Quota probe: every ${cur}s` : 'Quota probe: off (passive only)');
+    console.log('Set with: teamclaude probe <off|seconds>   e.g. teamclaude probe 300');
+    return;
+  }
+
+  let seconds;
+  if (arg === 'off' || arg === '0') {
+    seconds = 0;
+  } else {
+    seconds = parseInt(arg, 10);
+    if (Number.isNaN(seconds) || seconds < 0) {
+      console.error('Usage: teamclaude probe <off|seconds>');
+      process.exit(1);
+    }
+    if (seconds > 0 && seconds < 30) {
+      console.error('Minimum probe interval is 30s (to avoid hammering the usage endpoint).');
+      process.exit(1);
+    }
+  }
+
+  config.quotaProbeSeconds = seconds;
+  await saveConfig(config);
+  console.log(seconds > 0
+    ? `Quota probe set to every ${seconds}s (reads /api/oauth/usage; does not spend quota).`
+    : 'Quota probe disabled (passive only).');
+  await notifyRunningServer(config);
+}
+
+// ── warmup ──────────────────────────────────────────────────
+
+async function warmupCommand() {
+  const config = await loadOrCreateConfig();
+  const arg = args[1];
+
+  if (arg === undefined) {
+    const cur = config.warmupSeconds || 0;
+    console.log(cur > 0 ? `Keep-warm: every ${cur}s` : 'Keep-warm: off');
+    console.log('Set with: teamclaude warmup <off|seconds>   e.g. teamclaude warmup 600');
+    console.log('Note: warming spawns a minimal `claude` per idle account and DOES spend a little quota');
+    console.log('(unlike the passive quota probe). It only warms accounts whose 5h window is idle.');
+    return;
+  }
+
+  let seconds;
+  if (arg === 'off' || arg === '0') {
+    seconds = 0;
+  } else {
+    seconds = parseInt(arg, 10);
+    if (Number.isNaN(seconds) || seconds < 0) {
+      console.error('Usage: teamclaude warmup <off|seconds>');
+      process.exit(1);
+    }
+    if (seconds > 0 && seconds < 60) {
+      console.error('Minimum keep-warm interval is 60s.');
+      process.exit(1);
+    }
+  }
+
+  config.warmupSeconds = seconds;
+  await saveConfig(config);
+  console.log(seconds > 0
+    ? `Keep-warm set to every ${seconds}s (spawns a minimal \`claude\` per idle account; spends a little quota).`
+    : 'Keep-warm disabled.');
+  await notifyRunningServer(config);
+}
+
+// ── update ──────────────────────────────────────────────────
+
+async function updateCommand() {
+  const cur = currentVersion();
+  console.log(`Current version: ${cur || 'unknown'}`);
+
+  const kind = installKind();
+  if (kind === 'git') {
+    console.log('This is a git checkout — update it with `git pull`, not npm.');
+    return;
+  }
+
+  const info = await checkForUpdate({ force: true });
+  if (!info) {
+    console.error('Could not reach the npm registry to check for updates.');
+    process.exitCode = 1;
+    return;
+  }
+  if (!info.updateAvailable) {
+    console.log(`Already up to date (latest is ${info.latest}).`);
+    return;
+  }
+
+  console.log(`Updating ${info.current} → ${info.latest} …`);
+  const ok = runUpdate(info.latest);
+  if (ok) {
+    console.log(`Updated to ${info.latest}. Restart teamclaude to use the new version.`);
+  } else {
+    console.error(`Update failed. Try manually: npm install -g ${PKG_NAME}@latest`);
+    process.exitCode = 1;
+  }
+}
+
 // ── remove ──────────────────────────────────────────────────
+
+/**
+ * Resolve a single account from a name-or-email query.
+ *
+ * An exact display-name match wins. Otherwise match by email (the part before a
+ * " (org)" suffix), optionally narrowed by --org. If still ambiguous across
+ * orgs, print the candidates and exit so the caller can disambiguate with --org.
+ * Returns the matched account, or null if nothing matched.
+ */
+function resolveAccount(accounts, query, orgFilter) {
+  const matches = matchAccounts(accounts, query, orgFilter);
+  if (matches.length === 1) return matches[0];
+  if (matches.length === 0) return null;
+  console.error(`"${query}" matches ${matches.length} accounts — disambiguate with --org <name|uuid>:`);
+  for (const a of matches) {
+    console.error(`  - ${a.name}${a.orgName ? `  (org: ${a.orgName})` : ''}`);
+  }
+  process.exit(1);
+}
 
 async function removeCommand() {
   const config = await loadOrCreateConfig();
   const name = args[1];
 
   if (!name) {
-    console.error('Usage: teamclaude remove <account-name>');
+    console.error('Usage: teamclaude remove <account-name|email> [--org <name|uuid>]');
     process.exit(1);
   }
 
-  const idx = config.accounts.findIndex(a => a.name === name);
-  if (idx < 0) {
+  const account = resolveAccount(config.accounts, name, argValue('--org'));
+  if (!account) {
     console.error(`Account "${name}" not found`);
     process.exit(1);
   }
 
-  config.accounts.splice(idx, 1);
+  config.accounts.splice(config.accounts.indexOf(account), 1);
   await saveConfig(config);
-  console.log(`Removed account "${name}"`);
+  console.log(`Removed account "${account.name}"`);
 }
 
-// ── enable / disable / priority ─────────────────────────────
+// ── route ───────────────────────────────────────────────────
 
-/** Note that changes apply to a running server only after a reload/restart. */
-function noteRunningServerReload(config) {
-  return findRunningServer(config).then(running => {
-    if (running) {
-      console.log('A server is running — apply now with: teamclaude restart');
-      console.log('  (or press "R" in the TUI to reload from config).');
+const ROUTE_USAGE = [
+  'Usage: teamclaude route [list]',
+  '       teamclaude route add <name> --match "<glob>[,<glob>]" [--accounts "<name-or-index>[,...]"] [--bucket <quota-bucket>] [--color <name>]',
+  '       teamclaude route rm <name>',
+  '',
+  'A route pins model ids matching its globs to an exclusive set of accounts.',
+  'Omit --accounts to route to all accounts (e.g. just to override --bucket).',
+  '--color (red/green/yellow/blue/magenta/cyan) tints the route\'s inline marker in the TUI.',
+  'First matching route wins. Changes apply to a running server immediately.',
+].join('\n');
+
+const ROUTE_COLORS = ['red', 'green', 'yellow', 'blue', 'magenta', 'cyan'];
+
+function splitList(value) {
+  return (value || '').split(',').map(s => s.trim()).filter(Boolean);
+}
+
+async function routeCommand() {
+  const sub = args[1] || 'list';
+  const config = await loadOrCreateConfig();
+  config.routes = Array.isArray(config.routes) ? config.routes : [];
+
+  if (sub === 'list') {
+    if (!config.routes.length) { console.log('No routes configured.'); return; }
+    for (const r of config.routes) {
+      const match = (Array.isArray(r.match) ? r.match : [r.match]).join(', ');
+      const accts = (r.accounts && r.accounts.length) ? r.accounts.join(', ') : '(all accounts)';
+      const bucket = r.bucket ? `  bucket=${r.bucket}` : '';
+      const color = r.color ? `  color=${r.color}` : '';
+      console.log(`${r.name || '(unnamed)'}: ${match} → ${accts}${bucket}${color}`);
     }
-  }).catch(() => {});
+    return;
+  }
+
+  if (sub === 'add') {
+    const name = args[2] && !args[2].startsWith('--') ? args[2] : null;
+    const match = splitList(argValue('--match'));
+    const accounts = splitList(argValue('--accounts'));
+    const bucket = argValue('--bucket');
+    const color = argValue('--color');
+    if (!name || !match.length) {
+      console.error(ROUTE_USAGE);
+      process.exit(1);
+    }
+    if (color && !ROUTE_COLORS.includes(color.toLowerCase())) {
+      console.error(`Unknown color "${color}" — expected one of: ${ROUTE_COLORS.join(', ')}`);
+      process.exit(1);
+    }
+    const known = new Set(config.accounts.map(a => a.name));
+    for (const a of accounts) {
+      if (!known.has(a) && !/^\d+$/.test(a)) console.error(`Warning: no account named "${a}" (yet)`);
+    }
+    const route = { name, match };
+    if (accounts.length) route.accounts = accounts;
+    if (bucket) route.bucket = bucket;
+    if (color) route.color = color.toLowerCase();
+    const at = config.routes.findIndex(r => r.name === name);
+    if (at >= 0) { config.routes[at] = route; console.log(`Updated route "${name}"`); }
+    else { config.routes.push(route); console.log(`Added route "${name}"`); }
+    await saveConfig(config);
+    await notifyRunningServer(config);
+    return;
+  }
+
+  if (sub === 'rm' || sub === 'remove' || sub === 'delete') {
+    const name = args[2];
+    const before = config.routes.length;
+    config.routes = config.routes.filter(r => r.name !== name);
+    if (config.routes.length === before) { console.error(`Route "${name}" not found`); process.exit(1); }
+    await saveConfig(config);
+    await notifyRunningServer(config);
+    console.log(`Removed route "${name}"`);
+    return;
+  }
+
+  console.error(ROUTE_USAGE);
+  process.exit(1);
 }
 
-async function setEnabledCommand(enabled) {
+// ── priority ────────────────────────────────────────────────
+
+async function priorityCommand() {
+  const config = await loadOrCreateConfig();
   const name = args[1];
+
   if (!name) {
-    console.error(`Usage: teamclaude ${enabled ? 'enable' : 'disable'} <account-name>`);
+    console.error('Usage: teamclaude priority <account-name|email> <n> [--org <name|uuid>]');
+    console.error('       teamclaude priority <account-name|email> --first | --last');
+    console.error('Lower priority is preferred for rotation (default 0).');
     process.exit(1);
   }
-  // atomicConfigUpdate re-reads disk before writing, so a concurrent token
-  // refresh from the running server (or another CLI edit) isn't clobbered by a
-  // stale snapshot. Match by name (what the user typed) within the fresh copy.
-  let found = false;
-  const config = await atomicConfigUpdate(cfg => {
-    const acct = cfg.accounts.find(a => a.name === name);
-    if (acct) { acct.enabled = enabled; found = true; }
-  });
-  if (!found) { console.error(`Account "${name}" not found`); process.exit(1); }
-  console.log(`${enabled ? 'Enabled' : 'Disabled'} account "${name}"`);
-  if (!enabled) console.log('  (excluded from active rotation; in-flight requests still finish)');
-  await noteRunningServerReload(config);
+
+  const account = resolveAccount(config.accounts, name, argValue('--org'));
+  if (!account) {
+    console.error(`Account "${name}" not found`);
+    process.exit(1);
+  }
+
+  const priorities = config.accounts.map(a => a.priority || 0);
+  let priority;
+  if (args.includes('--first')) {
+    priority = Math.min(0, ...priorities) - 1;
+  } else if (args.includes('--last')) {
+    priority = Math.max(0, ...priorities) + 1;
+  } else {
+    // Accept the integer in any position (e.g. after --org) — first int-looking token.
+    const numTok = args.slice(2).find(t => /^-?\d+$/.test(t));
+    priority = numTok != null ? parseInt(numTok, 10) : NaN;
+    if (Number.isNaN(priority)) {
+      console.error('Provide an integer priority, or --first / --last.');
+      process.exit(1);
+    }
+  }
+
+  account.priority = priority;
+  await saveConfig(config);
+  console.log(`Set priority of "${account.name}" to ${priority} (lower = preferred)`);
+  await notifyRunningServer(config);
 }
 
-async function setPriorityCommand() {
+// ── enable / disable ────────────────────────────────────────
+
+async function setDisabledCommand(disabled) {
+  const config = await loadOrCreateConfig();
   const name = args[1];
-  const raw = args[2];
-  if (!name || raw === undefined) {
-    console.error('Usage: teamclaude priority <account-name> <number|auto>');
-    console.error('  Lower number = preferred first. Use "auto" (or "clear") to return the');
-    console.error('  account to automatic ordering: weekly reset soonest is drained first.');
+  const verb = disabled ? 'disable' : 'enable';
+
+  if (!name) {
+    console.error(`Usage: teamclaude ${verb} <account-name|email> [--org <name|uuid>]`);
     process.exit(1);
   }
-  const clearing = raw === 'auto' || raw === 'clear' || raw === 'none' || raw === 'null';
-  let value = null;
-  if (!clearing) {
-    const n = Number(raw);
-    if (!Number.isFinite(n)) { console.error(`Invalid priority "${raw}" — expected a number or "auto"`); process.exit(1); }
-    value = Math.floor(n);
+
+  const account = resolveAccount(config.accounts, name, argValue('--org'));
+  if (!account) {
+    console.error(`Account "${name}" not found`);
+    process.exit(1);
   }
-  let found = false;
-  const config = await atomicConfigUpdate(cfg => {
-    const acct = cfg.accounts.find(a => a.name === name);
-    if (acct) { found = true; if (clearing) delete acct.priority; else acct.priority = value; }
-  });
-  if (!found) { console.error(`Account "${name}" not found`); process.exit(1); }
-  console.log(clearing
-    ? `Set "${name}" to auto (use-or-lose ordering: weekly reset soonest first)`
-    : `Set priority of "${name}" to ${value} (lower = preferred first)`);
-  await noteRunningServerReload(config);
+
+  if (disabled) {
+    account.disabled = true;
+  } else {
+    delete account.disabled;
+  }
+  await saveConfig(config);
+  console.log(`${disabled ? 'Disabled' : 'Enabled'} account "${account.name}"`);
+  await notifyRunningServer(config);
 }
 
 // ── help ────────────────────────────────────────────────────
@@ -942,30 +1129,56 @@ function showHelp() {
 Usage: teamclaude [command] [options]
 
 Commands:
-  server              Start the proxy server (default)
-  stop                Stop the running proxy server
-  restart             Stop the running server (if any) and start a fresh one
+  server              Start the proxy server (default; --headless to skip the TUI)
   import              Import credentials from Claude Code
   login               OAuth login via browser
   login --api         Add an API key account
   env                 Print env vars to use with Claude
-  run [-- args...]    Run Claude Code through the proxy
-  status              Show proxy & account status (live)
+  run [--no-mitm] [-- args...]
+                      Run Claude Code through the proxy (direct if it's down).
+                      Routes via an HTTPS forward proxy + local CA by default, so
+                      even hardcoded api.anthropic.com endpoints are intercepted;
+                      --no-mitm uses base-URL routing only
+  alias               Print a shell alias so plain 'claude' routes via the proxy
+                      (--install to write it to your shell rc; --uninstall to remove)
+  status [--json]     Show rich proxy/account/probe status (live)
+                      Use --color=always|never to control ANSI colors
   accounts            List configured accounts
-  remove <name>       Remove an account
-  disable <name>      Disable an account (excluded from rotation)
-  enable <name>       Re-enable a disabled account
-  priority <name> <n> Set selection priority (lower = preferred; "auto" to return
-                      to automatic ordering — weekly reset soonest drained first)
+  remove <name>       Remove an account (by name or email; --org to disambiguate)
+  disable <name>      Temporarily exclude an account from rotation
+  enable <name>       Re-enable a disabled account (also clears a stuck error)
+  priority <name> <n> Set rotation priority (lower = preferred; --first/--last)
+  route [list|add|rm] Per-model routing: pin model globs to specific accounts
+                      (add <name> --match "<glob>" [--accounts "<name>"] [--bucket <b>])
+  probe [off|secs]    Opt-in background quota refresh for idle accounts
+                      (off by default; reads usage endpoint, spends no quota)
+  warmup [off|secs]   Opt-in: keep idle accounts' 5h timers running by sending
+                      a minimal claude request to each (off by default; spends
+                      a little quota, unlike probe)
   api <path>          Call an API endpoint with account credentials
+  update              Check npm for a newer teamclaude and install it
+  version             Print the installed version
   help                Show this help
 
 Options:
   --name NAME         Set account name (import/login)
+  --org NAME|UUID     Disambiguate when an email spans multiple orgs (remove/priority/api)
   --from PATH         Credentials path (import, default: ~/.claude/.credentials.json)
   --json JSON         Import from inline JSON (import), e.g.:
                       --json '{"accessToken":"...","refreshToken":"...","expiresAt":1234}'
   --log-to DIR        Log full requests/responses to DIR (server, one file per request)
+  --headless          Run the server without the interactive TUI (for backgrounding)
+  --no-mitm           (run) skip the forward proxy; route via ANTHROPIC_BASE_URL only
+
+The server always accepts both base-URL and proxy/CONNECT clients, so instances
+launched with and without --no-mitm can share one server.
+
+A running server re-syncs accounts from config on POST /teamclaude/reload
+(local only). add/login/enable/disable/priority trigger it automatically.
+
+A global npm install self-updates in the background (checked once/day, applied
+on the next launch). Disable with TEAMCLAUDE_DISABLE_AUTOUPDATE=1 or
+"autoUpdate": false in the config.
 
 Config: ${getConfigPath()}
 `);
@@ -973,8 +1186,14 @@ Config: ${getConfigPath()}
 
 // ── shared account upsert ────────────────────────────────────
 
+/** Short human label for an account's organization, for disambiguating names. */
+function orgLabel(a) {
+  return a.orgName || (a.orgUuid ? a.orgUuid.slice(0, 8) : 'org');
+}
+
 async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
-  // Fetch profile to auto-name and deduplicate by account UUID
+  // Fetch profile to auto-name and deduplicate by account+org identity.
+  const userNamed = !!name;
   const profile = await fetchProfile(creds.accessToken);
   const profileOk = profile && !profile.error;
 
@@ -987,10 +1206,8 @@ async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
     if (tier) console.log(`Detected Claude ${tier} account: ${profile.email}`);
   }
   if (!name) {
-    // First FREE account-N (not `count + 1`, which collides after a delete) so the
-    // generated name stays a unique identity key.
-    let n = 1;
-    do { name = `account-${n++}`; } while (config.accounts.some(a => a.name === name));
+    const n = config.accounts.filter(a => a.name.startsWith('account-')).length + 1;
+    name = `account-${n}`;
   }
 
   const account = {
@@ -998,45 +1215,54 @@ async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
     type: 'oauth',
     source,
     accountUuid: profile?.accountUuid || null,
+    orgUuid: profile?.orgUuid || null,
+    orgName: profile?.orgName || null,
     accessToken: creds.accessToken,
     refreshToken: creds.refreshToken,
     expiresAt: creds.expiresAt,
   };
 
-  // Deduplicate: match by UUID first, then by name
-  let idx = profile?.accountUuid
-    ? config.accounts.findIndex(a => a.accountUuid === profile.accountUuid)
-    : -1;
+  // Deduplicate by account+org identity (same email in a different org is a
+  // distinct account), then by name.
+  let idx = config.accounts.findIndex(a => sameIdentity(a, account));
   if (idx < 0) idx = config.accounts.findIndex(a => a.name === name);
 
   if (idx >= 0) {
-    // Re-credentialing an existing account must not wipe its manual routing
-    // settings — carry enabled/priority over from the entry being replaced.
+    // Same account+org: refresh credentials and org info, but keep the existing
+    // display name and any disk-only fields (e.g. importFrom).
     const prev = config.accounts[idx];
-    if (prev.enabled !== undefined) account.enabled = prev.enabled;
-    if (prev.priority !== undefined) account.priority = prev.priority;
-    config.accounts[idx] = account;
-    console.log(`Updated account "${name}"`);
+    config.accounts[idx] = { ...prev, ...account, name: prev.name };
+    console.log(`Updated account "${prev.name}"`);
   } else {
+    // New org for this person: if another entry shares the accountUuid, the bare
+    // email name would collide — disambiguate both with " (org)".
+    if (!userNamed && account.accountUuid) {
+      const collisions = config.accounts.filter(
+        a => a.accountUuid === account.accountUuid && !sameIdentity(a, account)
+      );
+      if (collisions.length > 0) {
+        for (const c of collisions) {
+          if (!c.name.includes(' (')) c.name = `${c.name} (${orgLabel(c)})`;
+        }
+        account.name = `${name} (${orgLabel(account)})`;
+      }
+    }
     config.accounts.push(account);
-    console.log(`Added account "${name}"`);
+    console.log(`Added account "${account.name}"`);
   }
 
   await saveConfig(config);
   console.log(`Saved to ${getConfigPath()}`);
+  await notifyRunningServer(config);
 }
 
 // ── config sync helpers ─────────────────────────────────────
 
 /**
- * Find a config account entry matching an in-memory account (by UUID, then name).
+ * Find a config account entry matching an in-memory account by account+org identity.
  */
 function findConfigAccount(diskConfig, account) {
-  if (account.accountUuid) {
-    const idx = diskConfig.accounts.findIndex(a => a.accountUuid === account.accountUuid);
-    if (idx >= 0) return idx;
-  }
-  return diskConfig.accounts.findIndex(a => a.name === account.name);
+  return diskConfig.accounts.findIndex(a => sameIdentity(a, account));
 }
 
 /**
@@ -1046,45 +1272,45 @@ function findConfigAccount(diskConfig, account) {
  */
 async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
   let added = 0;
-  for (const diskAcct of diskConfig.accounts) {
-    const matchByUuid = diskAcct.accountUuid &&
-      memConfig.accounts.findIndex(a => a.accountUuid === diskAcct.accountUuid);
-    const matchByName = memConfig.accounts.findIndex(a => a.name === diskAcct.name);
-    const memIdx = (matchByUuid >= 0 ? matchByUuid : null) ?? (matchByName >= 0 ? matchByName : -1);
+  // Greedy 1:1 pairing of disk entries to in-memory accounts, account+org aware.
+  // Each disk entry claims at most one unclaimed manager account, so multiple
+  // same-person/different-org entries pair correctly instead of all matching the
+  // first one with that accountUuid.
+  const claimed = new Set();
+  const claim = (diskAcct) => {
+    for (let i = 0; i < accountManager.accounts.length; i++) {
+      if (!claimed.has(i) && sameIdentity(accountManager.accounts[i], diskAcct)) {
+        claimed.add(i);
+        return i;
+      }
+    }
+    return -1;
+  };
 
-    if (memIdx < 0) {
+  for (const diskAcct of diskConfig.accounts) {
+    const mgrIdx = claim(diskAcct);
+
+    if (mgrIdx < 0) {
       // New account discovered on disk — add to running server
       memConfig.accounts.push(diskAcct);
       accountManager.addAccount(diskAcct);
+      claimed.add(accountManager.accounts.length - 1);
       added++;
       console.log(`[TeamClaude] Picked up new account "${diskAcct.name}" from config`);
       continue;
     }
 
-    // Find the corresponding AccountManager entry — UUID first, then name, so a
-    // disk entry whose UUID and name resolve to *different* live accounts can't
-    // misattribute the update to the name-match when a UUID-match exists.
-    const mgr = (diskAcct.accountUuid && accountManager.accounts.find(a => a.accountUuid === diskAcct.accountUuid))
-      || accountManager.accounts.find(a => a.name === diskAcct.name);
+    const mgr = accountManager.accounts[mgrIdx];
 
-    // Apply enable/disable + priority from disk FIRST — independent of credential
-    // re-resolution below. A failed re-import (freshCred null) must NOT strand a
-    // `teamclaude disable`/`priority` set while the server runs. setEnabled drains
-    // the overflow queue when re-enabling so a freed-up account is used at once.
-    if (mgr) {
-      const wantEnabled = diskAcct.enabled !== false;
-      if (mgr.enabled !== wantEnabled) accountManager.setEnabled(mgr, wantEnabled);
-      const diskPriority = Number.isFinite(diskAcct.priority) ? Math.floor(diskAcct.priority) : null;
-      if (mgr.priority !== diskPriority) accountManager.setPriority(mgr, diskPriority);
-      // Mirror the applied state into the in-memory config copy too. Otherwise a
-      // later TUI saveConfig (for any unrelated op) would spread the pre-sync
-      // enabled/priority over the disk value and silently revert a CLI change.
-      const memAcct = memConfig.accounts[memIdx];
-      if (memAcct) {
-        if (wantEnabled) delete memAcct.enabled; else memAcct.enabled = false;
-        if (diskPriority === null) delete memAcct.priority; else memAcct.priority = diskPriority;
-      }
-    }
+    // Backfill org identity and pick up renames/priority onto the running
+    // account (e.g. after disk-side org disambiguation or a `priority` change).
+    if (diskAcct.orgUuid && !mgr.orgUuid) mgr.orgUuid = diskAcct.orgUuid;
+    if (diskAcct.orgName && !mgr.orgName) mgr.orgName = diskAcct.orgName;
+    if (diskAcct.name && mgr.name !== diskAcct.name) mgr.name = diskAcct.name;
+    if (diskAcct.priority != null && mgr.priority !== diskAcct.priority) mgr.priority = diskAcct.priority;
+    // Pick up enable/disable toggles; re-enabling clears a stuck error state.
+    const wantDisabled = !!diskAcct.disabled;
+    if (mgr.disabled !== wantDisabled) accountManager.setDisabled(mgr.index, wantDisabled);
 
     // Existing account — resolve fresh credentials from disk
     let freshCred = null;
@@ -1101,7 +1327,7 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
       freshCred = { apiKey: diskAcct.apiKey };
     }
 
-    if (!freshCred || !mgr) continue;
+    if (!freshCred) continue;
 
     if (freshCred.accessToken) {
       const changed = mgr.credential !== freshCred.accessToken ||
@@ -1132,9 +1358,7 @@ async function resolveAccounts(config) {
       if (acct.importFrom) {
         try {
           const creds = await importCredentials(acct.importFrom);
-          // Carry accountUuid through so the live account can be matched UUID-first
-          // on sync (otherwise it stays null and a name change misroutes the update).
-          accounts.push({ name: acct.name, type: 'oauth', accountUuid: acct.accountUuid, maxConcurrent: acct.maxConcurrent, enabled: acct.enabled, priority: acct.priority, ...creds });
+          accounts.push({ name: acct.name, type: 'oauth', ...creds });
           console.log(`Imported "${acct.name}" from ${acct.importFrom}`);
         } catch (err) {
           console.error(`Failed to import "${acct.name}": ${err.message}`);
@@ -1156,13 +1380,52 @@ function argValue(flag) {
   return (i >= 0 && args[i + 1]) ? args[i + 1] : null;
 }
 
+// Hostname of the configured upstream (the host MITM-intercepts under `run`).
+function upstreamHost(config) {
+  try { return new URL(config.upstream || 'https://api.anthropic.com').hostname; }
+  catch { return 'api.anthropic.com'; }
+}
+
+// Best-effort: tell a running server (if any) to re-sync accounts from config so
+// CLI changes take effect without a restart. A closed local port refuses the
+// connection immediately, so this is a no-op (and near-instant) when nothing is
+// running. Reload picks up new accounts, credential, priority, and enable/disable
+// changes; account removals still need a restart.
+async function notifyRunningServer(config) {
+  const port = config?.proxy?.port;
+  if (!port) return;
+  try {
+    const res = await fetch(`http://localhost:${port}/teamclaude/reload`, {
+      method: 'POST',
+      headers: { 'x-api-key': config.proxy?.apiKey || '' },
+    });
+    if (res.ok) {
+      const data = await res.json().catch(() => ({}));
+      console.log(`Reloaded running server${data.added ? ` (+${data.added} new account)` : ''}.`);
+    }
+  } catch { /* no server running — nothing to notify */ }
+}
+
+// Quick liveness probe: is something listening on the local proxy port?
+// A successful TCP connect is enough (the proxy is local). Times out fast so a
+// down proxy doesn't add noticeable latency to `claude` launches via the alias.
+function isProxyUp(port, timeout = 600) {
+  return new Promise(resolve => {
+    const socket = net.connect({ host: '127.0.0.1', port });
+    const done = up => { socket.destroy(); resolve(up); };
+    socket.setTimeout(timeout);
+    socket.once('connect', () => done(true));
+    socket.once('timeout', () => done(false));
+    socket.once('error', () => resolve(false));
+  });
+}
+
 function handleServerListenError(err, port) {
   if (err.code === 'EADDRINUSE') {
     console.error(`[TeamClaude] Port ${port} is already in use.`);
     console.error('Another TeamClaude proxy may already be running.');
-    console.error('  See it:     teamclaude status');
-    console.error('  Stop it:    teamclaude stop');
-    console.error('  Restart it: teamclaude restart');
+    console.error('Check the existing server with: teamclaude status');
+    console.error(`Find the listener with: lsof -nP -iTCP:${port} -sTCP:LISTEN`);
   } else if (err.code === 'EACCES') {
     console.error(`[TeamClaude] Permission denied while listening on port ${port}.`);
     console.error('Choose a non-privileged port in the TeamClaude config.');

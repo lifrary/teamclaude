@@ -24,12 +24,10 @@ export async function importCredentials(filePath) {
 }
 
 const PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile';
+const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
+const OAUTH_USAGE_BETA = 'oauth-2025-04-20';
 const DEFAULT_TOKEN_ENDPOINT = 'https://platform.claude.com/v1/oauth/token';
 const DEFAULT_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
-// Bound the WHOLE token refresh (all retry attempts combined) so a hung token
-// endpoint can't block the refresh — and every request coalesced onto it /
-// holding an account slot — for long. One shared deadline, not per attempt.
-const TOKEN_REFRESH_TIMEOUT_MS = 30_000;
 
 /**
  * Refresh an expired OAuth access token using the refresh token.
@@ -38,17 +36,17 @@ const TOKEN_REFRESH_TIMEOUT_MS = 30_000;
 export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_ENDPOINT) {
   const maxRetries = 2;
   const baseDelayMs = 500;
-  // One deadline for the entire refresh (shared by every attempt), so the whole
-  // operation is bounded by TOKEN_REFRESH_TIMEOUT_MS rather than that × attempts.
-  const deadline = AbortSignal.timeout(TOKEN_REFRESH_TIMEOUT_MS);
+  // Bound each attempt so a dead pooled socket (after a network drop/reconnect)
+  // can't hang the refresh forever. A hung refresh is especially harmful here:
+  // ensureTokenFresh coalesces callers into a single _refreshPromise, so one
+  // stuck refresh wedges every request for that account until a restart.
+  const timeoutMs = Number(process.env.TEAMCLAUDE_REFRESH_TIMEOUT_MS) || 30_000;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    if (deadline.aborted) break; // total budget spent — don't start another attempt
     try {
       if (attempt > 0) {
-        // Deadline-aware retry backoff: don't sleep past the total refresh budget.
-        await delayUntilAborted(baseDelayMs * 2 ** (attempt - 1), deadline);
-        if (deadline.aborted) break;
+        const delay = baseDelayMs * 2 ** (attempt - 1);
+        await new Promise(resolve => setTimeout(resolve, delay));
       }
 
       const res = await fetch(endpoint, {
@@ -63,7 +61,7 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
           refresh_token: refreshToken,
           client_id: DEFAULT_CLIENT_ID,
         }),
-        signal: deadline,
+        signal: AbortSignal.timeout(timeoutMs),
       });
 
       if (!res.ok) {
@@ -72,7 +70,13 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
           continue;
         }
         const text = await res.text();
-        throw new Error(`Token refresh failed (${res.status}): ${text}`);
+        const err = new Error(`Token refresh failed (${res.status}): ${text}`);
+        // Surface the HTTP status so callers can distinguish a genuine auth
+        // rejection (the refresh token is dead — re-login needed) from a
+        // transient server error. 5xx is retried above; reaching here with a 5xx
+        // means retries were exhausted, which is still transient, not auth.
+        err.status = res.status;
+        throw err;
       }
 
       const data = await res.json();
@@ -83,32 +87,17 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
       };
     } catch (err) {
       const isNetworkError = err instanceof Error &&
-        (err.message.includes('fetch failed') ||
-          err.name === 'TimeoutError' || err.name === 'AbortError' ||
+        (err.name === 'TimeoutError' || err.name === 'AbortError' ||
+          err.message.includes('fetch failed') ||
           (err.code === 'ECONNRESET' || err.code === 'ECONNREFUSED' ||
            err.code === 'ETIMEDOUT' || err.code === 'UND_ERR_CONNECT_TIMEOUT'));
 
-      // Stop retrying once the shared refresh deadline is spent — otherwise the
-      // retry delays would push the total past the intended bound.
-      if (attempt < maxRetries && isNetworkError && !deadline.aborted) {
+      if (attempt < maxRetries && isNetworkError) {
         continue;
       }
       throw err;
     }
   }
-  // Reached only by breaking out when the shared deadline expired.
-  throw new Error(`Token refresh timed out after ${TOKEN_REFRESH_TIMEOUT_MS}ms`);
-}
-
-/** Sleep `ms`, but resolve early if `signal` aborts (cleans up its timer/listener). */
-function delayUntilAborted(ms, signal) {
-  return new Promise((resolve) => {
-    if (signal.aborted) return resolve();
-    const cleanup = () => { clearTimeout(t); signal.removeEventListener('abort', onAbort); };
-    const onAbort = () => { cleanup(); resolve(); };
-    const t = setTimeout(() => { cleanup(); resolve(); }, ms);
-    signal.addEventListener('abort', onAbort, { once: true });
-  });
 }
 
 /**
@@ -128,6 +117,17 @@ export function normalizeExpiresAt(expiresAt) {
 export function isTokenExpiringSoon(expiresAt, thresholdMs = 5 * 60 * 1000) {
   if (!expiresAt) return false;
   return Date.now() + thresholdMs >= normalizeExpiresAt(expiresAt);
+}
+
+/**
+ * Check if an OAuth token has ALREADY expired (no safety margin). Used to decide
+ * when a token must be refreshed synchronously before it can be injected — a
+ * still-valid-but-expiring-soon token is fine to use now and refresh in the
+ * background, but an expired one would 401.
+ */
+export function isTokenExpired(expiresAt) {
+  if (!expiresAt) return false;
+  return Date.now() >= normalizeExpiresAt(expiresAt);
 }
 
 /**
@@ -155,6 +155,7 @@ export async function fetchProfile(accessToken) {
       accountUuid: data.account?.uuid,
       email: data.account?.email,
       name: data.account?.display_name,
+      orgUuid: data.organization?.uuid,
       orgName: data.organization?.name,
       orgType: data.organization?.organization_type,
       hasClaudeMax: data.account?.has_claude_max,
@@ -165,10 +166,91 @@ export async function fetchProfile(accessToken) {
   }
 }
 
-// OAuth config (extracted from Claude Code)
-const OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
+// Pull a per-model weekly limit out of the payload's `limits[]` array, which is
+// where the endpoint now reports model-scoped quota (a `weekly_scoped` entry
+// carrying `scope.model.display_name`). Returns a bucket-shaped object
+// { utilization, resets_at } ready for normalizeUsageBucket, or null if absent.
+// The legacy top-level `seven_day_<model>` keys read null on current plans.
+export function findScopedWeeklyLimit(data, modelNamePattern) {
+  const limits = Array.isArray(data?.limits) ? data.limits : [];
+  const entry = limits.find((l) =>
+    l && l.group === 'weekly' && l.scope?.model?.display_name
+    && modelNamePattern.test(l.scope.model.display_name));
+  if (!entry) return null;
+  return { utilization: entry.percent, resets_at: entry.resets_at };
+}
+
+// Normalize one usage bucket from the /api/oauth/usage payload into
+// { utilization: 0-1, resetAt: ms-epoch }. The endpoint reports utilization
+// as a percentage in the 0-100 range, so 1 means 1%, not 100%.
+export function normalizeUsageBucket(bucket) {
+  if (!bucket || typeof bucket !== 'object') return null;
+
+  const rawPct = bucket.used_percentage ?? bucket.utilization ?? bucket.usedPercentage;
+  const parsedPct = typeof rawPct === 'number' ? rawPct : parseFloat(rawPct);
+  const utilization = Number.isFinite(parsedPct)
+    ? parsedPct / 100
+    : null;
+
+  const rawReset = bucket.resets_at ?? bucket.resetsAt ?? bucket.reset_at ?? bucket.resetAt;
+  let resetAt = null;
+  if (typeof rawReset === 'number') {
+    resetAt = rawReset < 1e12 ? rawReset * 1000 : rawReset;
+  } else if (typeof rawReset === 'string') {
+    const asNum = Number(rawReset);
+    if (Number.isFinite(asNum) && rawReset.trim() !== '') {
+      resetAt = asNum < 1e12 ? asNum * 1000 : asNum;
+    } else {
+      const parsed = Date.parse(rawReset);
+      if (Number.isFinite(parsed)) resetAt = parsed;
+    }
+  }
+
+  return { utilization, resetAt };
+}
+
+/**
+ * Fetch OAuth subscription usage from the usage endpoint. This reports quota
+ * utilization WITHOUT spending message quota, which is what makes it safe to
+ * poll. Returns normalized { fiveHour, sevenDay, sevenDaySonnet, sevenDayFable } buckets, or
+ * { error, status } on failure.
+ */
+export async function fetchUsage(accessToken) {
+  try {
+    const res = await fetch(USAGE_URL, {
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'anthropic-beta': OAUTH_USAGE_BETA,
+        'Accept': 'application/json',
+      },
+    });
+
+    if (!res.ok) {
+      let detail = '';
+      try {
+        const body = await res.json();
+        detail = body?.error?.message || JSON.stringify(body).slice(0, 200);
+      } catch {
+        detail = await res.text().catch(() => '');
+      }
+      return { error: `HTTP ${res.status}${detail ? ': ' + detail : ''}`, status: res.status };
+    }
+
+    const data = await res.json();
+    return {
+      fiveHour: normalizeUsageBucket(data?.five_hour),
+      sevenDay: normalizeUsageBucket(data?.seven_day),
+      sevenDaySonnet: normalizeUsageBucket(data?.seven_day_sonnet),
+      sevenDayFable: normalizeUsageBucket(findScopedWeeklyLimit(data, /fable/i)),
+    };
+  } catch (err) {
+    return { error: err.message || String(err), status: null };
+  }
+}
+
+// OAuth config (extracted from Claude Code). Client id + token endpoint are
+// shared with the refresh path — see DEFAULT_CLIENT_ID / DEFAULT_TOKEN_ENDPOINT.
 const OAUTH_AUTHORIZE = 'https://claude.ai/oauth/authorize';
-const OAUTH_TOKEN = 'https://platform.claude.com/v1/oauth/token';
 const OAUTH_SCOPES = 'org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload';
 
 /**
@@ -188,7 +270,7 @@ export async function loginOAuth() {
   // Build authorization URL
   const authUrl = new URL(OAUTH_AUTHORIZE);
   authUrl.searchParams.set('code', 'true');
-  authUrl.searchParams.set('client_id', OAUTH_CLIENT_ID);
+  authUrl.searchParams.set('client_id', DEFAULT_CLIENT_ID);
   authUrl.searchParams.set('response_type', 'code');
   authUrl.searchParams.set('redirect_uri', redirectUri);
   authUrl.searchParams.set('scope', OAUTH_SCOPES);
@@ -211,14 +293,14 @@ export async function loginOAuth() {
 
   // Exchange code for tokens
   console.log('Exchanging authorization code for tokens...');
-  const tokenRes = await fetch(OAUTH_TOKEN, {
+  const tokenRes = await fetch(DEFAULT_TOKEN_ENDPOINT, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       code,
       state,
       grant_type: 'authorization_code',
-      client_id: OAUTH_CLIENT_ID,
+      client_id: DEFAULT_CLIENT_ID,
       redirect_uri: redirectUri,
       code_verifier: codeVerifier,
     }),

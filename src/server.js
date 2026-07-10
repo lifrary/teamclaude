@@ -1,296 +1,67 @@
 import http from 'node:http';
-import { writeFile, mkdir } from 'node:fs/promises';
+import { timingSafeEqual } from 'node:crypto';
+import { createWriteStream } from 'node:fs';
+import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
-import { isTokenExpiringSoon } from './oauth.js';
+import { ensureCerts, createConnectHandler } from './mitm.js';
+import { patchAccountUuid } from './account-uuid-rewrite.js';
+import { parseRequestModel } from './account-manager.js';
+import { TopLevelFieldFinder } from './model.js';
+import { BodyWriter } from './request-log.js';
+import { upstreamFetch } from './upstream-fetch.js';
 
 
-const HOP_BY_HOP_HEADERS = new Set([
+export const HOP_BY_HOP_HEADERS = new Set([
   'host', 'connection', 'keep-alive', 'transfer-encoding',
   'te', 'trailer', 'upgrade', 'proxy-authorization', 'proxy-authenticate',
 ]);
+const INLINE_RETRY_AFTER_MAX_SECONDS = 15;
+// How long the proxy will absorb a rate-limit 429's retry-after inline (waiting
+// on the SAME account) before surfacing a 429 + retry-after to the client. A
+// rate-limit 429 never rotates accounts (that just moves the burst); it pauses
+// the account so concurrent requests wait, then retries the same account.
+const RATE_LIMIT_ABSORB_MAX_SECONDS =
+  Number(process.env.TEAMCLAUDE_RATE_LIMIT_ABSORB_MAX_SECONDS) || 60;
 
-export function createProxyServer(accountManager, config, hooks = {}) {
+// Response header names that are connection-specific and thus illegal on an
+// HTTP/2 response (Node's Http2ServerResponse.writeHead rejects them). Also
+// hop-by-hop on h1, so stripping them is correct on both paths.
+const CONNECTION_SPECIFIC_HEADERS = new Set([
+  'connection', 'keep-alive', 'transfer-encoding', 'upgrade',
+  'proxy-connection', 'te', 'trailer',
+]);
+
+// Constant-time proxy-API-key comparison (both the HTTP gate and the CONNECT
+// gate use it). Returns false on any type/length mismatch without leaking timing.
+export function safeKeyEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const ba = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (ba.length !== bb.length) return false;
+  return timingSafeEqual(ba, bb);
+}
+
+// True if a socket's remote address is loopback — the proxy-key gate exempts
+// localhost on both the HTTP and CONNECT paths.
+export function isLoopbackAddr(addr) {
+  return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1';
+}
+
+export function createProxyServer(accountManager, config, hooks = {}, sx = null) {
   const upstream = config.upstream || 'https://api.anthropic.com';
   const proxyApiKey = config.proxy?.apiKey;
   const logDir = config.logDir || null;
-  // How long a request may wait for a per-account concurrency slot to free when
-  // every available account is at its cap, before giving up with a 429. 0 = never
-  // queue (fail fast). Default 15s.
-  const queueTimeoutMs = Number.isFinite(config.overflowQueueTimeoutMs)
-    ? Math.max(0, config.overflowQueueTimeoutMs)
-    : 15000;
-  // Cap the buffered request body. The proxy must buffer the whole body to replay
-  // it across accounts on a 429/5xx, so an unbounded body is an unbounded buffer.
-  const maxBodyBytes = Number.isFinite(config.maxRequestBytes) && config.maxRequestBytes > 0
-    ? config.maxRequestBytes
-    : 32 * 1024 * 1024;
-  // Connection affinity: keep one client connection's sequential requests on the
-  // same account for prompt-cache locality (HTTP/1.1 keep-alive reuses the socket
-  // for a session's sequential turns). Soft — overflow still spreads. Set
-  // `sessionAffinity: false` to route purely by use-or-lose every request instead.
-  const sessionAffinity = config.sessionAffinity !== false;
-  let requestCounter = 0;
-  let inFlightProxied = 0; // proxied (non-status/oauth) requests currently being handled
 
   if (logDir) {
     mkdir(logDir, { recursive: true }).catch(() => {});
   }
 
-  // ── Active warm-up ─────────────────────────────────────────────────────────
-  // Quota is only learned from real upstream rate-limit headers (Anthropic has no
-  // "get my quota" endpoint), so a freshly (re)started proxy shows the whole fleet
-  // as "—" until client traffic happens to flow through every account. Active
-  // warm-up fixes that: it stages a request template from the first genuine
-  // /v1/messages and COMMITS it only after upstream accepts that request (2xx) —
-  // so a model/header combo upstream would reject can't seed a template that makes
-  // every probe fail. The committed template (exact model + anthropic-version +
-  // anthropic-beta + Claude-Code system) is replayed as a minimal probe
-  // (max_tokens: 1) against each still-unmeasured account to populate its quota.
-  // It fans out once the instant the template commits (right after the first
-  // post-restart request) AND periodically (config.warmupIntervalMs, default 5m;
-  // 0 = startup-only). Each probe is best-effort and side-effect-light: it never
-  // refreshes tokens or mutates account status, reserves a real cap slot so it
-  // can't push an account over maxConcurrent, and only learns from a 2xx (or an
-  // account-level quota 429). `config.activeWarmup: false` disables it all.
-  const activeWarmup = config.activeWarmup !== false;
-  const warmupIntervalMs = Number.isFinite(config.warmupIntervalMs)
-    ? Math.max(0, config.warmupIntervalMs)
-    : 5 * 60 * 1000;
-  const WARMUP_PROBE_TIMEOUT_MS = 15_000;
-  let probeTemplate = null;   // committed { model, version, beta, system } — only after a 2xx
-  let warmupInFlight = false; // guard against overlapping fan-outs
-  let warmupClosed = false;   // set on server close: stop scheduling, abort in-flight probes
-  const warmupAbort = new AbortController();
-
-  // Stage a candidate template from a genuine /v1/messages request WITHOUT
-  // committing — we only trust the shape once upstream has accepted it (see
-  // commitProbeTemplate). Path-exact so /v1/messages/count_tokens isn't taken for
-  // inference. Returns the candidate (or null). Called AFTER the response (the
-  // caller decides whether a commit/upgrade is even possible), so the body
-  // parse is only ever paid for the one or two requests that actually commit.
-  function stageProbeTemplate(req, body) {
-    if (!activeWarmup) return null;
-    if (req.method !== 'POST' || req.url.split('?')[0] !== '/v1/messages') return null;
-    let json;
-    try { json = JSON.parse(body.toString()); } catch { return null; }
-    if (!json || typeof json.model !== 'string') return null;
-    return {
-      model: json.model,
-      version: req.headers['anthropic-version'] || '2023-06-01',
-      beta: req.headers['anthropic-beta'] || null,
-      system: json.system ?? null,
-    };
-  }
-
-  // Commit a staged template once its request succeeded (2xx), then fan out so
-  // the rest of the fleet is measured within seconds of the first post-restart
-  // request. The MODEL matters beyond acceptance: model-scoped weekly windows
-  // (7d_oi — the "Fable" weekly limit) only appear on responses to requests for
-  // that model tier, so probes replaying e.g. a haiku-shaped template can never
-  // refresh the Fbl numbers. Therefore exactly one one-way UPGRADE is allowed:
-  // a shape whose own response carried a 7d_* window (elicitsModelWeekly)
-  // replaces a committed shape that didn't. No model names are hardcoded — the
-  // template converges to whatever tier actually reports the extra window.
-  function commitProbeTemplate(candidate, status, elicitsModelWeekly = false) {
-    if (!activeWarmup || warmupClosed) return;
-    if (!(status >= 200 && status < 300)) return; // only trust an accepted shape
-    if (probeTemplate && (probeTemplate._elicitsModelWeekly || !elicitsModelWeekly)) return;
-    probeTemplate = { ...candidate, _elicitsModelWeekly: elicitsModelWeekly };
-    setImmediate(() => { warmupUnmeasured(); });
-  }
-
-  function buildProbeBody(t) {
-    const b = { model: t.model, max_tokens: 1, messages: [{ role: 'user', content: 'ping' }] };
-    if (t.system != null) b.system = t.system; // mirror the real request (OAuth requires the system prompt)
-    return JSON.stringify(b);
-  }
-
-  // A probe fetch is bounded by BOTH a timeout and server-close, so a scheduled or
-  // in-flight probe can't keep sending a credentialed request after teardown.
-  // Returns { signal, cleanup }: the caller MUST call cleanup() when the probe
-  // settles (success OR failure) so a fast probe doesn't leave its 15s timer and
-  // its warmupAbort listener dangling until the timeout fires.
-  function probeSignal() {
-    const ac = new AbortController();
-    if (warmupAbort.signal.aborted) { ac.abort(); return { signal: ac.signal, cleanup() {} }; }
-    const onClose = () => ac.abort();
-    warmupAbort.signal.addEventListener('abort', onClose, { once: true });
-    const t = setTimeout(() => ac.abort(), WARMUP_PROBE_TIMEOUT_MS);
-    t.unref?.();
-    let cleaned = false;
-    const cleanup = () => {
-      if (cleaned) return;
-      cleaned = true;
-      clearTimeout(t);
-      warmupAbort.signal.removeEventListener('abort', onClose);
-    };
-    return { signal: ac.signal, cleanup };
-  }
-
-  // Probe one account: send a minimal /v1/messages with its own auth and fold the
-  // rate-limit headers into its quota. Best-effort and side-effect-light:
-  //  - Never refreshes tokens — a background refresh failure could mark the account
-  //    'error' and pull it from rotation before any real request proved auth. An
-  //    OAuth account with an expiring token is left to the client path (which has
-  //    the proper 401 → forced-refresh → error handling).
-  //  - Does NOT reserve a client concurrency slot. The hard rule is "client traffic
-  //    must not break". A probe that shared the per-account cap would inevitably
-  //    subtract one client slot, which — with the overflow queue disabled — lets
-  //    the proxy itself 429 a client when every slot is momentarily taken (no
-  //    account to fail over to). So the cap is left entirely to clients; a probe is
-  //    at most ONE extra concurrent request, and only ever on an idle, non-sticky,
-  //    unmeasured account (warmupCandidates requires inflight===0; real traffic
-  //    concentrates on the *measured* sticky account, not here). maxConcurrent is a
-  //    conservative soft cap kept under Anthropic's real per-account limit (see
-  //    CLAUDE.md, "the cap is not a hard binding"), so that transient +1 stays
-  //    safe — and in the unlikely event it did cause a client rate-429, the
-  //    existing 429 failover transparently recovers it, whereas a probe-induced
-  //    capacity 429 could not.
-  //  - Learns ONLY from a response upstream accepted (2xx) or an account-level
-  //    quota 429 ('rejected') — a 4xx / non-exhaustion 429 / 5xx never mutates state.
-  async function warmupAccount(account, { force = false } = {}) {
-    if (!probeTemplate || warmupClosed || account._warming) return;
-    // Don't refresh from a background probe; skip an OAuth account that needs one.
-    if (account.type === 'oauth' && isTokenExpiringSoon(account.expiresAt)) return;
-    // Re-confirm it's still an available, unmeasured, idle candidate — unless
-    // this is a FORCED re-measure (TUI Reload), which deliberately probes
-    // already-measured (and even throttled/near-quota) accounts to pull fresh
-    // upstream numbers. The idle/enabled screening for that path lives in
-    // refreshQuotaAll.
-    if (!force && !accountManager.warmupCandidates().includes(account)) return;
-    account._warming = true;
-    const probe = probeSignal();
+  const requestHandler = async (req, res) => {
     try {
-      const headers = { 'content-type': 'application/json', 'anthropic-version': probeTemplate.version };
-      if (probeTemplate.beta) headers['anthropic-beta'] = probeTemplate.beta;
-      if (account.type === 'oauth') headers['authorization'] = `Bearer ${account.credential}`;
-      else headers['x-api-key'] = account.credential;
-
-      const res = await fetch(`${upstream}/v1/messages`, {
-        method: 'POST', headers, body: buildProbeBody(probeTemplate), signal: probe.signal,
-      });
-      const rl = {};
-      for (const [k, v] of res.headers.entries()) {
-        if (k.startsWith('anthropic-ratelimit-')) rl[k] = v;
-      }
-      await res.body?.cancel();
-      // Learn ONLY from a response upstream accepted (2xx) or an *account-level*
-      // quota 429 — one whose `unified-status` is `rejected` (the account is
-      // genuinely over its limit). A non-exhaustion 429 (request-rate / global /
-      // transient) carries rate-limit headers too but is NOT account state;
-      // folding it in would wrongly mark the account measured/unavailable and
-      // break best-effort. updateQuota by OBJECT is reindex-safe; still skip a
-      // detached (removed-mid-fetch) account.
-      const accountExhausted429 = res.status === 429
-        && rl['anthropic-ratelimit-unified-status'] === 'rejected';
-      if ((res.ok || accountExhausted429) && Object.keys(rl).length
-          && accountManager.accounts[account.index] === account) {
-        accountManager.updateQuota(account, rl);
-        // Convergence accounting: a probe that leaves the account fully
-        // measured resets the fruitless-probe counter; one that leaves it
-        // half-measured (a header family missing) counts toward the cap.
-        if (accountManager._fullyMeasured(account)) {
-          account._partialProbes = 0;
-        } else {
-          account._partialProbes = (account._partialProbes || 0) + 1;
-          account._lastFruitlessProbeAt = Date.now(); // paces the slow retry backstop
-        }
-        console.log(`[TeamClaude] Warm-up measured account "${account.name}"`);
-        return true; // quota actually folded — the forced-refresh path counts these
-      } else if (accountManager.accounts[account.index] === account
-          && (res.ok || (res.status >= 400 && res.status < 500 && res.status !== 429))) {
-        // The probe COMPLETED with a DETERMINISTIC fruitless outcome — a 2xx
-        // with no rate-limit headers (contract violation that will repeat), or
-        // a 4xx (bad shape / revoked auth — same next time). Count it toward
-        // the convergence cap so such an upstream/account is not probed every
-        // interval forever. Transient trouble — 5xx, a non-exhaustion 429, or
-        // a network failure (the catch below) — is deliberately NOT counted: a
-        // fully unmeasured account has no reset timestamp, so no sweep would
-        // ever clear its counter, and counting a passing blip would abandon it
-        // permanently even after upstream recovers.
-        account._partialProbes = (account._partialProbes || 0) + 1;
-        account._lastFruitlessProbeAt = Date.now(); // paces the slow retry backstop
-      }
-    } catch (err) {
-      // Best-effort: leave the account unmeasured (exactly as before warm-up).
-      console.error(`[TeamClaude] Warm-up probe failed for "${account.name}": ${err.message}`);
-    } finally {
-      probe.cleanup(); // clear the timeout + warmupAbort listener now (not 15s later)
-      account._warming = false;
-    }
-    return false; // skipped, fruitless, or failed — nothing was measured
-  }
-
-  // Forced fleet re-measure (TUI Reload / R): probe EVERY enabled idle account,
-  // measured or not, so the dashboard reflects fresh upstream numbers on demand
-  // — usage spent from other devices/sessions never flows through this proxy,
-  // so the displayed values can silently drift until the next organic
-  // measurement. Throttled/near-quota accounts are included on purpose (their
-  // exhausted-429 responses still carry authoritative quota headers); accounts
-  // with a request in flight are skipped (that response refreshes them), as
-  // are disabled and auth-error accounts. The convergence budgets are renewed
-  // first — an explicit user action is a fresh reason to probe. Returns the
-  // number of accounts probed, or -1 when no probe template exists yet
-  // (nothing has flowed through the proxy, so there is no known-accepted
-  // request shape to replay).
-  async function refreshQuotaAll() {
-    if (!activeWarmup || warmupClosed || !probeTemplate) return -1;
-    const targets = accountManager.accounts.filter(a =>
-      a.enabled !== false && a.status !== 'error' && a.inflight === 0 && !a._warming);
-    // Revive lapsed tokens FIRST. Background probes never refresh tokens (a
-    // background failure could mark an account 'error' before any real request
-    // proved auth), so an account that has sat idle past its token lifetime
-    // gets silently skipped by warmupAccount's expiring-token guard — the
-    // no.1 reason a fleet-wide refresh would quietly update almost nothing.
-    // An explicit user action (R) is the right moment to pay that refresh:
-    // failures are the same actionable truth the client path would surface.
-    await Promise.all(targets.map(a =>
-      accountManager.ensureTokenFresh(a).catch(() => { /* surfaces via status/error below */ })));
-    const alive = targets.filter(a => a.status !== 'error');
-    for (const a of alive) a._partialProbes = 0;
-    const outcomes = await Promise.all(alive.map(a => warmupAccount(a, { force: true })));
-    // Honest accounting: `targets` is what the user asked to refresh, `measured`
-    // is what actually got fresh data — the TUI reports M/N, never a blanket
-    // "refreshed N" while probes silently skipped or failed.
-    return { targets: targets.length, measured: outcomes.filter(Boolean).length };
-  }
-
-  // Probe every currently-unmeasured idle account in parallel. Guarded so two
-  // triggers (first-commit + the interval) can't run overlapping fan-outs.
-  async function warmupUnmeasured() {
-    if (!activeWarmup || warmupClosed || !probeTemplate || warmupInFlight) return;
-    warmupInFlight = true;
-    try {
-      await Promise.all(accountManager.warmupCandidates().map(a => warmupAccount(a)));
-    } finally {
-      warmupInFlight = false;
-    }
-  }
-
-  // Periodic warm-up: re-measures any account that is still unmeasured — including
-  // one whose quota window just reset (its utilization is cleared, so the
-  // dashboard reads "—" again) — without waiting for client traffic to reach it.
-  let warmupTimer = null;
-  if (activeWarmup && warmupIntervalMs > 0) {
-    warmupTimer = setInterval(() => {
-      // Sweep expired quota windows first: a rolled-over window keeps its
-      // account "measured" (with stale values) until some request-path sweep
-      // runs, and warm-up only probes UNMEASURED accounts — so without this an
-      // idle proxy would never re-measure after a reset. Sweep → unmeasured →
-      // the fan-out below re-probes → fresh data → ordering/display update.
-      accountManager.sweepExpired();
-      warmupUnmeasured();
-    }, warmupIntervalMs);
-    warmupTimer.unref(); // never keep the process alive just for warm-up
-  }
-
-  const server = http.createServer(async (req, res) => {
-    try {
-      // Auth check — skip for localhost connections
+      // Auth check — skip for localhost connections.
       const clientKey = req.headers['x-api-key'];
-      const remoteAddr = req.socket.remoteAddress;
-      const isLocal = remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1';
-      if (proxyApiKey && clientKey !== proxyApiKey && !isLocal) {
+      const isLocal = isLoopbackAddr(req.socket.remoteAddress);
+      if (proxyApiKey && !safeKeyEqual(clientKey, proxyApiKey) && !isLocal) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           type: 'error',
@@ -301,179 +72,208 @@ export function createProxyServer(accountManager, config, hooks = {}) {
 
       // Status endpoint
       if (req.method === 'GET' && req.url === '/teamclaude/status') {
+        const status = accountManager.getStatus();
+        const extra = hooks.getStatusExtra?.() || {};
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(accountManager.getStatus(), null, 2));
+        res.end(JSON.stringify({ ...extra, ...status }, null, 2));
         return;
       }
 
-      // Everything below buffers a request body (the OAuth relay AND the proxied
-      // path) → global admission control to bound proxy memory: inFlightProxied
-      // may not exceed the fleet's useful capacity (sum of per-account caps +
-      // overflow queue depth), and we reject BEFORE buffering. Without this, body
-      // buffering happens before any queue admission, so N concurrent uploads each
-      // buffer up to maxBodyBytes regardless of queue depth — memory would grow
-      // with connection count (localhost auth is skipped, so any local process
-      // could flood, including via /v1/oauth/token). Bound: totalCapacity × maxBodyBytes.
-      if (inFlightProxied >= accountManager.totalCapacity()) {
-        req.resume(); // drain & discard the body so the socket isn't leaked
-        res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': '5' });
-        res.end(JSON.stringify({
-          type: 'error',
-          error: { type: 'rate_limit_error', message: 'Proxy at capacity; retry shortly.' },
-        }));
-        return;
-      }
-      inFlightProxied++;
-      try {
-        // Let client token refresh requests pass through to upstream untouched.
-        // The proxy manages its own tokens via ensureTokenFresh(); intercepting
-        // or rewriting client refreshes would cause token rotation conflicts.
-        if (req.method === 'POST' && req.url === '/v1/oauth/token') {
-          await relayRaw(req, res, upstream, maxBodyBytes);
-          return; // outer finally decrements inFlightProxied
+      // Reload endpoint — re-sync accounts from config without a restart. This
+      // is the headless equivalent of pressing 'R' in the TUI. Local control
+      // only (no upstream calls); the auth gate above already applies.
+      if (req.method === 'POST' && req.url === '/teamclaude/reload') {
+        if (!hooks.reload) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'reload not supported' }));
+          return;
         }
-
-        // Track request
-        const reqId = ++requestCounter;
-        hooks.onRequestStart?.(reqId, { method: req.method, path: req.url });
-
-        // tried429/tried5xx/authRetried hold account OBJECTS (not indexes), and
-        // `held` is the acquired account OBJECT — both stable across a concurrent
-        // removeAccount() re-index, so a release/exclude can't target the wrong account.
-        const ctx = { account: null, status: null, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null, sawModelWeekly: false };
         try {
-          // Buffer request body (needed for retry on 429), bounded by maxBodyBytes.
-          const bodyChunks = [];
-          let bodyLen = 0;
-          let bodyTooLarge = false;
-          for await (const chunk of req) {
-            bodyLen += chunk.length;
-            if (bodyLen > maxBodyBytes) { bodyTooLarge = true; break; }
-            bodyChunks.push(chunk);
-          }
-          if (bodyTooLarge) {
-            req.destroy();
-            if (!res.headersSent) {
-              res.writeHead(413, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({
-                type: 'error',
-                error: { type: 'invalid_request_error', message: `Request body exceeds ${maxBodyBytes} bytes.` },
-              }));
-            }
-            return;
-          }
-          const body = Buffer.concat(bodyChunks);
-
-          // Tie an abort signal to client disconnect so a request that's only
-          // WAITING in the overflow queue is cancelled if the client goes away —
-          // otherwise it would acquire a slot later and be dispatched upstream,
-          // burning quota for a response nobody is listening for.
-          const ac = new AbortController();
-          const onClose = () => ac.abort();
-          res.on('close', onClose);
-          ctx.abortSignal = ac.signal;
-          try {
-            await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
-            // Stage + commit the warm-up template AFTER the response: only an
-            // upstream-accepted shape (2xx via ctx.status) is trusted, and the
-            // response also tells us whether this request's model tier reports
-            // the model-scoped weekly windows (ctx.sawModelWeekly → the Fable
-            // limit) — the one property worth a one-way template upgrade.
-            if (!probeTemplate || (!probeTemplate._elicitsModelWeekly && ctx.sawModelWeekly)) {
-              const candidate = stageProbeTemplate(req, body);
-              if (candidate) commitProbeTemplate(candidate, ctx.status, ctx.sawModelWeekly === true);
-            }
-          } finally {
-            res.removeListener('close', onClose);
-          }
+          const added = await hooks.reload();
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, added: added || 0 }));
         } catch (err) {
-          ctx.status = ctx.status || 502;
-          console.error('[TeamClaude] Unhandled error:', err);
-          if (!res.headersSent) {
-            res.writeHead(502, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({
-              type: 'error',
-              error: { type: 'proxy_error', message: 'Internal proxy error' },
-            }));
-          }
-        } finally {
-          // Release the concurrency slot held by this request (if any). A failover
-          // releases the previous account before re-acquiring, so at this point only
-          // the last-held slot remains; releaseAccount guards against double-release.
-          if (ctx.held != null) {
-            accountManager.releaseAccount(ctx.held);
-            ctx.held = null;
-          }
-          hooks.onRequestEnd?.(reqId, {
-            method: req.method, path: req.url,
-            account: ctx.account, status: ctx.status,
-          });
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: err.message }));
         }
-      } finally {
-        inFlightProxied--;
+        return;
       }
+
+      return forward(req, res);
     } catch (err) {
       console.error('[TeamClaude] Unhandled error:', err);
     }
-  });
-
-  // Shut warm-up down the instant a close is REQUESTED, not when the `'close'`
-  // event finally fires — that waits for open keep-alive connections to drain,
-  // and during that window the interval could still dispatch a credentialed
-  // probe. Wrap server.close() to run the (idempotent) shutdown synchronously;
-  // keep the `'close'` handler as a fallback for closes that bypass the method.
-  // It stops scheduling new fan-outs (warmupClosed), aborts any in-flight /
-  // scheduled probe (warmupAbort), and clears the periodic timer.
-  const shutdownWarmup = () => {
-    if (warmupClosed) return;
-    warmupClosed = true;
-    warmupAbort.abort();
-    if (warmupTimer) clearInterval(warmupTimer);
   };
-  const closeServer = server.close.bind(server);
-  server.close = (cb) => { shutdownWarmup(); return closeServer(cb); };
-  server.on('close', shutdownWarmup);
 
-  // Exposed for the TUI Reload path (and tests): forced fleet-wide quota
-  // re-measure. Kept off the HTTP surface — it spends real upstream requests,
-  // so only a deliberate local action should trigger it.
-  server.refreshQuotaAll = refreshQuotaAll;
+  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx });
+  const server = http.createServer(requestHandler);
+
+  // Forward-proxy support (always on, so multiple claude instances can use
+  // either ANTHROPIC_BASE_URL or HTTPS_PROXY against the same server). A CONNECT
+  // to the upstream host is a transparent MITM relay (rewrite only auth); the
+  // test host is answered locally; anything else is blind-tunneled. Certs are
+  // minted lazily on the first intercepted CONNECT.
+  const mitmHost = (() => { try { return new URL(upstream).hostname; } catch { return 'api.anthropic.com'; } })();
+  let certsPromise = null;
+  const ensureLeaf = async () => {
+    // Reset the memo on failure so a transient cert error doesn't wedge the MITM
+    // path permanently (a cached rejected promise would re-throw on every CONNECT).
+    certsPromise ||= ensureCerts(mitmHost).catch((err) => { certsPromise = null; throw err; });
+    const c = await certsPromise;
+    return { key: c.leafKeyPem, cert: c.leafCertPem };
+  };
+  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks, log: console.error, sx }));
 
   return server;
 }
 
+// Resolve an account-pin token (from a `/tc-acct/<token>` URL) to an account
+// index, or null if it matches nothing. Matches by exact account name first,
+// then by numeric index. Exported for tests.
+export function resolveAccountPin(accountManager, token) {
+  const byName = accountManager.accounts.findIndex(a => a.name === token);
+  if (byName >= 0) return byName;
+  if (/^\d+$/.test(token)) {
+    const i = Number(token);
+    if (i >= 0 && i < accountManager.accounts.length) return i;
+  }
+  return null;
+}
+
+// Paths that must reach upstream with the client's own credential (never a
+// rotated account token): the Remote Control channel and attachment transfers.
+const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/files/', '/api/oauth/file_upload'];
+
 /**
- * Relay a request to upstream with no header rewriting — pure passthrough.
- * Buffers the body bounded by maxBodyBytes (else 413) so the untouched
- * `/v1/oauth/token` path can't be used to exhaust proxy memory.
+ * Build the core proxy request listener — buffer the body, then forward with
+ * account selection + retry (forwardRequest). Shared by the base HTTP server and
+ * the MITM's terminating h2/h1 server, so both get identical buffering, model-
+ * aware routing, and retry-on-quota behavior. Control endpoints (status/reload)
+ * and the proxy-API-key gate live in the base server's wrapper, not here.
  */
-async function relayRaw(req, res, upstream, maxBodyBytes = Infinity) {
-  const bodyChunks = [];
-  let bodyLen = 0;
-  let tooLarge = false;
-  for await (const chunk of req) {
-    bodyLen += chunk.length;
-    if (bodyLen > maxBodyBytes) { tooLarge = true; break; }
-    bodyChunks.push(chunk);
-  }
-  if (tooLarge) {
-    req.destroy();
-    if (!res.headersSent) {
-      res.writeHead(413, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: `Request body exceeds ${maxBodyBytes} bytes.` } }));
+export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null }) {
+  let counter = 0;
+  return async (req, res) => {
+    try {
+      // Client token refresh: pass through untouched (the proxy manages its own
+      // tokens via ensureTokenFresh; rewriting client refreshes would conflict).
+      if (req.method === 'POST' && req.url === '/v1/oauth/token') { await relayRaw(req, res, upstream, sx); return; }
+      // Remote Control (/v1/code/*) is bound to the session's paired claude.ai
+      // identity — forward with the client's OWN credential (streamed), never a
+      // rotated account token, which would 403 the worker event stream.
+      // Attachment transfers (/api/oauth/files/*, /api/oauth/file_upload) are
+      // likewise account-bound: files uploaded from claude.ai belong to the
+      // paired identity, so fetching them with a rotated token 403s and Claude
+      // Code silently drops the image from the message.
+      if (CLIENT_CREDENTIAL_PATHS.some((p) => (req.url || '').startsWith(p))) { await relayStream(req, res, upstream, sx); return; }
+
+      // Account pin: a request to `/tc-acct/<name-or-index>/...` (e.g. via
+      // ANTHROPIC_BASE_URL=http://host:port/tc-acct/deepseek) is forced onto that
+      // one account, bypassing rotation. Used by the keep-warm scheduler and for
+      // manual per-account testing. The prefix is stripped before forwarding.
+      let pinnedIndex = null;
+      const pin = (req.url || '').match(/^\/tc-acct\/([^/]+)(\/.*)$/);
+      if (pin) {
+        const token = decodeURIComponent(pin[1]);
+        pinnedIndex = resolveAccountPin(accountManager, token);
+        if (pinnedIndex == null) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `Unknown account pin "${token}"` } }));
+          return;
+        }
+        req.url = pin[2];
+      }
+
+      const reqId = ++counter;
+      hooks.onRequestStart?.(reqId, { method: req.method, path: req.url });
+
+      // Buffer request body (needed to resend on a different account after a 429).
+      // Peek the top-level `model` field incrementally as chunks arrive so the
+      // TUI can show it the instant it appears in the stream — usually the first
+      // frame — rather than waiting for the whole body and the request to finish.
+      const bodyChunks = [];
+      const modelFinder = new TopLevelFieldFinder('model');
+      for await (const chunk of req) {
+        bodyChunks.push(chunk);
+        if (!modelFinder.done) {
+          const found = modelFinder.push(chunk);
+          if (found) hooks.onRequestModel?.(reqId, { model: found });
+        }
+      }
+      const body = Buffer.concat(bodyChunks);
+
+      const model = modelFinder.done ? modelFinder.value : parseRequestModel(body);
+      const ctx = { account: null, status: null, tried: new Set(), model, pinnedIndex };
+      try {
+        await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir, sx);
+      } catch (err) {
+        ctx.status = ctx.status || 502;
+        console.error('[TeamClaude] Unhandled error:', err);
+        if (!res.headersSent) {
+          res.writeHead(502, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Internal proxy error' } }));
+        }
+      } finally {
+        hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model });
+      }
+    } catch (err) {
+      console.error('[TeamClaude] Unhandled error:', err);
     }
-    return;
-  }
+  };
+}
+
+/**
+ * Stream a request through to upstream with the client's OWN headers intact
+ * (including its authorization) and stream the response back — used for Remote
+ * Control (/v1/code/*), whose event stream must keep the paired credential and
+ * cannot be buffered.
+ */
+async function relayStream(req, res, upstream, sx) {
+  const bodyChunks = [];
+  for await (const chunk of req) bodyChunks.push(chunk);
   const body = Buffer.concat(bodyChunks);
 
-  // Abort the relay if the client disconnects, so a hung upstream OAuth endpoint
-  // can't pin this connection (and its admission-control inFlightProxied slot)
-  // forever. Tied to res 'close'; the listener is removed once we're done.
-  const ac = new AbortController();
-  const onClose = () => ac.abort();
-  res.on('close', onClose);
+  const headers = {};
+  for (const [key, value] of Object.entries(req.headers)) {
+    const lk = key.toLowerCase();
+    if (lk.startsWith(':') || HOP_BY_HOP_HEADERS.has(lk) || lk === 'accept-encoding') continue;
+    headers[key] = value;
+  }
+
   try {
-    const upstreamRes = await fetch(`${upstream}${req.url}`, {
+    const upstreamRes = await upstreamFetch(`${upstream}${req.url}`, {
+      method: req.method, headers,
+      body: ['GET', 'HEAD'].includes(req.method) ? undefined : (body.length ? body : undefined),
+      redirect: 'manual',
+    }, sx, sx?.useByDefault());
+
+    const responseHeaders = {};
+    for (const [key, value] of upstreamRes.headers.entries()) {
+      if (CONNECTION_SPECIFIC_HEADERS.has(key) || key === 'content-encoding' || key === 'content-length') continue;
+      responseHeaders[key] = value;
+    }
+    res.writeHead(upstreamRes.status, responseHeaders);
+    if (upstreamRes.body) { for await (const chunk of upstreamRes.body) res.write(chunk); }
+    res.end();
+  } catch (err) {
+    console.error('[TeamClaude] Remote Control relay error:', err.message);
+    if (!res.headersSent) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Upstream unreachable' } }));
+    }
+  }
+}
+
+/**
+ * Relay a request to upstream with no header rewriting — pure passthrough.
+ */
+async function relayRaw(req, res, upstream, sx) {
+  const bodyChunks = [];
+  for await (const chunk of req) bodyChunks.push(chunk);
+  const body = Buffer.concat(bodyChunks);
+
+  try {
+    const upstreamRes = await upstreamFetch(`${upstream}${req.url}`, {
       method: req.method,
       headers: {
         'content-type': req.headers['content-type'] || 'application/json',
@@ -481,30 +281,26 @@ async function relayRaw(req, res, upstream, maxBodyBytes = Infinity) {
         'user-agent': req.headers['user-agent'] || 'node',
       },
       body: body.length > 0 ? body : undefined,
-      signal: ac.signal,
-    });
+    }, sx, sx?.useByDefault());
 
     const responseBody = await upstreamRes.text();
     const responseHeaders = {};
     for (const [key, value] of upstreamRes.headers.entries()) {
-      if (key === 'transfer-encoding' || key === 'connection') continue;
+      // `.text()` already decompressed the body, so drop content-encoding and
+      // the now-stale content-length (both refer to the compressed bytes) — else
+      // a gzip'd upstream response reaches the client mis-framed / truncated.
+      if (key === 'transfer-encoding' || key === 'connection' ||
+          key === 'content-encoding' || key === 'content-length') continue;
       responseHeaders[key] = value;
     }
     res.writeHead(upstreamRes.status, responseHeaders);
     res.end(responseBody);
   } catch (err) {
-    // Client disconnected → we aborted the relay; nothing to respond to.
-    if (ac.signal.aborted || err?.name === 'AbortError' || err?.code === 'ABORT_ERR' || res.destroyed) {
-      if (!res.writableEnded) res.destroy();
-      return;
-    }
     console.error('[TeamClaude] Raw relay error:', err.message);
     if (!res.headersSent) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Upstream unreachable' } }));
     }
-  } finally {
-    res.removeListener('close', onClose);
   }
 }
 
@@ -515,15 +311,28 @@ function logTimestamp() {
   return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`;
 }
 
-async function writeRequestLog(logDir, reqId, sections) {
-  if (!logDir) return;
-  const ts = logTimestamp();
-  const filename = `${ts}_${String(reqId).padStart(5, '0')}.log`;
-  try {
-    await writeFile(join(logDir, filename), sections.join('\n\n'), 'utf-8');
-  } catch (err) {
-    console.error(`[TeamClaude] Failed to write log: ${err.message}`);
-  }
+// A per-request log that streams to disk as the request/response flow, instead
+// of buffering the whole body in memory and writing once at the end. The file
+// is opened on first write; header sections are written verbatim and bodies are
+// streamed through BodyWriter (JSON pretty-printed on the fly, SSE/other raw),
+// so even a ~1M-token response costs only the current chunk.
+function openRequestLog(logDir, reqId) {
+  const filename = `${logTimestamp()}_${String(reqId).padStart(5, '0')}.log`;
+  const ws = createWriteStream(join(logDir, filename), { flags: 'a' });
+  ws.on('error', (err) => console.error(`[TeamClaude] Failed to write log: ${err.message}`));
+  let ended = false;
+  const write = (s) => { if (!ended && s) ws.write(Buffer.from(String(s), 'latin1')); };
+  return {
+    write,
+    // Stream a complete body buffer under a section header.
+    body(label, buf, contentType) {
+      if (!buf || !buf.length) { write(`\n\n=== ${label} ===\n(empty)`); return; }
+      new BodyWriter(write, label, contentType || '').chunk(buf);
+    },
+    // A BodyWriter to append chunks incrementally (e.g. an SSE response).
+    bodyWriter(label, contentType) { return new BodyWriter(write, label, contentType || ''); },
+    end() { if (!ended) { ended = true; ws.end('\n'); } },
+  };
 }
 
 function formatHeaders(headers) {
@@ -533,107 +342,48 @@ function formatHeaders(headers) {
   return Object.entries(headers).map(([k, v]) => `  ${k}: ${v}`).join('\n');
 }
 
-// Upstream statuses that are transient and safe to retry instead of surfacing to
-// the client. 529 = "Overloaded" (Anthropic at capacity); 500/502/503/504 =
-// gateway / availability blips. Passing these straight through fails the client's
-// turn — e.g. Claude Code prints "API Error: 529 Overloaded" and stops — so
-// forwardRequest fails them over to another account and, when the whole fleet is
-// overloaded, retries with a bounded exponential backoff before giving up.
-const RETRYABLE_STATUS = new Set([500, 502, 503, 504, 529]);
-// Sleep that also resolves immediately if `signal` aborts — so a client that
-// disconnects during an overload backoff doesn't keep its account slot reserved
-// for the whole (up to multi-second) wait. Cleans up its timer/listener either way.
-function sleepOrAbort(ms, signal) {
-  return new Promise((resolve) => {
-    if (signal?.aborted) return resolve();
-    const cleanup = () => { clearTimeout(t); signal?.removeEventListener('abort', onAbort); };
-    const onAbort = () => { cleanup(); resolve(); };
-    const t = setTimeout(() => { cleanup(); resolve(); }, ms);
-    signal?.addEventListener('abort', onAbort, { once: true });
-  });
-}
-
-// Await `promise`, but stop waiting the instant `signal` aborts (client gone).
-// The underlying op (e.g. a coalesced token refresh shared by other requests)
-// is NOT cancelled — we only stop *this* request from blocking on it, so its
-// account slot can be released promptly. Rejections still propagate.
-function raceAbort(promise, signal) {
-  if (!signal) return promise;
-  if (signal.aborted) return Promise.resolve();
-  return new Promise((resolve, reject) => {
-    const cleanup = () => signal.removeEventListener('abort', onAbort);
-    const onAbort = () => { cleanup(); resolve(); };
-    signal.addEventListener('abort', onAbort, { once: true });
-    promise.then(
-      (v) => { cleanup(); resolve(v); },
-      (e) => { cleanup(); reject(e); },
-    );
-  });
-}
-
-// parseInt with a default that HONORS an explicit 0 — unlike `parseInt(...) || def`,
-// which discards a valid 0 (0 is falsy). e.g. TEAMCLAUDE_OVERLOAD_RETRIES=0 must
-// actually disable proxy-held backoff retries during an incident, not fall back to
-// the default. Mirrors the Number.isFinite guard used for reevalIntervalMs in index.js.
-const envInt = (name, def) => {
-  const v = parseInt(process.env[name], 10);
-  return Number.isFinite(v) ? v : def;
-};
-
-async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir) {
+export async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, useSx) {
   const maxRetries = accountManager.accounts.length;
+  // Whether THIS attempt dials via sx.org. Undefined on the first call → derive
+  // from the default policy ('always' routes; 'off'/'429' start direct).
+  const route = useSx === undefined ? !!(sx?.useByDefault()) : useSx;
 
-  // Select account. On a failover retry (a prior account 429'd / 5xx'd for this
-  // request) ctx.tried* is non-empty → pick a different account, skipping the
-  // ones already tried.
-  const excludeForSelect = (ctx.tried429.size || ctx.tried5xx.size)
-    ? new Set([...ctx.tried429, ...ctx.tried5xx])
-    : null;
-
-  // Reserve a per-account concurrency slot. On a 401 same-account refresh-retry
-  // the slot is already held (ctx.held set, exclude unchanged) → reuse it.
-  // Otherwise acquire a fresh slot, waiting briefly if every available account is
-  // at its cap (overflow queue) before giving up with a 429. Releasing this slot
-  // before any account-switching retry is the caller's job, via releaseHeld().
-  let account;
-  if (ctx.held != null) {
-    account = ctx.held;
-  } else {
-    account = await accountManager.acquireAccount(excludeForSelect, ctx.queueTimeoutMs, ctx.abortSignal, ctx.affinityKey);
-    if (account) ctx.held = account;
-  }
-  const releaseHeld = () => {
-    if (ctx.held != null) {
-      accountManager.releaseAccount(ctx.held);
-      ctx.held = null;
-    }
-  };
-
-  // The client disconnected while this request was queued (acquireAccount was
-  // cancelled by the abort signal) — nothing to respond to.
-  if (!account && (ctx.abortSignal?.aborted || res.destroyed)) return;
-
+  // Select account, skipping any already tried (and failed) this request.
+  // The model scopes availability so a Fable-exhausted account is skipped only
+  // for Fable requests (it still serves other models).
+  // A pinned request (via /tc-acct/<name>) forces one exact account and never
+  // rotates or fails over: once that account has been tried, `account` is null
+  // and the caller gets the exhausted response rather than leaking to another.
+  const account = ctx.pinnedIndex != null
+    ? (ctx.tried.has(ctx.pinnedIndex) ? null : accountManager.accounts[ctx.pinnedIndex])
+    : accountManager.getActiveAccount(ctx.tried, ctx.model);
   if (!account) {
-    ctx.account = '(none available)';
-    // If every account is in auth-error state, this is an authentication
-    // problem (revoked/expired tokens needing re-login), not a rate limit —
-    // return 401 so the client surfaces it instead of pointlessly backing off.
-    const accts = accountManager.accounts;
-    if (accts.length > 0 && accts.every(a => a.status === 'error')) {
-      ctx.status = 401;
-      res.writeHead(401, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        type: 'error',
-        error: {
-          type: 'authentication_error',
-          message: `All ${accts.length} accounts failed authentication. Re-login required.`,
-        },
-      }));
+    // A pinned request concerns exactly one account: don't compute a fleet-wide
+    // retry-after or sleep on other accounts' windows — return immediately.
+    if (ctx.pinnedIndex != null) {
+      ctx.status = 429;
+      ctx.account = '(pinned account unavailable)';
+      if (!res.headersSent) {
+        res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': '5' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'rate_limit_error', message: 'Pinned account is unavailable (rate-limited, errored, or already tried). Retry shortly.' },
+        }));
+      }
       return;
     }
     ctx.status = 429;
+    ctx.account = '(none available)';
     const status = accountManager.getStatus();
-    const retryAfter = computeRetryAfter(status.accounts, accountManager.switchThreshold);
+    const retryAfter = computeRetryAfter(status.accounts);
+    const exhaustedRetries = ctx.exhaustedRetries || 0;
+    if (exhaustedRetries < 1 && retryAfter <= INLINE_RETRY_AFTER_MAX_SECONDS) {
+      ctx.exhaustedRetries = exhaustedRetries + 1;
+      console.log(`[TeamClaude] All accounts exhausted — waiting ${retryAfter}s before retry`);
+      await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
+      if (res.destroyed) return;
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
+    }
     res.writeHead(429, {
       'Content-Type': 'application/json',
       'retry-after': String(retryAfter),
@@ -642,7 +392,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       type: 'error',
       error: {
         type: 'rate_limit_error',
-        message: `All ${accts.length} accounts exhausted. Retry in ${retryAfter}s.`,
+        message: `All ${accountManager.accounts.length} accounts exhausted. Retry in ${retryAfter}s.`,
       },
     }));
     return;
@@ -652,38 +402,11 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   ctx.account = account.name;
   hooks.onRequestRouted?.(reqId, { account: account.name });
 
-  // Refresh OAuth token if needed. Stop waiting if the client disconnects (the
-  // refresh is coalesced/shared, so we don't cancel it — we just don't pin this
-  // request's account slot on a possibly-hung token endpoint).
-  await raceAbort(accountManager.ensureTokenFresh(account), ctx.abortSignal);
-  if (res.destroyed || ctx.abortSignal?.aborted) return; // client gone — outer finally frees the slot
-
-  // The account may have been REMOVED (TUI/CLI delete) during the awaited refresh
-  // above (or the 401 forced-refresh that recurses back here). A detached account
-  // must not be used to dispatch upstream — its slot release is a no-op and we'd
-  // be sending traffic on a credential the operator just retired. Re-select a live
-  // account instead. (accounts[i] === account holds only while it's still live.)
-  if (accountManager.accounts[account.index] !== account) {
-    releaseHeld();
-    if (res.destroyed) return; // client gone — outer finally cleans up
-    if (retryCount < maxRetries) {
-      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
-    }
-    // Out of retry budget after repeated removals — respond rather than hang.
-    ctx.status = 503;
-    if (!res.headersSent) {
-      res.writeHead(503, { 'Content-Type': 'application/json', 'retry-after': '5' });
-      res.end(JSON.stringify({
-        type: 'error',
-        error: { type: 'overloaded_error', message: 'Account removed mid-request; retry shortly.' },
-      }));
-    }
-    return;
-  }
-
+  // Refresh OAuth token if needed
+  await accountManager.ensureTokenFresh(account.index);
   if (account.status === 'error' && retryCount < maxRetries) {
-    releaseHeld(); // failing over to a different account
-    return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+    ctx.tried.add(account.index);
+    return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
   }
 
   // Build upstream request headers
@@ -691,6 +414,9 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   const headers = {};
   for (const [key, value] of Object.entries(req.headers)) {
     const lk = key.toLowerCase();
+    // HTTP/2 pseudo-headers (:method, :path, :authority, :scheme) live in
+    // req.headers on the h2 server path; fetch rejects `:`-prefixed names.
+    if (lk.startsWith(':')) continue;
     if (HOP_BY_HOP_HEADERS.has(lk)) continue;
     if (lk === 'x-api-key') continue;
     // Strip accept-encoding: Node fetch auto-decompresses, which would
@@ -705,46 +431,54 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     headers['x-api-key'] = account.credential;
   }
 
-  const upstreamUrl = `${upstream}${req.url}`;
+  const upstreamUrl = `${account.upstream || upstream}${req.url}`;
   const method = req.method;
 
-  // Build log sections
-  const logSections = [];
-  if (logDir) {
+  // Align the body's account_uuid (in metadata.user_id) with the account whose
+  // token we're injecting (same-length patch; no-op if absent).
+  let sendBody = account.accountUuid ? patchAccountUuid(body, account.accountUuid) : body;
+  // Rewrite the model name for accounts that target a different upstream (e.g.
+  // GLM), which uses different model identifiers than Anthropic.
+  if (account.modelMap) sendBody = rewriteModel(sendBody, account.modelMap);
+  // If the body changed length (model name rewrite), update Content-Length so the
+  // upstream doesn't receive a mismatched framing and truncate or stall.
+  if (sendBody !== body) headers['content-length'] = String(sendBody.length);
+
+  // Streaming request log, opened lazily on the first terminal outcome (a
+  // pure-429-then-retry attempt writes no file, matching prior behavior). The
+  // request head+body are written once, just before the response is logged.
+  let log = null;
+  let reqLogged = false;
+  const getLog = () => (logDir ? (log ||= openRequestLog(logDir, reqId)) : null);
+  const logRequestHead = () => {
+    const l = getLog();
+    if (!l || reqLogged) return;
+    reqLogged = true;
     const safeHeaders = { ...headers };
-    // Mask credentials in logs
-    if (safeHeaders['x-api-key']) {
-      safeHeaders['x-api-key'] = safeHeaders['x-api-key'].slice(0, 15) + '...';
-    }
-    if (safeHeaders['authorization']) {
-      safeHeaders['authorization'] = safeHeaders['authorization'].slice(0, 20) + '...';
-    }
-    logSections.push(
-      `=== REQUEST (account: ${account.name}, retry: ${retryCount}) ===\n${method} ${upstreamUrl}\n${formatHeaders(safeHeaders)}`,
-    );
-    if (body.length > 0) {
-      try {
-        logSections.push(`=== REQUEST BODY ===\n${JSON.stringify(JSON.parse(body.toString()), null, 2)}`);
-      } catch {
-        logSections.push(`=== REQUEST BODY (${body.length} bytes) ===\n${body.toString().slice(0, 4096)}`);
-      }
-    }
-  }
+    if (safeHeaders['x-api-key']) safeHeaders['x-api-key'] = safeHeaders['x-api-key'].slice(0, 15) + '...';
+    if (safeHeaders['authorization']) safeHeaders['authorization'] = safeHeaders['authorization'].slice(0, 20) + '...';
+    l.write(`=== REQUEST (account: ${account.name}, retry: ${retryCount}) ===\n${method} ${upstreamUrl}\n${formatHeaders(safeHeaders)}`);
+    if (body.length > 0) l.body('REQUEST BODY', body, req.headers['content-type']);
+  };
 
   try {
-    const upstreamRes = await fetch(upstreamUrl, {
-      method,
-      headers,
-      body: ['GET', 'HEAD'].includes(method) ? undefined : body,
-      redirect: 'manual',
-      // Abort the upstream call when the client disconnects (ctx.abortSignal is
-      // tied to res 'close'). Without this, a client that drops mid-SSE while the
-      // upstream stalls would leave streamResponse blocked in reader.read(), so
-      // the per-account slot and inFlightProxied never release — repeated stalls
-      // would leak the proxy to capacity. Aborting rejects the read and unwinds
-      // the finally that frees the slot.
-      signal: ctx.abortSignal,
-    });
+    // Storm control: pace requests onto a freshly-switched account so a failover
+    // burst doesn't slam it all at once and cascade (issue #84). The slot is held
+    // only until the response headers arrive — long enough to stagger the burst,
+    // then released so streaming bodies don't tie up concurrency. Fail-open: a
+    // client that disconnects while waiting just drops out.
+    if (!await accountManager.admit(account.index, () => res.destroyed)) return;
+    let upstreamRes;
+    try {
+      upstreamRes = await upstreamFetch(upstreamUrl, {
+        method,
+        headers,
+        body: ['GET', 'HEAD'].includes(method) ? undefined : sendBody,
+        redirect: 'manual',
+      }, sx, route);
+    } finally {
+      accountManager.release(account.index);
+    }
 
     // Extract rate limit headers
     const rateLimitHeaders = {};
@@ -753,237 +487,114 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         rateLimitHeaders[key] = value;
       }
     }
-    // Did this request's model tier report a model-scoped weekly window
-    // (anthropic-ratelimit-unified-7d_<label>-*)? Only such requests can teach
-    // probes to refresh the Fable weekly numbers — used by the template-upgrade
-    // decision in the request handler. Request-scoped: any attempt's headers
-    // prove the property, since the request shape is identical across failovers.
-    if (Object.keys(rateLimitHeaders).some(k => k.startsWith('anthropic-ratelimit-unified-7d_'))) {
-      ctx.sawModelWeekly = true;
-    }
-    accountManager.updateQuota(account, rateLimitHeaders);
+    accountManager.updateQuota(account.index, rateLimitHeaders);
 
-    // 401 = auth failure (stale or revoked token). For OAuth, attempt one
-    // forced token refresh and retry the same account (the token may be stale
-    // but still refreshable). If that doesn't fix it — refresh fails, the token
-    // is revoked, or it's an API-key account — mark the account 'error' so it's
-    // excluded from BOTH selection and warm-up, then switch to another account.
-    // Without this, warm-up would keep routing client traffic to a revoked
-    // account (it stays unmeasured/active), yielding repeated 401s.
-    if (upstreamRes.status === 401) {
-      await upstreamRes.body?.cancel();
+    // Any non-429 response is live proof a rate-limit hold no longer binds —
+    // this is what lets a revalidation probe (a throttled account selected by
+    // _selectProbe) clear its own hold and return the fleet to service.
+    if (upstreamRes.status !== 429) accountManager.clearRateLimited(account.index);
 
-      if (account.type === 'oauth' && account.refreshToken
-          && !ctx.authRetried.has(account)
-          && retryCount < maxRetries && !res.destroyed) {
-        ctx.authRetried.add(account);
-        console.log(`[TeamClaude] 401 on "${account.name}" — forcing token refresh and retrying`);
-        await raceAbort(accountManager.ensureTokenFresh(account, true), ctx.abortSignal);
-        if (res.destroyed || ctx.abortSignal?.aborted) return; // client gone during refresh
-        // ensureTokenFresh only marks 'error' for an expired token; a successful
-        // (or non-fatal) refresh leaves status intact → retry the same account.
-        if (account.status !== 'error') {
-          if (logDir) {
-            logSections.push(`=== RESPONSE 401 — forced token refresh, retrying ===`);
-            writeRequestLog(logDir, reqId, logSections);
-          }
-          return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
-        }
-      }
-
-      // Refresh didn't help (failed / already retried / revoked-but-unexpired)
-      // or it's an API-key account — fail this account out and switch.
-      if (account.status !== 'error') {
-        account.status = 'error';
-        console.log(`[TeamClaude] 401 on "${account.name}" — auth failed, marking account error`);
-      }
-      if (logDir) {
-        logSections.push(`=== RESPONSE 401 — auth failure, account marked error ===\n${formatHeaders(upstreamRes.headers)}`);
-        writeRequestLog(logDir, reqId, logSections);
-      }
-      if (res.destroyed) return;
-      if (retryCount < maxRetries) {
-        releaseHeld(); // this account is now 'error'; fail over to another
-        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
-      }
-      // Every account failed auth — surface the 401 to the client.
-      ctx.status = 401;
-      if (!res.headersSent) {
-        res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-          type: 'error',
-          error: { type: 'authentication_error', message: 'All accounts failed authentication.' },
-        }));
-      }
-      return;
-    }
-
-    // Handle 429s. A 429 can mean two very different things:
-    //   (a) this account is out of quota (account-level exhaustion), or
-    //   (b) a transient / global / IP / request-level limit that would 429 on
-    //       any account.
-    // Only (a) should throttle the account and switch; replaying (b) across the
-    // fleet would mark every account throttled and break unrelated requests.
-    // isExhausted() (checked after updateQuota folds in the 429 headers)
-    // distinguishes them.
+    // Two kinds of 429 are handled differently below: a quota rejection rotates
+    // to another account; a transient rate-limit throttle pauses + retries the
+    // same account (never rotates — see #84).
     if (upstreamRes.status === 429) {
+      // Clamp Retry-After to a sane window: missing/invalid falls back to 60s,
+      // and out-of-range values are bounded to [1, 300]. A negative value would
+      // otherwise bypass the wait cap — setTimeout returns immediately and a
+      // pause/hold would be armed in the past.
       let retryAfter = parseInt(upstreamRes.headers.get('retry-after'), 10);
       if (Number.isNaN(retryAfter)) retryAfter = 60;
-      retryAfter = Math.min(Math.max(retryAfter, 1), 300); // clamp [1s, 5m]
       // Discard the 429 response body
       await upstreamRes.body?.cancel();
 
-      if (accountManager.isExhausted(account)) {
-        // (a) Account-level exhaustion: throttle this account (so
-        // getActiveAccount skips it until it resets) and immediately
-        // re-dispatch to another available account — never sleep holding the
-        // client. When every account is throttled, getActiveAccount returns
-        // null and the client gets a 429 to back off on its own.
-        console.log(`[TeamClaude] 429 (quota exhausted) on "${account.name}" — throttling ${retryAfter}s, switching accounts`);
-        accountManager.markRateLimited(account, retryAfter);
-        if (logDir) {
-          logSections.push(`=== RESPONSE 429 — account quota exhausted, throttled ${retryAfter}s, switching ===\n${formatHeaders(upstreamRes.headers)}`);
-          writeRequestLog(logDir, reqId, logSections);
+      // Durable quota exhaustion vs. a transient rate limit. A "rejected" unified
+      // status means a quota bucket is spent, so waiting and retrying the SAME
+      // account is futile — switch to another account now (updateQuota above
+      // already recorded the spent bucket's utilization from the headers).
+      const rl = rateLimitHeaders;
+      const generalRejected = rl['anthropic-ratelimit-unified-5h-status'] === 'rejected'
+        || rl['anthropic-ratelimit-unified-7d-status'] === 'rejected';
+      const fableRejected = rl['anthropic-ratelimit-unified-7d_oi-status'] === 'rejected' && !generalRejected;
+      if ((generalRejected || fableRejected) && retryCount < maxRetries) {
+        // A Fable-only rejection leaves the account fine for other models, so we
+        // do NOT throttle it globally — the recorded Fable utilization makes
+        // selection skip it for Fable requests only. A general rejection spends a
+        // shared bucket, so hold the whole account for its reset window.
+        if (fableRejected) {
+          console.log(`[TeamClaude] Fable weekly exhausted on "${account.name}" — switching account for this Fable request`);
+        } else {
+          const hold = Math.min(Math.max(retryAfter, 1), 3600);
+          console.log(`[TeamClaude] Quota rejection (429) on "${account.name}" — throttling ${hold}s and switching account`);
+          accountManager.markRateLimited(account.index, hold);
         }
+        ctx.tried.add(account.index);
         if (res.destroyed) return;
-
-        // Safety backstop: each retry throttles a distinct account, so
-        // getActiveAccount returns null before this can fire. Cap anyway.
-        if (retryCount >= maxRetries) {
-          ctx.status = 429;
-          const ra = computeRetryAfter(accountManager.getStatus().accounts, accountManager.switchThreshold);
-          if (!res.headersSent) {
-            res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': String(ra) });
-            res.end(JSON.stringify({
-              type: 'error',
-              error: { type: 'rate_limit_error', message: `All accounts throttled. Retry in ${ra}s.` },
-            }));
-          }
-          return;
-        }
-        releaseHeld(); // throttled this account; switch to another
-        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
       }
 
-      // (b) Non-exhaustion 429: usually an account-level request-rate /
-      // concurrency limit (the account still has token quota, but is being hit
-      // too fast) — or a transient / global limit. Try ANOTHER account for THIS
-      // request (per-request exclusion via ctx.tried429) so concurrent overflow
-      // spreads to an idle account instead of failing. Crucially we do NOT
-      // throttle the account: throttling on a request-global 429 would poison
-      // the fleet for unrelated requests. Only when every available account has
-      // been tried for this request (→ effectively global) is the 429 passed
-      // through to the client; no account state is mutated either way.
-      ctx.tried429.add(account);
-      if (!res.destroyed && retryCount < maxRetries
-          && (accountManager.anyUsable(ctx.tried429) || accountManager.anyCapped(ctx.tried429))) {
-        console.log(`[TeamClaude] 429 (rate/transient) on "${account.name}" — switching account for this request`);
-        if (logDir) {
-          logSections.push(`=== RESPONSE 429 — rate/transient, switching account (not throttled) ===\n${formatHeaders(upstreamRes.headers)}`);
-          writeRequestLog(logDir, reqId, logSections);
-        }
-        releaseHeld(); // free this account's slot before trying another
-        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+      retryAfter = Math.min(Math.max(retryAfter, 1), 300);
+
+      // sx.org failover: 429s are IP-based, so retry via the proxy's egress IP.
+      // 'always' is already on sx; '429' switches direct→sx now and skips the
+      // wait (a fresh IP isn't throttled). Also arm the sticky window for MITM.
+      const nextUseSx = !!(sx?.useOn429());
+      const switchingToSx = nextUseSx && !route;
+      sx?.noteRateLimited(retryAfter);
+
+      // This is a rate-limit 429 (per-minute throttle), NOT quota exhaustion —
+      // quota rejection is handled above and is the only thing that rotates.
+      // Do NOT switch accounts here: moving the burst to the next account just
+      // throttles it too (thundering herd, #84) and discards this account's KV
+      // cache. Instead PAUSE this account so concurrent requests wait in admit()
+      // (capped, then released through a fresh ramp) instead of piling on, and
+      // retry the SAME account. The pause never marks the account throttled, so
+      // selection keeps choosing it.
+      accountManager.pauseAccount(account.index, Math.min(retryAfter, RATE_LIMIT_ABSORB_MAX_SECONDS));
+
+      // sx fresh-IP retry (still the same account) takes precedence over waiting.
+      // Bounded by retryCount like the inline-wait path below, so a persistently
+      // 429ing upstream can't loop forever through sx.
+      if (switchingToSx && retryCount < maxRetries) {
+        console.log(`[TeamClaude] 429 on "${account.name}" — retrying via sx.org (fresh egress IP)`);
+        if (res.destroyed) return;
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, nextUseSx);
       }
 
-      console.log(`[TeamClaude] 429 (global) on "${account.name}" — every account tried, passing through`);
+      // Absorb short waits inline on the same account — the client never sees the
+      // 429. Bounded by retryCount (maxRetries = account count) so a persistently
+      // rate-limited account can't loop forever tying up the connection.
+      if (retryAfter <= RATE_LIMIT_ABSORB_MAX_SECONDS && retryCount < maxRetries) {
+        console.log(`[TeamClaude] Rate-limit 429 on "${account.name}" — waiting ${retryAfter}s, retrying same account (no switch)`);
+        await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
+        if (res.destroyed) return;
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, nextUseSx);
+      }
+
+      // Longer retry-after (or retries exhausted): don't hold the connection and
+      // don't rotate — surface the 429 with retry-after so the client backs off.
+      // The pause above keeps other requests off this account meanwhile.
+      console.log(`[TeamClaude] Rate-limit 429 on "${account.name}" — retry-after ${retryAfter}s over inline cap; returning 429 to client (no switch)`);
       ctx.status = 429;
-      if (logDir) {
-        logSections.push(`=== RESPONSE 429 — global, passed through after trying all accounts ===\n${formatHeaders(upstreamRes.headers)}`);
-        writeRequestLog(logDir, reqId, logSections);
-      }
-      if (res.destroyed) return;
-      if (!res.headersSent) {
+      if (!res.headersSent && !res.destroyed) {
         res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': String(retryAfter) });
-        res.end(JSON.stringify({
-          type: 'error',
-          error: { type: 'rate_limit_error', message: `Upstream rate limited (retry in ${retryAfter}s).` },
-        }));
+        res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: `Rate limited; retry in ${retryAfter}s.` } }));
       }
       return;
     }
 
-    // Handle retryable upstream 5xx (notably 529 "Overloaded" — Anthropic is over
-    // capacity). Unlike a 429, a 529 is NOT account-specific: every account hits
-    // the same overloaded upstream. Surfacing it fails the client's turn, so:
-    //   (1) fail this request over to another account (cheap; for 500/502/503/504 a
-    //       different account/region is occasionally healthier), then
-    //   (2) once every account has 5xx'd for this request, wait a bounded
-    //       exponential backoff and retry the whole fleet — the client transparently
-    //       gets the eventual success instead of an error.
-    // Only after the backoff budget is spent is the 5xx surfaced (so the client is
-    // never left hanging indefinitely). No account state is mutated — a 529 is
-    // upstream overload, not a bad account.
-    if (RETRYABLE_STATUS.has(upstreamRes.status)) {
-      const code = upstreamRes.status;
-      await upstreamRes.body?.cancel();
-
-      const maxOverload = Math.max(0, envInt('TEAMCLAUDE_OVERLOAD_RETRIES', 6));
-      const backoffBase = Math.max(50, envInt('TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS', 1000));
-      const backoffCap = Math.max(backoffBase, envInt('TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS', 10000));
-
-      // (1) Per-request failover to an account not yet 5xx'd (or 429'd) this request.
-      ctx.tried5xx.add(account);
-      const exclude5xx = new Set([...ctx.tried429, ...ctx.tried5xx]);
-      if (!res.destroyed && retryCount < maxRetries
-          && (accountManager.anyUsable(exclude5xx) || accountManager.anyCapped(exclude5xx))) {
-        console.log(`[TeamClaude] ${code} on "${account.name}" — switching account for this request`);
-        if (logDir) {
-          logSections.push(`=== RESPONSE ${code} — transient upstream 5xx, switching account ===\n${formatHeaders(upstreamRes.headers)}`);
-          writeRequestLog(logDir, reqId, logSections);
-        }
-        releaseHeld(); // free this account's slot before trying another
-        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
-      }
-
-      // (2) Every account 5xx'd for this request → upstream overload. Back off and
-      // retry the whole fleet so the client transparently rides out the blip.
-      if (!res.destroyed && ctx.overloadRetries < maxOverload) {
-        const waitMs = Math.min(backoffBase * 2 ** ctx.overloadRetries, backoffCap);
-        ctx.overloadRetries += 1;
-        console.log(`[TeamClaude] ${code} on every account — upstream overloaded, backing off ${waitMs}ms (retry ${ctx.overloadRetries}/${maxOverload})`);
-        if (logDir) {
-          logSections.push(`=== RESPONSE ${code} — all accounts overloaded, backoff ${waitMs}ms (retry ${ctx.overloadRetries}/${maxOverload}) ===`);
-          writeRequestLog(logDir, reqId, logSections);
-        }
-        await sleepOrAbort(waitMs, ctx.abortSignal);
-        // Client gone during the backoff → bail; the outer finally releases the
-        // slot promptly instead of holding it for the rest of the wait.
-        if (res.destroyed || ctx.abortSignal?.aborted) return;
-        ctx.tried5xx.clear(); // fresh round: let every account be tried again
-        releaseHeld();        // re-acquire from the full set on the next round
-        return forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
-      }
-
-      // (3) Backoff budget spent — surface the 5xx rather than hold the client forever.
-      console.log(`[TeamClaude] ${code} on "${account.name}" — overload persisted after ${ctx.overloadRetries} backoffs, passing through`);
-      ctx.status = code;
-      if (logDir) {
-        logSections.push(`=== RESPONSE ${code} — overload persisted after ${ctx.overloadRetries} backoffs, passed through ===\n${formatHeaders(upstreamRes.headers)}`);
-        writeRequestLog(logDir, reqId, logSections);
-      }
-      if (res.destroyed) return;
-      if (!res.headersSent) {
-        res.writeHead(code, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-          type: 'error',
-          error: { type: 'overloaded_error', message: `Upstream overloaded (HTTP ${code}). Retried ${ctx.overloadRetries}x.` },
-        }));
-      }
-      return;
-    }
-
-    // Log response headers
-    if (logDir) {
-      logSections.push(`=== RESPONSE ${upstreamRes.status} ===\n${formatHeaders(upstreamRes.headers)}`);
-    }
+    // Log the request head (once) followed by the response headers, streaming
+    // to disk from here on.
+    logRequestHead();
+    getLog()?.write(`\n\n=== RESPONSE ${upstreamRes.status} ===\n${formatHeaders(upstreamRes.headers)}`);
 
     ctx.status = upstreamRes.status;
 
-    // Build response headers (skip hop-by-hop and encoding headers)
+    // Build response headers (skip hop-by-hop and encoding headers). The
+    // connection-specific names are also illegal on an HTTP/2 response — when
+    // this runs behind the MITM's h2 server, writeHead would otherwise throw.
     const responseHeaders = {};
     for (const [key, value] of upstreamRes.headers.entries()) {
-      if (key === 'transfer-encoding' || key === 'connection') continue;
+      if (CONNECTION_SPECIFIC_HEADERS.has(key)) continue;
       // Strip content-encoding/content-length since fetch may auto-decompress
       if (key === 'content-encoding' || key === 'content-length') continue;
       responseHeaders[key] = value;
@@ -992,67 +603,63 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     res.writeHead(upstreamRes.status, responseHeaders);
 
     if (!upstreamRes.body) {
-      if (logDir) {
-        logSections.push(`=== RESPONSE BODY ===\n(empty)`);
-        writeRequestLog(logDir, reqId, logSections);
-      }
+      const l = getLog();
+      if (l) { l.write('\n\n=== RESPONSE BODY ===\n(empty)'); l.end(); }
       res.end();
       return;
     }
 
-    const isStreaming = (upstreamRes.headers.get('content-type') || '').includes('text/event-stream');
+    const contentType = upstreamRes.headers.get('content-type') || '';
+    const isStreaming = contentType.includes('text/event-stream');
 
     if (isStreaming) {
-      const streamLog = logDir ? [] : null;
-      await streamResponse(upstreamRes.body, res, account, accountManager, streamLog);
-      if (logDir) {
-        logSections.push(`=== RESPONSE BODY (streamed) ===\n${streamLog.join('')}`);
-        writeRequestLog(logDir, reqId, logSections);
-      }
+      // Stream each chunk straight to the log as it is relayed — never hold the
+      // whole (potentially ~1M-token) SSE body in memory.
+      const l = getLog();
+      const bw = l ? l.bodyWriter('RESPONSE BODY (streamed)', contentType) : null;
+      await streamResponse(upstreamRes.body, res, account.index, accountManager, bw);
+      l?.end();
     } else {
       const buf = Buffer.from(await upstreamRes.arrayBuffer());
-      extractUsageFromBody(buf, account, accountManager);
-      if (logDir) {
-        try {
-          logSections.push(`=== RESPONSE BODY ===\n${JSON.stringify(JSON.parse(buf.toString()), null, 2)}`);
-        } catch {
-          logSections.push(`=== RESPONSE BODY (${buf.length} bytes) ===\n${buf.toString().slice(0, 8192)}`);
-        }
-        writeRequestLog(logDir, reqId, logSections);
-      }
+      extractUsageFromBody(buf, account.index, accountManager);
+      const l = getLog();
+      if (l) { l.body('RESPONSE BODY', buf, contentType); l.end(); }
       res.end(buf);
     }
   } catch (err) {
-    // Client disconnected → we aborted the upstream fetch (ctx.abortSignal). This
-    // is not the account's fault: don't mark it 'error' or fail over (the client
-    // is gone). Just unwind — the outer finally releases the slot / inFlightProxied.
-    if (ctx.abortSignal?.aborted || err?.name === 'AbortError' || err?.code === 'ABORT_ERR' || res.destroyed) {
-      if (!res.writableEnded) res.destroy();
-      return;
-    }
-
     console.error(`[TeamClaude] Upstream error (account "${account.name}"):`, err.message);
 
-    if (logDir) {
-      logSections.push(`=== ERROR ===\n${err.stack || err.message}`);
-      writeRequestLog(logDir, reqId, logSections);
-    }
+    logRequestHead();
+    const l = getLog();
+    if (l) { l.write(`\n\n=== ERROR ===\n${err.stack || err.message}`); l.end(); }
 
     const isTransient = err instanceof Error &&
-      (err.message.includes('fetch failed') ||
+      (err.code === 'TEAMCLAUDE_HEADERS_TIMEOUT' || err.code === 'TEAMCLAUDE_BODY_TIMEOUT' ||
+        err.name === 'TimeoutError' || err.name === 'AbortError' ||
+        err.message.includes('fetch failed') ||
         err.code === 'ECONNRESET' || err.code === 'ECONNREFUSED' ||
-        err.code === 'ETIMEDOUT' || err.code === 'UND_ERR_CONNECT_TIMEOUT');
+        err.code === 'ETIMEDOUT' || err.code === 'UND_ERR_CONNECT_TIMEOUT' ||
+        err.code === 'UND_ERR_HEADERS_TIMEOUT' || err.code === 'UND_ERR_BODY_TIMEOUT');
 
-    // Transient network errors: just close the connection and let the client retry
+    // Transient network errors (including a stale-socket headers/body timeout):
+    // close the connection and let the client retry. Failing over to another
+    // account would not help (the poisoned fetch pool is process-wide), but the
+    // fast failure lets Node evict the dead socket so the retry reconnects
+    // cleanly. If headers were already sent (a mid-stream body timeout), destroy
+    // is the only option — the client sees a broken response and retries.
     if (isTransient) {
       res.destroy();
       return;
     }
 
+    // Any other thrown error is a transport/stream failure, NOT proof the
+    // account's credentials are bad — a bad credential comes back as a 401
+    // *response*, never a throw. So don't sideline the account (that would drop
+    // a healthy account from rotation until a credential change). Instead skip
+    // it for the rest of THIS request only and fail over to another account.
     if (retryCount < maxRetries && !res.headersSent) {
-      account.status = 'error';
-      releaseHeld(); // this account errored; fail over to another
-      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+      ctx.tried.add(account.index);
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
     ctx.status = 502;
 
@@ -1062,21 +669,67 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         type: 'error',
         error: { type: 'proxy_error', message: `Upstream error: ${err.message}` },
       }));
+    } else if (!res.writableEnded) {
+      // Error after headers were already sent (mid-stream) and it wasn't
+      // classified transient: we can't send a status or fail over, and
+      // streamResponse deliberately skipped res.end(). Destroy so the client
+      // sees a broken response and retries instead of hanging on an open socket.
+      res.destroy();
     }
   }
+}
+
+// Idle deadline for the RESPONSE BODY, complementing the headers timeout in
+// upstream-fetch.js. The headers guard only covers time-to-first-byte; once
+// headers arrive it is disarmed, so a network drop AFTER the stream starts would
+// otherwise hang the read forever (the SSE completion just goes silent mid-way).
+// This watchdog resets on every chunk, so a long but healthy stream is never
+// cut — it fires only when the socket produces nothing for the whole window,
+// converting a mid-stream hang into a fast failure that evicts the dead socket
+// (reader.cancel destroys the underlying connection on both the direct-fetch and
+// the sx-tunnel path, since both hand back a web ReadableStream). Override with
+// TEAMCLAUDE_UPSTREAM_BODY_TIMEOUT_MS.
+const DEFAULT_BODY_IDLE_TIMEOUT_MS = 120_000;
+
+function resolveBodyIdleTimeout() {
+  const env = Number(process.env.TEAMCLAUDE_UPSTREAM_BODY_TIMEOUT_MS);
+  return env > 0 ? env : DEFAULT_BODY_IDLE_TIMEOUT_MS;
+}
+
+// Race a single reader.read() against an inactivity deadline. Resolves to the
+// read result, or rejects with a transient TEAMCLAUDE_BODY_TIMEOUT if no chunk
+// arrives within `ms`. The pending read is abandoned on timeout; the caller
+// cancels the reader (evicting the socket) in its finally block.
+export function readWithIdleTimeout(reader, ms) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const err = new Error(`upstream stream idle for ${ms}ms`);
+      err.code = 'TEAMCLAUDE_BODY_TIMEOUT';
+      reject(err);
+    }, ms);
+    timer.unref?.();
+  });
+  const read = reader.read();
+  // If the timeout wins the race, `read` is abandoned; swallow any later
+  // rejection so it can't surface as an unhandledRejection.
+  read.catch(() => {});
+  return Promise.race([read, timeout]).finally(() => clearTimeout(timer));
 }
 
 /**
  * Stream an SSE response to the client, parsing usage data along the way.
  */
-async function streamResponse(webStream, res, account, accountManager, streamLog) {
+async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter) {
   const reader = webStream.getReader();
+  const idleMs = resolveBodyIdleTimeout();
   const decoder = new TextDecoder();
   let sseBuffer = '';
+  let errored = false;
 
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      const { done, value } = await readWithIdleTimeout(reader, idleMs);
       if (done) break;
 
       // Client disconnected — stop reading from upstream
@@ -1085,10 +738,10 @@ async function streamResponse(webStream, res, account, accountManager, streamLog
       // Forward chunk immediately
       const ok = res.write(value);
 
-      const text = decoder.decode(value, { stream: true });
+      // Append to the log as it streams (no whole-body buffering)
+      if (bodyWriter) bodyWriter.chunk(Buffer.from(value));
 
-      // Capture for logging
-      if (streamLog) streamLog.push(text);
+      const text = decoder.decode(value, { stream: true });
 
       // Parse SSE events for usage tracking
       sseBuffer += text;
@@ -1096,15 +749,19 @@ async function streamResponse(webStream, res, account, accountManager, streamLog
       sseBuffer = events.pop(); // keep incomplete event
 
       for (const event of events) {
-        parseSSEUsage(event, account, accountManager);
+        parseSSEUsage(event, accountIndex, accountManager);
       }
 
       // Handle backpressure — also bail out if client disconnects,
       // because 'drain' will never fire on a destroyed socket
       if (!ok) {
         await new Promise(resolve => {
-          res.once('drain', resolve);
-          res.once('close', resolve);
+          // Remove BOTH listeners when either fires: otherwise the un-fired one
+          // (usually 'close') stays attached and accumulates one leaked listener
+          // per backpressure cycle over a long SSE stream to a slow client.
+          const done = () => { res.off('drain', done); res.off('close', done); resolve(); };
+          res.once('drain', done);
+          res.once('close', done);
         });
         if (res.destroyed) break;
       }
@@ -1112,93 +769,74 @@ async function streamResponse(webStream, res, account, accountManager, streamLog
 
     // Parse any remaining buffer
     if (sseBuffer.trim()) {
-      parseSSEUsage(sseBuffer, account, accountManager);
+      parseSSEUsage(sseBuffer, accountIndex, accountManager);
     }
+  } catch (err) {
+    // A mid-stream idle timeout (or any read error) means the upstream went
+    // silent after headers. Rethrow to the caller's transient handler, which
+    // destroys the client connection so the truncated stream is NOT ended
+    // cleanly (a clean res.end() would look like a complete response and
+    // suppress the client's retry). reader.cancel() in finally evicts the socket.
+    errored = true;
+    throw err;
   } finally {
-    // Cancel upstream reader to stop consuming data nobody needs
+    // Cancel upstream reader to stop consuming data nobody needs (and, on the
+    // timeout path, to destroy the dead socket so the pool drops it).
     reader.cancel().catch(() => {});
-    if (!res.writableEnded) res.end();
+    if (!errored && !res.writableEnded) res.end();
   }
 }
 
-function parseSSEUsage(event, account, accountManager) {
+function parseSSEUsage(event, accountIndex, accountManager) {
   const dataLine = event.split('\n').find(l => l.startsWith('data: '));
   if (!dataLine) return;
 
   try {
     const data = JSON.parse(dataLine.slice(6));
     if (data.type === 'message_start' && data.message?.usage) {
-      accountManager.updateUsage(account, data.message.usage.input_tokens, 0);
+      accountManager.updateUsage(accountIndex, data.message.usage.input_tokens, 0);
     } else if (data.type === 'message_delta' && data.usage) {
-      accountManager.updateUsage(account, 0, data.usage.output_tokens);
+      accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens);
     }
   } catch {
     // not valid JSON, skip
   }
 }
 
-function extractUsageFromBody(buffer, account, accountManager) {
+function extractUsageFromBody(buffer, accountIndex, accountManager) {
   try {
     const json = JSON.parse(buffer.toString());
     if (json.usage) {
-      accountManager.updateUsage(account, json.usage.input_tokens, json.usage.output_tokens);
+      accountManager.updateUsage(accountIndex, json.usage.input_tokens, json.usage.output_tokens);
     }
   } catch {
     // not JSON or no usage
   }
 }
 
-// Seconds a client should wait before ANY account can serve again, derived from
-// *why* each account is currently unusable — so an all-exhausted fleet tells the
-// client the real (often hours-long) wait instead of a flat 60s it would just
-// re-flood against every minute:
-// An account is usable again only once BOTH its throttle AND every quota window
-// it is currently past `threshold` on have cleared — so we take the LATEST (max)
-// of them per account:
-//   - an explicit throttle (a live exhaustion 429 → markRateLimited) is clamped
-//     to <=5m, but the binding 5h/7d window that 429 came with may reset hours
-//     later; the account stays `_isNearQuota` until then, so returning the
-//     throttle alone made the client re-flood every 5 min while still exhausted;
-//   - the quota reset is the unified 5h/7d reset the dashboard shows, NOT
-//     `resetsAt` (a standard/API-key-only field the old code looked at, so a
-//     utilization-exhausted Max fleet always fell through to the 60s default).
-// A window UNDER threshold is not binding, so its (always-future) reset is
-// ignored — and an account with NO binding constraint at all (quota-healthy,
-// merely concurrency-capped or overflow-queued) contributes a short 60s
-// candidate instead: its slot frees in seconds, so one healthy account caps the
-// whole fleet's wait at the short fallback even when every other account is
-// hours from reset. Disabled/auth-error accounts never return on a timer, so
-// they're skipped. Falls back to 60s when nothing contributes anything.
-function computeRetryAfter(accounts, threshold = 0.98) {
-  const now = Date.now();
+// Rewrite the `model` field in a JSON request body using a per-account map.
+// Returns the original buffer unchanged if the model isn't in the map or the
+// body isn't valid JSON, so non-messages endpoints pass through safely.
+// Exported for tests.
+export function rewriteModel(body, modelMap) {
+  try {
+    const obj = JSON.parse(body.toString('utf8'));
+    if (obj.model && modelMap[obj.model]) {
+      obj.model = modelMap[obj.model];
+      return Buffer.from(JSON.stringify(obj), 'utf8');
+    }
+  } catch { /* not JSON — pass through unchanged */ }
+  return body;
+}
+
+function computeRetryAfter(accounts) {
   let soonest = Infinity;
-  const consider = ms => { if (ms > 0 && ms < soonest) soonest = ms; };
   for (const acct of accounts) {
-    if (acct.enabled === false || acct.status === 'error') continue;
-    // freeAt = max(throttle, every over-threshold quota reset). The account is
-    // blocked until the LAST of these clears; taking the min across accounts
-    // then gives the soonest the fleet has anything to serve.
-    let freeAt = 0;
-    if (acct.rateLimitedUntil) freeAt = Math.max(freeAt, new Date(acct.rateLimitedUntil).getTime());
-    const q = acct.quota || {};
-    if (q.unified5h != null && q.unified5h >= threshold && q.unified5hReset)
-      freeAt = Math.max(freeAt, q.unified5hReset);
-    if (q.unified7d != null && q.unified7d >= threshold && q.unified7dReset)
-      freeAt = Math.max(freeAt, q.unified7dReset);
-    // Standard windows reset independently — use each window's OWN reset
-    // (falling back to the collapsed resetsAt for snapshots predating the
-    // split fields), so when both are binding the LATER one wins instead of
-    // resetsAt's preference for the sooner token reset.
-    const tokensReset = q.tokensReset || q.resetsAt;
-    if (q.tokensLimit != null && q.tokensRemaining != null && tokensReset
-        && 1 - q.tokensRemaining / q.tokensLimit >= threshold)
-      freeAt = Math.max(freeAt, new Date(tokensReset).getTime());
-    const requestsReset = q.requestsReset || q.resetsAt;
-    if (q.requestsLimit != null && q.requestsRemaining != null && requestsReset
-        && 1 - q.requestsRemaining / q.requestsLimit >= threshold)
-      freeAt = Math.max(freeAt, new Date(requestsReset).getTime());
-    if (freeAt > 0) consider(freeAt - now);
-    else consider(60_000); // quota-healthy (merely capped/queued): a slot frees in seconds — cap the fleet wait at the short fallback
+    const reset = acct.rateLimitedUntil || acct.quota.resetsAt;
+    if (reset) {
+      const ms = new Date(reset).getTime() - Date.now();
+      if (ms < soonest) soonest = ms;
+    }
   }
   return soonest === Infinity ? 60 : Math.max(1, Math.ceil(soonest / 1000));
 }

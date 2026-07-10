@@ -1,9 +1,18 @@
-import { refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
+import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired } from './oauth.js';
+import { sameIdentity } from './identity.js';
+import { weeklyBucketForModel, modelGlobMatches } from './model.js';
 
-/** Coerce a per-account / global concurrency cap to a positive integer, else fallback. */
-function coerceMaxConcurrent(value, fallback) {
-  return Number.isFinite(value) && value >= 1 ? Math.floor(value) : fallback;
-}
+// Re-exported for callers that import these model helpers from here.
+export { isFableModel, parseRequestModel } from './model.js';
+
+// Quota fields that survive a restart: utilization levels and their reset
+// windows, learned passively from upstream responses. Transient/derived state
+// (probing, requalify, rateLimitedUntil) is intentionally excluded.
+const PERSISTED_QUOTA_FIELDS = [
+  'unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable',
+  'unified5hReset', 'unified7dReset', 'unified7dSonnetReset', 'unified7dFableReset', 'unifiedStatus',
+  'tokensLimit', 'tokensRemaining', 'requestsLimit', 'requestsRemaining', 'resetsAt',
+];
 
 function emptyQuota() {
   return {
@@ -13,754 +22,702 @@ function emptyQuota() {
     requestsLimit: null,
     requestsRemaining: null,
     // Unified rate limits (Claude Max accounts)
-    unified5h: null,       // utilization 0-1
-    unified7d: null,       // utilization 0-1
-    unified5hReset: null,  // ms timestamp
-    unified7dReset: null,  // ms timestamp
-    unifiedStatus: null,   // allowed | allowed_warning | rejected
-    // Model-scoped weekly windows, keyed by header window label — e.g. `7d_oi`,
-    // the separate weekly limit for the top model tier shown as "Fable" in
-    // Claude's usage UI. Parsed generically from
-    // anthropic-ratelimit-unified-<window>-* so a renamed/added window keeps
-    // being tracked without a code change. Display-only: it never feeds
-    // availability, because an account over its Fable weekly limit still
-    // serves every other model.
-    modelWeekly: {},       // { '7d_oi': { utilization: 0-1, reset: msTimestamp } }
-    resetsAt: null,        // soonest standard reset (session-order fallback)
-    // Token and request windows can reset at DIFFERENT times; tracked separately
-    // so retry-after can wait for whichever over-threshold window frees last
-    // (resetsAt alone collapses them, preferring the sooner token reset).
-    tokensReset: null,     // standard token-window reset (date string)
-    requestsReset: null,   // standard request-window reset (date string)
+    unified5h: null,            // utilization 0-1
+    unified7d: null,            // utilization 0-1
+    unified7dSonnet: null,      // utilization 0-1 (Sonnet-specific weekly bucket)
+    unified7dFable: null,       // utilization 0-1 (Fable-specific weekly bucket)
+    unified5hReset: null,       // ms timestamp
+    unified7dReset: null,       // ms timestamp
+    unified7dSonnetReset: null, // ms timestamp
+    unified7dFableReset: null,  // ms timestamp
+    unifiedStatus: null,        // allowed | allowed_warning | rejected
+    resetsAt: null,
   };
 }
 
+// Build a fresh in-memory account record from a config/disk account object.
+// Shared by the constructor and addAccount() so the field set can never drift
+// between startup accounts and runtime-added ones (a divergence here once left
+// runtime-added accounts without `inFlight`, hanging every request in admit()).
+function makeAccount(acct, index) {
+  return {
+    index,
+    name: acct.name,
+    type: acct.type,
+    accountUuid: acct.accountUuid || null,
+    orgUuid: acct.orgUuid || null,
+    orgName: acct.orgName || null,
+    priority: acct.priority || 0,
+    disabled: acct.disabled || false,
+    upstream: acct.upstream || null,
+    modelMap: acct.modelMap || null,
+    models: acct.models || null,
+    credential: acct.accessToken || acct.apiKey,
+    refreshToken: acct.refreshToken || null,
+    expiresAt: acct.expiresAt || null,
+    status: 'active',
+    // No quota is known at startup, so start probing: the first response for
+    // an account reveals its weekly limit and triggers re-evaluation.
+    probing: true,
+    quota: emptyQuota(),
+    usage: {
+      totalInputTokens: 0,
+      totalOutputTokens: 0,
+      totalRequests: 0,
+      lastUsed: null,
+    },
+    rateLimitedUntil: null,
+    throttledAt: null,
+    // Storm control (see admit/release): in-flight upstream requests and the
+    // time this account last became the current one (starts a ramp window).
+    inFlight: 0,
+    rampStartedAt: null,
+    // Rate-limit pause (see pauseAccount): a short window during which new
+    // requests wait in admit() rather than flooding — set from a 429's
+    // retry-after. Distinct from `throttled`/rateLimitedUntil: it does NOT
+    // make the account unavailable, so selection never rotates away from it.
+    pausedUntil: null,
+  };
+}
+
+// Does a declared `models` entry name `model`? The declared side may carry a
+// trailing [Nm] context-length suffix (e.g. "deepseek-v4-pro[1m]"); we match it
+// against a bare request too. Shared by _accountOwnsModel's two lookups so the
+// predicate can't drift.
+function modelMatches(declared, model) {
+  return declared === model || declared.replace(/\[\d+m\]$/, '') === model;
+}
+
 export class AccountManager {
-  constructor(accounts, switchThreshold = 0.98, reevalIntervalMs = 5 * 60 * 1000, maxConcurrentDefault = 3, overflowQueueMaxDepth = 256) {
-    this.maxConcurrentDefault = coerceMaxConcurrent(maxConcurrentDefault, 3);
-    // Hard cap on the overflow queue so a flood of concurrent requests can't grow
-    // it (and the buffered bodies / sockets / timers it pins) without bound. Past
-    // this depth acquireAccount rejects immediately (→ 429) instead of queuing.
-    this.maxQueueDepth = Number.isFinite(overflowQueueMaxDepth) && overflowQueueMaxDepth >= 0
-      ? Math.floor(overflowQueueMaxDepth) : 256;
-    this.accounts = accounts.map((acct, index) => ({
-      index,
-      name: acct.name,
-      type: acct.type,
-      accountUuid: acct.accountUuid || null,
-      credential: acct.accessToken || acct.apiKey,
-      refreshToken: acct.refreshToken || null,
-      expiresAt: acct.expiresAt || null,
-      status: 'active',
-      // Manual on/off switch. A disabled account is excluded from ALL rotation
-      // (warm-up, use-or-lose selection, recover, acquire) via _isAvailable —
-      // in-flight requests still drain, but no new request is routed to it.
-      // Defaults to enabled; only an explicit `enabled: false` disables it.
-      enabled: acct.enabled !== false,
-      // Explicit selection priority: lower number = preferred first. Null/unset
-      // means "no preference" — selection then falls back to use-or-lose. So a
-      // config with no priorities behaves exactly as before.
-      priority: Number.isFinite(acct.priority) ? Math.floor(acct.priority) : null,
-      quota: emptyQuota(),
-      usage: {
-        totalInputTokens: 0,
-        totalOutputTokens: 0,
-        totalRequests: 0,
-        lastUsed: null,
-      },
-      rateLimitedUntil: null,
-      // Concurrency: how many requests are in flight through this account right
-      // now, and the per-account cap above which the selector treats it as
-      // momentarily full (so concurrent load spreads to other accounts).
-      inflight: 0,
-      maxConcurrent: coerceMaxConcurrent(acct.maxConcurrent, this.maxConcurrentDefault),
-    }));
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, throttleProbeFloorMs, routes, ramp } = {}) {
+    // Injectable for tests (mirrors Prober's probeFn); defaults to the real
+    // OAuth token refresh.
+    this._refreshFn = refreshFn;
+    this.accounts = accounts.map((acct, index) => makeAccount(acct, index));
     this.currentIndex = 0;
+    // Ephemeral per-route manual pins (routeName → account index). Not persisted:
+    // like the global manual switch (currentIndex) these are runtime overrides that
+    // bias selection for a route's models and reset on restart. A pinned account
+    // that becomes ineligible is skipped — routing falls back to best-available.
+    this.routePins = new Map();
     this.switchThreshold = switchThreshold;
-    this.reevalIntervalMs = reevalIntervalMs;
-    this.lastEvalAt = 0; // 0 forces a priority pick on the first request
-    this.maxWarmupTries = 3; // give up warming an account after this many unmeasured attempts
-    // Slow retry backstop for the active warm-up convergence cap: a capped
-    // account (deterministic fruitless probes) is retried once per this window,
-    // so an upstream that only LOOKED deterministic (e.g. temporarily
-    // header-less) recovers without a restart, while a truly pathological one
-    // costs at most one probe per window.
-    this.probeRetryAfterMs = 15 * 60 * 1000;
-    this._warmupCursor = 0;  // round-robin pointer used during warm-up
-    this._waiters = [];      // overflow queue: requests waiting for a free slot
-    // Soft connection→account affinity (keyed by the client socket). Keeps one
-    // keep-alive connection's *sequential* requests on the same account so
-    // Anthropic's per-account prompt cache stays warm. A WeakMap so an entry is
-    // GC'd when the socket is collected (connection closed) — no manual cleanup,
-    // no leak. The stored value is the account *object* (not its index, which
-    // shifts on removeAccount); a stale entry is detected and ignored.
-    this._affinity = new WeakMap();
+    this.setRoutes(routes);
+    // Storm control: when rotation switches to a fresh account, a burst of
+    // in-flight requests (e.g. dozens of agents failing over together) would all
+    // hit it at once and instantly throttle it — cascading down the fleet
+    // (issue #84). admit() caps concurrent requests to a just-switched account
+    // and ramps the cap up over a short window, so the first few reveal whether
+    // it's also near-exhausted before the whole herd commits.
+    this.ramp = {
+      enabled: true,
+      startConc: 1,       // concurrent requests allowed at the instant of a switch
+      stepConc: 1,        // cap increase per stepMs
+      stepMs: 250,        // → +stepConc every 250ms (default ramps ~4 req/s)
+      windowMs: 30_000,   // after this, pacing stops entirely (cap = Infinity)
+      pollMs: 50,         // how often a waiting request re-checks the cap
+      ...ramp,
+    };
+    // When every account reads as over-quota we would otherwise refuse locally
+    // forever (a stale cached utilization is never re-validated because no
+    // request is ever sent). Instead, allow one real upstream probe at most this
+    // often to refresh the cached quota. See _selectProbe.
+    this.probeIntervalMs = 60_000;
+    this._nextProbeAt = 0;
+    // Minimum time a 429 hold is respected verbatim before a throttled account
+    // becomes probe-eligible (see _isProbeable). Long enough to honor a genuine
+    // retry-after, short enough that a stale hold cannot pin the fleet.
+    this.throttleProbeFloorMs = throttleProbeFloorMs
+      ?? (Number(process.env.TEAMCLAUDE_THROTTLE_PROBE_FLOOR_MS) || 60_000);
+  }
+
+  /** Start (or restart) the ramp window for an account that just became current,
+   * so a failover burst is paced onto it rather than all landing at once. */
+  _beginRamp(account) {
+    if (account && this.ramp.enabled) account.rampStartedAt = Date.now();
+  }
+
+  /** Max concurrent upstream requests allowed to `account` right now. Infinity
+   * once the ramp window has elapsed (or ramping is off / never started). */
+  _rampCap(account, now = Date.now()) {
+    if (!this.ramp.enabled || account.rampStartedAt == null) return Infinity;
+    // Clamp to 0: pauseAccount arms rampStartedAt in the FUTURE (pause-end), so a
+    // call during the pause would otherwise yield a negative elapsed → negative
+    // cap. admit()'s pause branch already guards this, but keep _rampCap sound on
+    // its own — a future start simply means "cap is at its floor (startConc)".
+    const elapsed = Math.max(0, now - account.rampStartedAt);
+    if (elapsed >= this.ramp.windowMs) { account.rampStartedAt = null; return Infinity; }
+    return this.ramp.startConc + Math.floor(elapsed / this.ramp.stepMs) * this.ramp.stepConc;
   }
 
   /**
-   * Get the account to use for the next request.
-   *
-   * Policy:
-   *  - Cold-start warm-up: while any available account is still unmeasured,
-   *    route to it so its quota (usage % / reset) gets populated before any
-   *    priority decision is made on incomplete data.
-   *  - If the current account is unavailable (near quota / throttled / error),
-   *    switch immediately to the highest-priority account. This is the old
-   *    "switch at threshold" trigger — but it now picks by priority rather
-   *    than round-robin to the next index.
-   *  - Otherwise re-evaluate priority at most once per `reevalIntervalMs`
-   *    (default 5 min) and switch if a higher-priority account exists. Set
-   *    `reevalIntervalMs <= 0` (config `reevalIntervalMs: 0`) to disable this
-   *    timer entirely — the account then only changes when it becomes
-   *    unavailable or via per-request 429 failover.
-   *  - Between re-evaluations the current account is sticky, so a request
-   *    stream stays on one account and keeps Anthropic's per-account prompt
-   *    cache warm.
-   *
-   * Priority is "use-or-lose": soonest WEEKLY (7d) reset first, then soonest
-   * session reset, then lowest session usage — so quota about to reset (and
-   * otherwise be wasted) is consumed first, starting with the scarcer weekly
-   * window. Returns null if every account is exhausted.
+   * Reserve a concurrency slot on `account` before sending upstream. Waits while
+   * the account is in a rate-limit pause (a 429's retry-after window) and while
+   * it is over its current ramp cap. Fail-open: returns true once a slot is taken
+   * (always eventually — the pause ends and the ramp cap grows), or false if
+   * `isAborted()` reports the client went away while waiting. Pair every `true`
+   * with a `release(index)`.
    */
-  getActiveAccount(exclude = null) {
-    const now = Date.now();
+  async admit(index, isAborted) {
+    const account = this.accounts[index];
+    if (!account) return true;
+    while (true) {
+      if (isAborted?.()) return false;
+      const now = Date.now();
+      // Rate-limit pause: hold new requests off this account until the window
+      // passes instead of flooding it (which would deepen the 429). Not a
+      // rotation trigger — the account stays selectable the whole time.
+      if (account.pausedUntil && now < account.pausedUntil) {
+        await new Promise(r => setTimeout(r, Math.min(account.pausedUntil - now, this.ramp.pollMs * 4)));
+        continue;
+      }
+      const cap = this.ramp.enabled ? this._rampCap(account, now) : Infinity;
+      if (account.inFlight < cap) { account.inFlight++; return true; }
+      await new Promise(r => setTimeout(r, this.ramp.pollMs));
+    }
+  }
 
-    // Per-request failover: a prior account already returned a non-quota 429
-    // for THIS request (those accounts are in `exclude`, a Set of objects). Pick another available
-    // account by priority WITHOUT touching the sticky primary or warm-up state
-    // — this diverts only the overflow of one request; steady-state selection
-    // still prefers the use-or-lose primary, keeping its prompt cache warm.
-    // Returns null once every available account has been tried this request.
-    if (exclude && exclude.size) return this._selectBest(exclude);
+  /** Release a slot taken by admit(). Safe to call once per successful admit. */
+  release(index) {
+    const account = this.accounts[index];
+    if (account && account.inFlight > 0) account.inFlight--;
+  }
 
+  /**
+   * Pause an account after a rate-limit (non-quota) 429 so concurrent requests
+   * wait in admit() instead of piling on. Unlike markRateLimited this does NOT
+   * set `throttled`/rateLimitedUntil, so _isAvailable still returns true and
+   * selection never rotates away — rotation is reserved for quota exhaustion.
+   * When the pause lifts, the held requests are released through a fresh ramp
+   * window (storm control) so they trickle out rather than flood. Extends an
+   * existing pause rather than shortening it.
+   */
+  pauseAccount(index, seconds) {
+    const account = this.accounts[index];
+    if (!account) return;
+    const until = Date.now() + Math.max(0, seconds) * 1000;
+    account.pausedUntil = Math.max(account.pausedUntil || 0, until);
+    // Arm the ramp to begin when the pause ends: while paused, admit() holds on
+    // the pause branch; once it lifts, _rampCap counts from here and releases the
+    // backlog gradually (startConc, then +stepConc per step).
+    if (this.ramp.enabled) account.rampStartedAt = account.pausedUntil;
+  }
+
+  /**
+   * Get the best available account, rotating if the current one is near quota.
+   * Returns null if all accounts are exhausted.
+   */
+  getActiveAccount(exclude = null, model = null) {
+    // Clear expired quotas across all accounts and switch proactively if a
+    // session reset made a sooner-expiring account the better choice. This runs
+    // on every request so the behaviour holds without the TUI render loop.
+    this.refreshExpiredQuotas();
+    // A manual per-route pin biases selection for that route's models (independent
+    // of the global currentIndex). Honored only while eligible — otherwise we fall
+    // through to normal best-available selection so requests keep flowing.
+    const pinned = this._pinnedAccountForModel(model);
+    if (pinned && this._isAvailable(pinned, model) && !exclude?.has(pinned.index)) return pinned;
     const current = this.accounts[this.currentIndex];
-
-    // Cold-start warm-up: until every available account has been measured at
-    // least once, round-robin across the unmeasured accounts so their quota
-    // (usage % / reset) gets populated. Round-robin (not "first unmeasured")
-    // means a concurrent startup burst of any size spreads evenly instead of
-    // hammering one unknown-quota account. Only once all are measured does the
-    // use-or-lose priority below take over — with complete data.
-    const warmup = this._nextWarmup();
-    if (warmup) {
-      if (warmup.index !== this.currentIndex) {
-        console.log(`[TeamClaude] Warm-up: measuring account "${warmup.name}"`);
-        this.currentIndex = warmup.index;
-      }
-      return warmup;
+    // `model` scopes availability: an account whose Fable weekly bucket is spent
+    // is still fully usable for other models, so it is only excluded when THIS
+    // request targets Fable (see _isAvailable).
+    // `exclude` is a per-request set of indices already tried this request (e.g.
+    // an account that just threw a transport error). It is never a persistent
+    // status change — the account stays healthy for the next request.
+    // We just learned a probed account's weekly quota — re-evaluate which
+    // account is best now that its limit is known.
+    if (current && current.requalify) {
+      current.requalify = false;
+      const next = this._selectNext(exclude, model);
+      if (next) return next;
     }
-
-    if (!this._isAvailable(current)) {
-      const best = this._selectBest();
-      if (best) {
-        if (best.index !== this.currentIndex) {
-          console.log(`[TeamClaude] Switched to account "${best.name}" (current unavailable)`);
-        }
-        this.currentIndex = best.index;
-        this.lastEvalAt = now;
-      }
-      return best;
+    if (this._isAvailable(current, model) && !exclude?.has(current.index)) {
+      // A strictly higher-priority (lower value) available account preempts a
+      // healthy current one. Within the same priority tier we stay put, so the
+      // common case (all accounts at the default priority 0) is unchanged and
+      // never thrashes — preemption only triggers when priorities differ.
+      const betterExists = this.accounts.some(a =>
+        this._isAvailable(a, model) && !exclude?.has(a.index) && (a.priority || 0) < (current.priority || 0));
+      return betterExists ? this._selectNext(exclude, model) : current;
     }
-
-    // Periodic re-prioritization. Disabled when reevalIntervalMs <= 0: the
-    // current account then stays sticky and only changes when it becomes
-    // unavailable (exhausted / throttled / error) or via per-request 429
-    // failover — no timer-driven switching.
-    if (this.reevalIntervalMs > 0 && now - this.lastEvalAt >= this.reevalIntervalMs) {
-      this.lastEvalAt = now;
-      const best = this._selectBest();
-      if (best && best.index !== this.currentIndex) {
-        console.log(`[TeamClaude] Re-prioritized to account "${best.name}" (weekly reset soonest)`);
-        this.currentIndex = best.index;
-        return best;
-      }
-    }
-
-    // While the current account is still unmeasured, keep load-balancing via
-    // _selectBest (which rotates among equal-rank accounts) instead of sticking
-    // to an unknown-quota account — so a cold-start burst stays spread even
-    // after per-account warm-up attempts are exhausted.
-    if (!this._isMeasured(current)) {
-      const best = this._selectBest();
-      if (best) {
-        this.currentIndex = best.index;
-        return best;
-      }
-    }
-
-    return current;
-  }
-
-  // ── Concurrency layer: per-account in-flight cap + overflow queue ──────────
-  //
-  // getActiveAccount() above picks ONE account (sticky, use-or-lose). On its own
-  // that funnels every concurrent terminal onto the same account, which then hits
-  // Anthropic's per-account rate / concurrency limit (429) while other accounts
-  // sit idle with quota to spare. The layer below fixes that PROACTIVELY: each
-  // account carries an `inflight` counter and a `maxConcurrent` cap, and
-  // acquireAccount() treats a capped account as momentarily unavailable (folds it
-  // into the exclude set). The existing priority logic then naturally spreads
-  // load to the next account — filling A up to its cap, then B, then C, by
-  // use-or-lose priority. When every available account is at its cap the request
-  // waits briefly for a slot to free (overflow queue) instead of 429-storming.
-
-  /** Has this account a free concurrency slot? */
-  _hasCapacity(account) {
-    return account.inflight < account.maxConcurrent;
+    const next = this._selectNext(exclude, model);
+    if (next) return next;
+    // No account is under the switch threshold. Before refusing locally, allow a
+    // throttled probe so a stale/poisoned cached quota can't pin us in a
+    // permanent "all exhausted" state — the probe's real response refreshes the
+    // quota (or upstream's own 429 converts soft exhaustion into a hard
+    // rate-limit hold). null here means the caller emits the synthetic 429.
+    return this._selectProbe(exclude, model);
   }
 
   /**
-   * Resolve an account handle to the live account object. Accepts the object
-   * itself (reindex-safe — what server.js passes) or a numeric index (legacy /
-   * tests). All public per-account methods route their first arg through this so
-   * a stale index captured before a removeAccount() can't hit the wrong account.
+   * Like getActiveAccount, but if the selected account's OAuth token has ALREADY
+   * expired it blocks on a refresh before returning — so a caller that injects
+   * the token immediately (the MITM relay) never sends a dead token and eats a
+   * 401. A token that is merely expiring soon (still valid) is left to the
+   * caller's opportunistic background refresh; only a hard-expired one blocks.
    */
-  _resolve(accountOrIndex) {
-    return typeof accountOrIndex === 'number' ? this.accounts[accountOrIndex] : accountOrIndex;
-  }
-
-  /**
-   * Available accounts currently at their concurrency cap, as a Set of account
-   * OBJECTS (not indexes). Object identity is stable across a removeAccount()
-   * re-index, so an exclude/capped set captured before the request awaits
-   * upstream can't later point at the wrong account.
-   */
-  _cappedSet(exclude = null) {
-    const capped = new Set();
-    for (const a of this.accounts) {
-      if (exclude && exclude.has(a)) continue;
-      if (this._isAvailable(a) && !this._hasCapacity(a)) capped.add(a);
+  async getActiveAccountFresh(exclude = null, model = null) {
+    const account = this.getActiveAccount(exclude, model);
+    if (account && account.type === 'oauth' && account.refreshToken
+        && isTokenExpired(account.expiresAt)) {
+      await this.ensureTokenFresh(account.index); // coalesces with any in-flight refresh
     }
-    return capped;
-  }
-
-  /** Is there an available account with a free slot (not excluded)? Non-mutating. (`exclude` = Set of account objects.) */
-  anyUsable(exclude = null) {
-    return this.accounts.some(a =>
-      this._isAvailable(a) && this._hasCapacity(a) && !(exclude && exclude.has(a)));
-  }
-
-  /** Is there an available-but-capped account (not excluded)? A freed slot could serve it. (`exclude` = Set of account objects.) */
-  anyCapped(exclude = null) {
-    return this.accounts.some(a =>
-      this._isAvailable(a) && !this._hasCapacity(a) && !(exclude && exclude.has(a)));
+    return account;
   }
 
   /**
-   * Synchronously pick + reserve the best account that is available AND has a
-   * free concurrency slot, honoring `exclude`. Capped accounts are folded into
-   * the exclusion so the existing getActiveAccount / _selectBest priority logic
-   * (warm-up, use-or-lose, recover) only ever chooses an account that can take
-   * the request. Increments the chosen account's inflight. Returns null when
-   * nothing is currently acquirable (all exhausted, excluded, or capped).
-   *
-   * Single-threaded JS keeps this race-free: there is no await between selecting
-   * the account and the inflight++ that reserves its slot.
+   * Read-only: the index of the account a request for `model` would be served by
+   * right now — the same decision getActiveAccount makes (manual pin → the global
+   * current account if it can serve the model → best-available), but WITHOUT
+   * mutating currentIndex and without the exhausted-fleet probe fallback. Returns
+   * null when nothing can serve `model` at the moment. The TUI uses this to mark
+   * the single account each secondary bucket (Fable/Sonnet) currently routes to —
+   * the F7/S7 analogue of the ► that marks the default route's current account.
    */
-  _tryAcquire(exclude = null, affinityKey = null) {
-    // Only an object/function is a valid WeakMap key. Ignore anything else (a
-    // primitive key from an external caller would otherwise throw on get/set).
-    const affOk = affinityKey != null
-      && (typeof affinityKey === 'object' || typeof affinityKey === 'function');
-
-    // Connection affinity (cache locality): prefer the account this connection
-    // already used — but only as a *soft* hint, and DEFER to cold-start warm-up.
-    // While any account still needs measuring, skip affinity so it can't pin all
-    // of a connection's traffic to one account and starve the others of quota
-    // data (warm-up round-robins the unmeasured accounts instead). Once measured,
-    // affinity is honored only when that account is still available, has a free
-    // slot, and isn't excluded for this request; otherwise it falls through to
-    // normal selection. So it never exceeds a cap, revives an exhausted account,
-    // or disturbs use-or-lose for new connections. (`accounts[idx] === a` rejects
-    // a stale entry left by a removeAccount that re-indexed the array.)
-    if (affOk && !this.accounts.some(acc => this._isWarmupTarget(acc))) {
-      const a = this._affinity.get(affinityKey);
-      // Require the home to be MEASURED — not just past its warm-up tries. A
-      // headerless account stays unmeasured forever; pinning a connection to it
-      // would bypass getActiveAccount's unmeasured-rebalance (which keeps
-      // spreading to gather quota data / let tokens refresh on use). Once an
-      // account returns rate-limit headers (every real Anthropic response does),
-      // affinity engages normally.
-      if (a && this.accounts[a.index] === a && this._isMeasured(a) && this._isAvailable(a)
-          && this._hasCapacity(a) && !(exclude && exclude.has(a))) {
-        a.inflight++;
-        return a;
-      }
+  previewRouteIndex(model) {
+    const pinned = this._pinnedAccountForModel(model);
+    if (pinned && this._isAvailable(pinned, model)) return pinned.index;
+    const current = this.accounts[this.currentIndex];
+    if (current && this._isAvailable(current, model)) {
+      // Mirror getActiveAccount's priority preemption: a strictly higher-priority
+      // available account wins over a healthy current one; same tier stays put.
+      const better = this.accounts.some(a =>
+        this._isAvailable(a, model) && (a.priority || 0) < (current.priority || 0));
+      if (!better) return current.index;
     }
+    const best = this._pickBestAvailable(null, model);
+    return best ? best.index : null;
+  }
 
-    const capped = this._cappedSet(exclude);
-    const eff = ((exclude && exclude.size) || capped.size)
-      ? new Set([...(exclude || []), ...capped])
-      : null;
-    // eff === null → full sticky / warm-up path (cold start, nothing capped).
-    // eff set → getActiveAccount routes to _selectBest(eff), which already skips
-    // every excluded + capped account.
-    const account = eff ? this.getActiveAccount(eff) : this.getActiveAccount();
-    if (account && this._isAvailable(account) && this._hasCapacity(account)
-        && !(eff && eff.has(account))) {
-      account.inflight++;
-      // (Re)write affinity ONLY when the connection has no still-usable home.
-      // Reaching this fall-through path means we left the home account — but that
-      // can be merely transient: the home may be momentarily capped (overflow
-      // spill) or failover-excluded for THIS request, yet still perfectly
-      // available. Overwriting it then would let one blip permanently evict the
-      // connection from its cache-warm account. So keep an available home (even
-      // capped/excluded right now); replace it only when it's genuinely gone
-      // (removed, unavailable, or exhausted — `_isAvailable` is false).
-      if (affOk) {
-        const home = this._affinity.get(affinityKey);
-        const homeUsable = home && this.accounts[home.index] === home && this._isAvailable(home);
-        if (!homeUsable) this._affinity.set(affinityKey, account);
-      }
-      return account;
+  _isProbeable(account) {
+    if (!account) return false;
+    // Never probe an account the operator has taken out of rotation or one
+    // whose token is broken — those are hard states, not stale guesses.
+    if (account.disabled) return false;
+    if (account.status === 'error' || account.status === 'exhausted') return false;
+    // A 429 hold is respected verbatim at first, but a hold is a snapshot: the
+    // 429 that armed it may itself have been transient (e.g. the retry burst
+    // after a network flap), and while it lasts NOTHING revalidates it — so a
+    // stale hold pins the fleet in synthetic 429s for up to an hour and only a
+    // restart (which wipes the in-memory hold) recovers. After the floor, let
+    // the account be probed: the probe's real response either clears the hold
+    // (any non-429 → clearRateLimited) or re-arms it with a fresh retry-after.
+    if (account.status === 'throttled' && account.rateLimitedUntil
+        && Date.now() < account.rateLimitedUntil) {
+      return Date.now() >= (account.throttledAt || 0) + this.throttleProbeFloorMs;
     }
-    return null;
-  }
-
-  /**
-   * Acquire an account for a request, reserving one of its concurrency slots.
-   * If none is immediately acquirable but an available account is merely at its
-   * cap (overflow), wait up to `timeoutMs` for a slot to free — a releaseAccount
-   * elsewhere wakes the waiter. Returns null when every account is genuinely
-   * unavailable (quota-exhausted / auth-error / excluded) or the wait times out,
-   * so the caller surfaces a 429 for the client to back off on.
-   *
-   * The caller MUST releaseAccount(account) exactly once when the request
-   * (including any streamed body) finishes — pass the returned account OBJECT,
-   * not its index, so a concurrent removeAccount() can't misattribute the slot.
-   * `exclude` is a Set of account OBJECTS (per-request failover).
-   */
-  async acquireAccount(exclude = null, timeoutMs = 0, signal = null, affinityKey = null) {
-    if (signal?.aborted) return null;
-    const account = this._tryAcquire(exclude, affinityKey);
-    if (account) return account;
-    // Queue only when the blockage is cap-saturation (a slot WILL free as
-    // in-flight requests finish) AND the queue isn't already full. If no
-    // available account exists at all, or the queue is at its depth cap, return
-    // null and let the caller 429 — never grow the backlog without bound.
-    if (timeoutMs <= 0 || !this.anyCapped(exclude) || this.isQueueFull()) return null;
-    return this._enqueue(exclude, timeoutMs, signal, affinityKey);
-  }
-
-  /** Is the overflow queue at its depth cap? */
-  isQueueFull() {
-    return this._waiters.length >= this.maxQueueDepth;
-  }
-
-  /**
-   * Upper bound on concurrent in-flight requests the proxy may admit (server.js
-   * caps `inFlightProxied` to this to bound buffered memory): each ENABLED
-   * account contributes its full cap (capacity it can still take), each DISABLED
-   * account contributes only its *current* in-flight (requests still draining —
-   * it accepts no new ones), plus the queue depth.
-   *
-   * This is the tightest bound that's still safe: it covers the draining requests
-   * on a just-disabled account (so they can't push inFlightProxied over the
-   * ceiling and 429 traffic the enabled accounts could serve), without admitting
-   * fresh requests against a disabled account's dead future capacity (which could
-   * only be buffered and then 429'd at acquire). As those draining requests
-   * finish, the disabled account's contribution falls to zero.
-   */
-  totalCapacity() {
-    const caps = this.accounts.reduce(
-      (sum, a) => sum + (a.enabled === false ? a.inflight : a.maxConcurrent), 0);
-    return caps + this.maxQueueDepth;
-  }
-
-  _enqueue(exclude, timeoutMs, signal = null, affinityKey = null) {
-    return new Promise(resolve => {
-      const waiter = { exclude, resolve, done: false, timer: null, signal, onAbort: null, affinityKey };
-      waiter.timer = setTimeout(() => this._settleWaiter(waiter, null), timeoutMs);
-      // Cancel the wait if the client disconnects — otherwise an aborted request
-      // would still acquire a slot later and be dispatched upstream, burning quota.
-      if (signal) {
-        waiter.onAbort = () => this._settleWaiter(waiter, null);
-        signal.addEventListener('abort', waiter.onAbort, { once: true });
-      }
-      this._waiters.push(waiter);
-    });
-  }
-
-  /** Resolve a queued waiter exactly once, cleaning up its timer/abort listener. */
-  _settleWaiter(waiter, value) {
-    if (waiter.done) return false;
-    waiter.done = true;
-    clearTimeout(waiter.timer);
-    if (waiter.signal && waiter.onAbort) waiter.signal.removeEventListener('abort', waiter.onAbort);
-    const i = this._waiters.indexOf(waiter);
-    if (i >= 0) this._waiters.splice(i, 1);
-    waiter.resolve(value);
     return true;
   }
 
-  /**
-   * Release a concurrency slot held by a request and hand any freed capacity to
-   * the longest-waiting overflow request that can use it (FIFO, but a waiter
-   * whose exclude set can't currently be satisfied is skipped rather than
-   * head-of-line blocking a later waiter that can run).
-   */
-  releaseAccount(accountOrIndex) {
-    // Resolve to the account OBJECT (what the server holds — reindex-safe across a
-    // removeAccount) so a release decrements the slot of the *account that was
-    // acquired*, never whatever happens to sit at that index now. A numeric index
-    // is still accepted for convenience/tests.
-    const account = this._resolve(accountOrIndex);
-    if (account && account.inflight > 0) account.inflight--;
-    this._drainWaiters();
-  }
-
-  _drainWaiters() {
-    for (let i = 0; i < this._waiters.length;) {
-      const waiter = this._waiters[i];
-      const account = this._tryAcquire(waiter.exclude, waiter.affinityKey);
-      if (account) {
-        // _settleWaiter splices the waiter out, so don't advance i. If it was
-        // already settled (shouldn't happen — settled waiters aren't in the list),
-        // give the slot back instead of leaking it.
-        if (!this._settleWaiter(waiter, account)) { account.inflight--; i++; }
-        continue;
-      }
-      // No slot right now. If no account this waiter could use is even
-      // available-but-capped, nothing will ever free for it (e.g. the account it
-      // was queued for just got disabled or exhausted) — settle it null so it
-      // releases its finite queue slot instead of blocking later, satisfiable
-      // overflow requests until its timeout. A waiter that still has a cappable
-      // account to hope for is left in place.
-      if (!this.anyCapped(waiter.exclude)) { this._settleWaiter(waiter, null); continue; }
-      i++;
-    }
-  }
-
-  /**
-   * Highest-priority available account by use-or-lose ordering: soonest WEEKLY
-   * (7d) reset first — weekly quota is the scarce resource, so an account whose
-   * week is about to renew (and whose unspent quota would be wasted) is drained
-   * first — then soonest session reset, then lowest session utilization. Falls
-   * back to the soonest-resetting account when none are currently available.
-   *
-   * `exclude` (a Set of account objects) is used for per-request failover: those
-   * accounts are skipped, and when nothing else is eligible this returns null
-   * (instead of recovering one) so the caller can pass the 429 through.
-   */
-  _selectBest(exclude = null) {
-    const has = a => (exclude ? exclude.has(a) : false);
-    const eligible = this.accounts.filter(a => this._isAvailable(a) && !has(a));
-    if (eligible.length === 0) return exclude ? null : this._recoverSoonest();
-
-    eligible.sort((a, b) => {
-      const pa = this._priority(a);
-      const pb = this._priority(b);
-      if (pa !== pb) return pa - pb;                                     // explicit priority first (lower = preferred)
-      return this.autoCompare(a, b);                                     // then the automatic use-or-lose order
-    });
-
-    // Accounts tied for the best rank (notably all-unknown at cold start, or all
-    // sharing one priority) are load-balanced round-robin instead of always
-    // pinning to the lowest index, so a startup burst can't pile onto one account
-    // before quotas are known.
-    const p0 = this._priority(eligible[0]);
-    const w0 = this._weeklyResetTime(eligible[0]);
-    const r0 = this._sessionResetTime(eligible[0]);
-    const u0 = this._sessionUtilization(eligible[0]);
-    const tied = eligible
-      .filter(a => this._priority(a) === p0
-        && this._weeklyResetTime(a) === w0
-        && this._sessionResetTime(a) === r0
-        && this._sessionUtilization(a) === u0)
-      .sort((a, b) => a.index - b.index);
-    if (tied.length <= 1) return eligible[0];
-    return tied.find(a => a.index > this.currentIndex) || tied[0];
-  }
-
-  /**
-   * Explicit selection priority: lower = preferred. Unset (null) sorts last
-   * (Infinity) so an account WITH any finite priority — however large — is chosen
-   * ahead of those without. When no account sets a priority, every account ties
-   * here (Infinity === Infinity) and the sort falls through to use-or-lose, i.e.
-   * the original behavior unchanged. The callers compare with a `pa !== pb` guard
-   * before any subtraction, so Infinity never produces a NaN sort key.
-   */
-  _priority(account) {
-    return Number.isFinite(account.priority) ? account.priority : Infinity;
-  }
-
-  /**
-   * The automatic ("auto") use-or-lose comparator, shared by selection and the
-   * TUI display order: soonest WEEKLY reset (drain what renews first) → soonest
-   * session reset → lowest session utilization. Returns 0 on a full tie, so a
-   * stable sort keeps ties in array order (the pre-weekly behavior for API-key
-   * fleets and unmeasured accounts).
-   */
-  autoCompare(a, b) {
-    const wa = this._weeklyResetTime(a);
-    const wb = this._weeklyResetTime(b);
-    if (wa !== wb) return wa - wb;
-    const ra = this._sessionResetTime(a);
-    const rb = this._sessionResetTime(b);
-    if (ra !== rb) return ra - rb;
-    return this._sessionUtilization(a) - this._sessionUtilization(b);
-  }
-
-  /**
-   * Weekly reset timestamp (ms): unified 7d (Max) → Infinity. API-key accounts
-   * have no weekly window, so they tie at Infinity and the session tiebreak
-   * decides — exactly the pre-weekly-ordering behavior. The window counts only
-   * when BOTH utilization and reset are present: a partial/garbled header pair
-   * (reset without utilization) must not outrank accounts with no 7d data,
-   * matching the documented "no weekly data ranks at Infinity" semantics.
-   *
-   * A timestamp that has PASSED ranks at Infinity too: the moment a window
-   * rolls over, the account's old "resets soonest" claim is void (its fresh
-   * window is unknown until re-measured) — without this, the past timestamp
-   * (smallest value) would pin the account at the top of the order until a
-   * request-path sweep happened to clear it, so the order would NOT follow
-   * reset rollovers. The lazy sweep in _isNearQuota still clears the fields;
-   * this just makes ORDERING (selection and the TUI display, which has no
-   * sweep) reflect the rollover instantly.
-   */
-  _weeklyResetTime(account) {
+  /** Highest utilization across the quota dimensions that govern `model` (0-1),
+   * used to pick the least-exhausted probe target. Mirrors _isNearQuota: the
+   * shared 5-hour bucket plus the model's governing weekly bucket. With no model
+   * it falls back to the shared weekly. */
+  _maxUtilization(account, model = null) {
     const q = account.quota;
-    const r = (q.unified7d != null && q.unified7dReset) ? q.unified7dReset : Infinity;
-    return r > Date.now() ? r : Infinity;
-  }
-
-  /**
-   * Session reset timestamp (ms): unified 5h (Max) → standard reset → Infinity.
-   * Expired timestamps rank at Infinity for the same rollover reason as
-   * _weeklyResetTime above.
-   */
-  _sessionResetTime(account) {
-    const q = account.quota;
-    const r = q.unified5hReset
-      || (q.resetsAt ? new Date(q.resetsAt).getTime() : Infinity);
-    return r > Date.now() ? r : Infinity;
-  }
-
-  /** Session utilization 0–1: unified 5h (Max) → standard token/request usage → 0. */
-  _sessionUtilization(account) {
-    const q = account.quota;
-    if (q.unified5h != null) return q.unified5h;
+    let max = 0;
+    if (q.unified5h != null) max = Math.max(max, q.unified5h);
+    const weeklyVal = this._governingWeekly(account, model);
+    if (weeklyVal != null) max = Math.max(max, weeklyVal);
     if (q.tokensLimit != null && q.tokensRemaining != null) {
-      return 1 - q.tokensRemaining / q.tokensLimit;
+      max = Math.max(max, 1 - q.tokensRemaining / q.tokensLimit);
     }
     if (q.requestsLimit != null && q.requestsRemaining != null) {
-      return 1 - q.requestsRemaining / q.requestsLimit;
+      max = Math.max(max, 1 - q.requestsRemaining / q.requestsLimit);
     }
-    return 0;
+    return max;
   }
 
-  /**
-   * Clear every account's expired quota windows NOW. The lazy sweep inside
-   * _isNearQuota only runs on selection paths (i.e. when a request flows), so
-   * on an idle proxy a rolled-over window would keep its stale values — and
-   * stay "measured", which prevents the periodic active warm-up from
-   * re-probing it. The server's warm-up timer calls this first, closing the
-   * loop: rollover → sweep → unmeasured → probe → fresh data → order updates.
-   * Idempotent and cheap (pure field clears).
-   */
-  sweepExpired() {
-    for (const a of this.accounts) this._isNearQuota(a);
-  }
-
-  /** True once we have any quota data for this account (rate-limit headers seen). */
-  _isMeasured(account) {
+  /** Utilization (0-1) of the weekly bucket that governs `model` on this account:
+   * unified7dFable for Fable, unified7dSonnet for Sonnet, unified7d otherwise.
+   * Falls back to the shared unified7d when a family-specific bucket isn't
+   * reported. Returns null when nothing is known. */
+  _governingWeekly(account, model) {
     const q = account.quota;
-    return q.unified5h != null || q.unified7d != null
-      || q.tokensLimit != null || q.requestsLimit != null;
+    const key = this._weeklyBucketFor(model);
+    if (q[key] != null) return q[key];
+    return key !== 'unified7d' ? q.unified7d : null;
+  }
+
+  /** Reset timestamp (ms) of the weekly bucket that governs `model`, falling back
+   * to the shared weekly reset. Used to spend the soonest-expiring quota first. */
+  _governingWeeklyReset(account, model) {
+    const q = account.quota;
+    const key = this._weeklyBucketFor(model);
+    return q[`${key}Reset`] || q.unified7dReset || null;
+  }
+
+  /** True when the family-specific weekly bucket that governs `model` is spent.
+   * Unlike _isNearQuota this ignores the shared 5h/weekly caps — it is only used
+   * to skip an account for a probe of a model it definitely can't serve. Returns
+   * false for families without a dedicated bucket (they share unified7d, already
+   * covered by _isNearQuota). */
+  _modelWeeklyExhausted(account, model) {
+    const q = account.quota;
+    const key = this._weeklyBucketFor(model);
+    if (key === 'unified7d') return false;
+    return q[key] != null && q[key] >= this.switchThreshold;
   }
 
   /**
-   * Fully measured, for ACTIVE warm-up candidacy: an OAuth (Max) response
-   * always carries both the 5h and the 7d window, so a missing half — e.g. a
-   * weekly rollover swept `unified7d` while the session window survived —
-   * means the account needs a re-probe or its weekly quota/ordering stays
-   * unknown until real traffic reaches it. One probe repopulates both windows,
-   * so candidacy converges. API-key accounts keep the any-data semantics.
+   * Pick an account to send a single revalidation probe upstream when every
+   * account reads as over the switch threshold. Throttled to one probe per
+   * probeIntervalMs so a genuinely-exhausted fleet isn't hammered — between
+   * probes this returns null and the caller falls back to the synthetic 429.
+   * The chosen account is the least-utilized probeable one (most likely to have
+   * stale headroom), so the refreshed quota corrects the cache fastest.
    */
-  _fullyMeasured(account) {
-    if (account.type === 'oauth') {
-      // A window counts only when COMPLETE (utilization AND reset) — the same
-      // semantics the ordering helpers use. Utilization without its reset
-      // timestamp gives use-or-lose nothing to sort on, so such an account
-      // still needs a re-probe.
-      const q = account.quota;
-      return q.unified5h != null && q.unified5hReset != null
-        && q.unified7d != null && q.unified7dReset != null;
-    }
-    return this._isMeasured(account);
-  }
+  _selectProbe(exclude = null, model = null) {
+    const now = Date.now();
+    if (now < this._nextProbeAt) return null;
 
-  /**
-   * An account still needing warm-up: available, not yet MEASURED, under the
-   * per-account attempt cap.
-   *
-   * Keying on `!_isMeasured` (not on "has it made a request") is deliberate: a
-   * request can return *no* rate-limit headers — a `HEAD /` health check, a
-   * 404, an auth failure — which would leave the account unmeasured. Gating
-   * warm-up on `totalRequests === 0` used to permanently disqualify such an
-   * account after that single header-less request, trapping it as "unmeasured"
-   * forever: it then sorts to the bottom of use-or-lose priority (no reset
-   * data) and the unmeasured-rebalance bounces any switch away from it, so it
-   * never gets used again — and its token never gets refreshed, so it expires.
-   *
-   * maxWarmupTries provides the loop-safety instead: a genuinely dead account
-   * (always header-less / 401) is abandoned after a few attempts rather than
-   * looping forever. (An expired-token account is resolved on its first warm-up
-   * routing anyway — ensureTokenFresh either refreshes it into a measurable
-   * state or marks it `error`, which makes it unavailable here.)
-   */
-  _isWarmupTarget(account) {
-    return this._isAvailable(account)
-      && !this._isMeasured(account)
-      && (account._warmupTries || 0) < this.maxWarmupTries;
-  }
-
-  /**
-   * Next account to warm up, round-robin across the warm-up targets so a burst
-   * spreads evenly. Advances the cursor and bumps the chosen account's attempt
-   * counter synchronously, so concurrent calls pick different accounts even
-   * before any response arrives. Returns null when no target remains.
-   */
-  _nextWarmup() {
-    const n = this.accounts.length;
-    for (let i = 0; i < n; i++) {
-      const idx = (this._warmupCursor + i) % n;
-      const a = this.accounts[idx];
-      if (this._isWarmupTarget(a)) {
-        this._warmupCursor = idx + 1;
-        a._warmupTries = (a._warmupTries || 0) + 1;
-        return a;
+    let best = null;
+    let bestPriority = Infinity;
+    let bestUsage = Infinity;
+    for (const account of this.accounts) {
+      if (exclude?.has(account.index)) continue;
+      if (!this._isProbeable(account)) continue;
+      // A family-exhausted account can't serve that family even as a probe — it
+      // would just 429 again — so skip it (Fable/Sonnet) and let the caller emit
+      // the synthetic 429 when no other account is available.
+      if (model && this._modelWeeklyExhausted(account, model)) continue;
+      // Same for routing/ownership: a probe for a routed or owned model must not
+      // land on an ineligible account (it would just reject the unknown model id).
+      if (model && !this._routeAllows(account, model)) continue;
+      const priority = account.priority || 0;
+      const usage = this._maxUtilization(account, model);
+      if (priority < bestPriority ||
+          (priority === bestPriority && usage < bestUsage)) {
+        bestPriority = priority;
+        bestUsage = usage;
+        best = account;
       }
     }
-    return null;
+    if (!best) return null;
+
+    this._nextProbeAt = now + this.probeIntervalMs;
+    this.currentIndex = best.index;
+    this._beginRamp(best);
+    if (best.status === 'throttled') {
+      console.log(`[TeamClaude] All accounts unavailable — revalidating throttled "${best.name}" with a live request`);
+    } else {
+      console.log(`[TeamClaude] All accounts over threshold — probing "${best.name}" to refresh quota`);
+    }
+    return best;
   }
 
-  /**
-   * Accounts eligible for an *active* warm-up probe: available (enabled, not
-   * throttled / exhausted / error), with no quota data yet, AND not already
-   * handling a request. The server sends each one a minimal upstream request to
-   * populate its quota so the dashboard reflects the whole fleet shortly after a
-   * (re)start, instead of waiting for client traffic to organically reach every
-   * account.
-   *
-   * `inflight === 0` matters: a request already in flight will itself populate
-   * the account's quota (updateQuota runs on its response headers), so probing it
-   * would just race that request and waste an upstream call. Cold start's very
-   * first request holds its (still-unmeasured) account here, so the startup
-   * fan-out probes only the genuinely idle rest of the fleet — never the account
-   * that request is already measuring. (An unmeasured account can't be near-quota,
-   * so no extra status carve-outs are needed beyond _isAvailable.)
-   */
-  warmupCandidates() {
-    return this.accounts.filter(a =>
-      this._isAvailable(a) && !this._fullyMeasured(a) && a.inflight === 0
-      // Convergence cap: against the real upstream one probe fully measures an
-      // account (responses always carry both window families), but a
-      // pathological upstream — a 2xx missing a family, header-less responses,
-      // or a deterministic 4xx — must not be probed every interval forever. A
-      // probe that completes with such a deterministic fruitless outcome
-      // increments _partialProbes (transient 5xx/429/network failures don't
-      // count — see warmupAccount); after maxWarmupTries fruitless probes the
-      // account stops being a candidate. The counter resets when a window is
-      // swept (a fresh rollover is a fresh reason to probe) or when the
-      // account becomes fully measured — and, because a fully UNMEASURED
-      // account has no reset timestamp for the sweep to fire on, a capped
-      // account is retried once per probeRetryAfterMs as a slow backstop, so a
-      // "deterministic-looking" outage (e.g. headers temporarily missing) still
-      // recovers instead of suppressing active warm-up until a restart.
-      && ((a._partialProbes || 0) < this.maxWarmupTries
-        || Date.now() - (a._lastFruitlessProbeAt || 0) >= this.probeRetryAfterMs));
-  }
-
-  _isAvailable(account) {
+  _isAvailable(account, model = null) {
     if (!account) return false;
 
-    // Manually disabled accounts are out of rotation entirely. This single gate
-    // covers every selection path (warm-up target, _selectBest, _cappedSet,
-    // anyUsable/anyCapped, the sticky-current check) so a disabled account is
-    // never chosen for a new request. _recoverSoonest iterates accounts directly
-    // (not via this), so it skips disabled accounts itself.
-    if (account.enabled === false) return false;
+    // Manually disabled accounts are skipped entirely until re-enabled.
+    if (account.disabled) return false;
 
     // Check rate limit expiry
     if (account.status === 'throttled' && account.rateLimitedUntil) {
       if (Date.now() < account.rateLimitedUntil) return false;
       account.status = 'active';
       account.rateLimitedUntil = null;
+      account.throttledAt = null;
       console.log(`[TeamClaude] Account "${account.name}" rate limit expired, marking active`);
     }
 
     if (account.status === 'exhausted' || account.status === 'error') return false;
-    if (this._isNearQuota(account)) return false;
+    // Model-scoped: _isNearQuota checks the shared 5h bucket plus only the weekly
+    // bucket that governs this model, so a spent Fable/Sonnet bucket bars just
+    // that family — the account still serves every other model normally.
+    if (this._isNearQuota(account, model)) return false;
+
+    // Route/ownership restriction: a configured route can pin a model pattern to
+    // an exclusive set of accounts; failing that, a per-account `models` claim
+    // restricts an owned model to its owners. Either way an account not eligible
+    // for this model is skipped so the request never lands somewhere it can't run.
+    if (model && !this._routeAllows(account, model)) return false;
 
     return true;
   }
 
-  _isNearQuota(account) {
+  /**
+   * Normalize and store the configurable routing table. A route pins a set of
+   * model globs to an exclusive set of accounts (and may override the governing
+   * quota bucket). Called from the constructor and on config reload.
+   *   { name, match: string|string[], accounts?: (name|index)[], bucket? }
+   */
+  setRoutes(routes) {
+    this.routes = (Array.isArray(routes) ? routes : []).map((r, i) => ({
+      name: r.name || `route-${i + 1}`,
+      match: (Array.isArray(r.match) ? r.match : [r.match]).filter(g => typeof g === 'string' && g),
+      accounts: Array.isArray(r.accounts) ? r.accounts.map(String) : [],
+      bucket: r.bucket || null,
+      color: r.color || null, // display-only accent for the route's inline marker
+    })).filter(r => r.match.length);
+    // Drop pins for routes that no longer exist after a reload.
+    if (this.routePins?.size) {
+      const names = new Set(this.routes.map(r => r.name));
+      for (const name of [...this.routePins.keys()]) {
+        if (name !== 'fable' && name !== 'sonnet' && !names.has(name)) this.routePins.delete(name);
+      }
+    }
+  }
+
+  /** The first configured route whose globs match `model`, or null. */
+  _routeForModel(model) {
+    if (!model || !this.routes?.length) return null;
+    return this.routes.find(r => r.match.some(g => modelGlobMatches(g, model))) || null;
+  }
+
+  /** The weekly quota bucket that governs `model` — a matching route's `bucket`
+   * override wins, otherwise the model family's default bucket. */
+  _weeklyBucketFor(model) {
+    const route = this._routeForModel(model);
+    return route?.bucket || weeklyBucketForModel(model);
+  }
+
+  /** Whether `account` may serve `model`. A matching route with an `accounts`
+   * list is exclusive (only listed accounts, by name or index). With no matching
+   * route — or a route that lists no accounts — it falls back to the per-account
+   * `models` ownership claim so PR #74 configs keep working. */
+  _routeAllows(account, model) {
+    const route = this._routeForModel(model);
+    if (route && route.accounts.length) {
+      return route.accounts.includes(account.name) || route.accounts.includes(String(account.index));
+    }
+    return this._accountOwnsModel(account, model);
+  }
+
+  /** Returns true if no account claims model ownership, or this account does. */
+  _accountOwnsModel(account, model) {
+    for (const a of this.accounts) {
+      if (a.models && a.models.some(m => modelMatches(m, model))) {
+        // Some other account owns this model — this account must own it too.
+        return !!(account.models && account.models.some(m => modelMatches(m, model)));
+      }
+    }
+    return true; // no one claims ownership → any account is fine
+  }
+
+  /**
+   * The routing table for display: every configured route plus an ephemeral,
+   * auto-created route for each model family that some account meters with its
+   * own weekly bucket but no configured route already covers. Auto-created routes
+   * carry `autocreated: true` and are never persisted — they simply surface the
+   * per-model quota the server already respects. Each route lists the accounts it
+   * can use with a live eligibility flag.
+   */
+  getRoutes() {
+    const out = this.routes.map(r => ({
+      name: r.name, match: r.match, bucket: r.bucket, color: r.color || null, autocreated: false,
+      pinned: this._pinnedName(r.name),
+      accounts: this._routeAccountsView(r),
+    }));
+
+    const detected = [];
+    if (this.accounts.some(a => a.quota.unified7dFable != null)) {
+      detected.push({ name: 'fable', match: ['*fable*'], sample: 'claude-fable-5' });
+    }
+    if (this.accounts.some(a => a.quota.unified7dSonnet != null)) {
+      detected.push({ name: 'sonnet', match: ['*sonnet*'], sample: 'claude-sonnet-4-6' });
+    }
+    for (const d of detected) {
+      if (this._routeForModel(d.sample)) continue; // already covered by a configured route
+      out.push({
+        name: d.name, match: d.match, bucket: null, color: null, autocreated: true,
+        pinned: this._pinnedName(d.name),
+        accounts: this.accounts.map(a => ({ name: a.name, eligible: this._isAvailable(a, d.sample) })),
+      });
+    }
+    return out;
+  }
+
+  /** The name of the account this route is manually pinned to, or null. */
+  _pinnedName(routeName) {
+    const idx = this.routePins.get(routeName);
+    return idx == null ? null : (this.accounts[idx]?.name ?? null);
+  }
+
+  /** Accounts a configured route can use (all accounts when it lists none), each
+   * with a live eligibility flag for a representative model of the route. */
+  _routeAccountsView(route) {
+    const sample = route.match[0].replace(/\*/g, '') || 'model';
+    const inRoute = a => !route.accounts.length
+      || route.accounts.includes(a.name) || route.accounts.includes(String(a.index));
+    return this.accounts.filter(inRoute).map(a => ({ name: a.name, eligible: this._isAvailable(a, sample) }));
+  }
+
+  /** A representative model id for a route name (configured or auto fable/sonnet),
+   * used to test route-allowance when pinning. Null for an unknown route. */
+  _routeSample(routeName) {
+    const r = this.routes.find(x => x.name === routeName);
+    if (r) return r.match[0]?.replace(/\*/g, '') || 'model';
+    if (routeName === 'fable') return 'claude-fable-5';
+    if (routeName === 'sonnet') return 'claude-sonnet-4-6';
+    return null;
+  }
+
+  /**
+   * Manually pin a route to an account (ephemeral runtime override). Rejects an
+   * account the route's exclusivity/ownership rules disallow. Pinning an account
+   * that is merely near-quota/throttled is allowed — it acts as a preference and
+   * routing falls back to best-available until the pinned account is eligible.
+   * Returns { ok, reason? }.
+   */
+  setRoutePin(routeName, accountIndex) {
+    const account = this.accounts[accountIndex];
+    if (!account) return { ok: false, reason: 'no such account' };
+    const sample = this._routeSample(routeName);
+    if (sample && !this._routeAllows(account, sample)) {
+      return { ok: false, reason: `route "${routeName}" does not allow "${account.name}"` };
+    }
+    this.routePins.set(routeName, accountIndex);
+    return { ok: true };
+  }
+
+  clearRoutePin(routeName) { this.routePins.delete(routeName); }
+
+  /** The account a route is pinned to, or null. */
+  getRoutePin(routeName) {
+    const idx = this.routePins.get(routeName);
+    return idx == null ? null : (this.accounts[idx] || null);
+  }
+
+  /** The manually-pinned account governing `model`, if any: a configured route's
+   * pin wins, else an auto fable/sonnet family pin (only when no configured route
+   * covers the model). Returns null when nothing is pinned for this model. */
+  _pinnedAccountForModel(model) {
+    if (!model || !this.routePins.size) return null;
+    const route = this._routeForModel(model);
+    if (route) {
+      const idx = this.routePins.get(route.name);
+      return idx == null ? null : (this.accounts[idx] || null);
+    }
+    for (const name of ['fable', 'sonnet']) {
+      if (this.routePins.has(name) && modelGlobMatches(`*${name}*`, model)) {
+        return this.accounts[this.routePins.get(name)] || null;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Clear any quota counters whose reset time has passed. Cheap and safe to
+   * call frequently (e.g. from the TUI render loop) — once a counter is cleared
+   * it stays null until the next upstream response repopulates it, so the
+   * "reset" log fires at most once per window.
+   * @returns {{changed: boolean, session: boolean}} what was cleared.
+   */
+  _clearExpiredQuotas(account) {
     const q = account.quota;
     const now = Date.now();
+    let changed = false;
+    let session = false;
 
-    // Clear expired unified quotas. The reset timestamp is cleared even when the
-    // matching utilization was never set (a partial/garbled header pair) — a
-    // stale past timestamp would otherwise survive forever and, since selection
-    // sorts by reset time, permanently bias the ordering toward that account.
-    if (q.unified5hReset && now >= q.unified5hReset) {
-      if (q.unified5h != null) console.log(`[TeamClaude] Account "${account.name}" session quota reset`);
+    // Clear expired unified quotas
+    if (q.unified5h != null && q.unified5hReset && now >= q.unified5hReset) {
+      console.log(`[TeamClaude] Account "${account.name}" session quota reset`);
       q.unified5h = null;
       q.unified5hReset = null;
-      // Fresh rollover → BOTH warm-up budgets renew: active probes
-      // (_partialProbes) and the passive request-routing warm-up
-      // (_warmupTries) get a fresh reason to re-measure this window.
-      account._partialProbes = 0;
-      account._warmupTries = 0;
+      changed = true;
+      session = true;
     }
-    if (q.unified7dReset && now >= q.unified7dReset) {
-      if (q.unified7d != null) console.log(`[TeamClaude] Account "${account.name}" weekly quota reset`);
+    if (q.unified7d != null && q.unified7dReset && now >= q.unified7dReset) {
+      console.log(`[TeamClaude] Account "${account.name}" weekly quota reset`);
       q.unified7d = null;
       q.unified7dReset = null;
       q.unifiedStatus = null;
-      account._partialProbes = 0; // fresh rollover → re-probes allowed again
-      account._warmupTries = 0;
+      changed = true;
     }
-    // Clear expired model-scoped weekly windows (display-only, but a stale
-    // "94% Fable" bar after the window reset would mislead)
-    for (const [label, win] of Object.entries(q.modelWeekly)) {
-      if (win.reset && now >= win.reset) {
-        console.log(`[TeamClaude] Account "${account.name}" ${label} quota reset`);
-        delete q.modelWeekly[label];
+    if (q.unified7dSonnet != null && q.unified7dSonnetReset && now >= q.unified7dSonnetReset) {
+      q.unified7dSonnet = null;
+      q.unified7dSonnetReset = null;
+      changed = true;
+    }
+    if (q.unified7dFable != null && q.unified7dFableReset && now >= q.unified7dFableReset) {
+      q.unified7dFable = null;
+      q.unified7dFableReset = null;
+      changed = true;
+    }
+
+    // Clear expired standard quotas
+    if (q.resetsAt && now >= new Date(q.resetsAt).getTime()) {
+      q.tokensRemaining = null;
+      q.tokensLimit = null;
+      q.requestsRemaining = null;
+      q.requestsLimit = null;
+      q.resetsAt = null;
+      changed = true;
+    }
+
+    return { changed, session };
+  }
+
+  /**
+   * Clear expired quotas across all accounts. Called from the display loop and
+   * the request path so a window expiry (e.g. the 5-hour session quota) resets
+   * the view instantly rather than waiting for the next request.
+   *
+   * When an account's session quota resets, it may have become the better
+   * choice — switch to it if its weekly limit expires sooner than the current
+   * account's (and it still has weekly quota), so we spend the quota closest to
+   * refreshing first.
+   */
+  refreshExpiredQuotas() {
+    let changed = false;
+    const sessionReset = [];
+    for (const account of this.accounts) {
+      const r = this._clearExpiredQuotas(account);
+      if (r.changed) changed = true;
+      if (r.session) sessionReset.push(account);
+    }
+    if (sessionReset.length) this._switchOnSessionReset(sessionReset);
+    return changed;
+  }
+
+  /**
+   * Given accounts whose session quota just reset, switch to the one whose
+   * weekly limit expires soonest — but only if that is sooner than the current
+   * account's weekly limit and the account still has weekly quota to spend.
+   */
+  _switchOnSessionReset(candidates) {
+    const current = this.accounts[this.currentIndex];
+    // Need a known weekly reset on the current account to compare against;
+    // if it is unknown we are still probing it, so leave it alone.
+    if (!current || current.quota.unified7dReset == null) return;
+
+    let best = null;
+    let bestWeekly = current.quota.unified7dReset;
+    for (const acc of candidates) {
+      if (acc.index === this.currentIndex) continue;
+      if (!this._isAvailable(acc)) continue; // enough session & weekly quota left
+      // Don't demote to a lower-priority (higher value) account on a reset.
+      if ((acc.priority || 0) > (current.priority || 0)) continue;
+      const weekly = acc.quota.unified7dReset;
+      if (weekly == null) continue; // need a known weekly to compare
+      if (weekly < bestWeekly) {
+        bestWeekly = weekly;
+        best = acc;
       }
     }
 
-    // Clear expired standard quotas — each window INDEPENDENTLY. The token and
-    // request windows reset at different times; sweeping both on the collapsed
-    // resetsAt (token-first) made a still-blocked request window vanish the
-    // moment the sooner token window reset, freeing the account ~an hour early.
-    // A window without its own reset falls back to resetsAt (old snapshots /
-    // upstreams that only send one reset header) — same sweep as before.
-    const tokensResetAt = q.tokensReset || q.resetsAt;
-    if (tokensResetAt && now >= new Date(tokensResetAt).getTime()) {
-      q.tokensRemaining = null;
-      q.tokensLimit = null;
-      q.tokensReset = null;
+    if (best) {
+      this.currentIndex = best.index;
+      this._beginRamp(best);
+      console.log(`[TeamClaude] Account "${best.name}" session quota reset and weekly expires sooner — switching to it`);
     }
-    const requestsResetAt = q.requestsReset || q.resetsAt;
-    if (requestsResetAt && now >= new Date(requestsResetAt).getTime()) {
-      q.requestsRemaining = null;
-      q.requestsLimit = null;
-      q.requestsReset = null;
-    }
-    // Advance the collapsed resetsAt (session-ordering fallback) to the soonest
-    // still-future window reset, or clear it once no window remains.
-    if (q.resetsAt && now >= new Date(q.resetsAt).getTime()) {
-      const future = [q.tokensReset, q.requestsReset]
-        .map(r => (r ? new Date(r).getTime() : null))
-        .filter(t => t && t > now);
-      q.resetsAt = future.length ? new Date(Math.min(...future)).toISOString() : null;
-    }
+  }
 
-    // Unified quotas (Claude Max) — utilization is already 0-1
+  _isNearQuota(account, model = null) {
+    const q = account.quota;
+    this._clearExpiredQuotas(account);
+
+    // Shared 5-hour bucket gates every request regardless of model.
     if (q.unified5h != null && q.unified5h >= this.switchThreshold) return true;
-    if (q.unified7d != null && q.unified7d >= this.switchThreshold) return true;
+
+    // Only the weekly bucket that GOVERNS this model is checked: Fable and Sonnet
+    // meter their own weekly quota, so a spent Fable bucket must not bar an Opus
+    // or Sonnet request (and vice versa). When the family bucket isn't reported
+    // (e.g. the plan doesn't expose it), fall back to the shared weekly so an
+    // account over its overall cap is still treated as near-quota.
+    const weeklyVal = this._governingWeekly(account, model);
+    if (weeklyVal != null && weeklyVal >= this.switchThreshold) return true;
 
     // Standard quotas (API key accounts)
     if (q.tokensLimit != null && q.tokensRemaining != null) {
@@ -776,14 +733,95 @@ export class AccountManager {
     return false;
   }
 
-  /** When all accounts are unavailable, return the soonest to reset (if it has already reset). */
-  _recoverSoonest() {
+  /**
+   * Pick the best available account by selection order, WITHOUT mutating state:
+   *   1. lowest `priority` value (operator-controlled; default 0, lower = preferred)
+   *   2. then the account with no known weekly limit — using it lets us
+   *      discover its quota
+   *   3. then the account whose weekly limit expires soonest: that quota is
+   *      closest to refreshing, so spending it first preserves accounts whose
+   *      weekly window resets further out.
+   * With all priorities at the default 0, this reduces to the weekly-reset
+   * heuristic. Returns the account or null if none are available.
+   */
+  _pickBestAvailable(exclude = null, model = null) {
+    let best = null;
+    let bestPriority = Infinity;
+    let bestReset = Infinity;
+
+    for (let i = 0; i < this.accounts.length; i++) {
+      const account = this.accounts[i];
+      if (exclude?.has(account.index)) continue;
+      // _isAvailable filters out accounts at/above the switch threshold, so the
+      // soonest-expiring pick only ever lands on an account whose 5-hour quota
+      // is still below 98%.
+      if (!this._isAvailable(account, model)) continue;
+
+      const priority = account.priority || 0;
+      // Rank by the reset of the weekly bucket that governs THIS model (Fable and
+      // Sonnet have their own), so a Fable request spends the account whose Fable
+      // window refreshes soonest while preserving accounts that reset later for
+      // Opus/Sonnet. Unknown reset sorts first so we probe and fill it in.
+      const weeklyReset = this._governingWeeklyReset(account, model) || -Infinity;
+      if (priority < bestPriority ||
+          (priority === bestPriority && weeklyReset < bestReset)) {
+        bestPriority = priority;
+        bestReset = weeklyReset;
+        best = account;
+      }
+    }
+    return best;
+  }
+
+  /**
+   * Select the active account up front (e.g. on daemon launch, once persisted
+   * quota has been restored) so we start on the highest-priority / soonest-
+   * resetting account instead of blindly on index 0. Mirrors rotation order.
+   * Returns the chosen account, or the existing current one if none are
+   * available (the server still starts; requests 429 until a window resets).
+   */
+  selectActiveAccount() {
+    this.refreshExpiredQuotas(); // drop any restored windows that already expired
+    const best = this._pickBestAvailable();
+    if (!best) return this.accounts[this.currentIndex] || null;
+    this.currentIndex = best.index;
+    this._beginRamp(best);
+    best.probing = best.quota.unified7dReset == null;
+    const wk = best.quota.unified7d != null
+      ? `${(best.quota.unified7d * 100).toFixed(1)}% weekly used`
+      : 'weekly quota unknown';
+    console.log(`[TeamClaude] Starting on account "${best.name}" (priority ${best.priority || 0}, ${wk})`);
+    return best;
+  }
+
+  _selectNext(exclude = null, model = null) {
+    const best = this._pickBestAvailable(exclude, model);
+    if (best) {
+      const switched = best.index !== this.currentIndex;
+      this.currentIndex = best.index;
+      // If we switched to an account whose weekly quota is still unknown, flag
+      // it so we re-evaluate once that quota is learned (see updateQuota).
+      best.probing = best.quota.unified7dReset == null;
+      if (switched) {
+        this._beginRamp(best);
+        console.log(`[TeamClaude] Switched to account "${best.name}"`);
+      }
+      return best;
+    }
+
+    // All accounts unavailable — find the one that resets soonest
     let soonestAccount = null;
     let soonestTime = Infinity;
 
     for (const account of this.accounts) {
-      // Never recover a manually-disabled account into rotation.
-      if (account.enabled === false) continue;
+      if (exclude?.has(account.index)) continue;
+      // Never resurrect a hard-state account: `disabled` is an operator decision
+      // and `error` means the token is broken (needs re-login). Selecting either
+      // here would send a live request on an account that must not be used and,
+      // below, silently clear its throttle/error state. (Mirrors _isAvailable.)
+      if (account.disabled || account.status === 'error') continue;
+      // A routed/owned model must not fall back to an ineligible account.
+      if (model && !this._routeAllows(account, model)) continue;
       const resetTime = account.rateLimitedUntil
         || account.quota.unified5hReset
         || account.quota.unified7dReset
@@ -799,6 +837,7 @@ export class AccountManager {
       soonestAccount.status = 'active';
       soonestAccount.rateLimitedUntil = null;
       this.currentIndex = soonestAccount.index;
+      this._beginRamp(soonestAccount);
       console.log(`[TeamClaude] Account "${soonestAccount.name}" reset, switching to it`);
       return soonestAccount;
     }
@@ -810,7 +849,7 @@ export class AccountManager {
    * Update an account's quota tracking from upstream response headers.
    */
   updateQuota(accountIndex, headers) {
-    const account = this._resolve(accountIndex);
+    const account = this.accounts[accountIndex];
     if (!account) return;
 
     // Unified rate limits (Claude Max)
@@ -824,27 +863,25 @@ export class AccountManager {
     if (r5h) account.quota.unified5hReset = parseInt(r5h, 10) * 1000;
     if (r7d) account.quota.unified7dReset = parseInt(r7d, 10) * 1000;
 
+    // Model-scoped weekly bucket — surfaced in headers as `7d_oi` ("7-day,
+    // overage included"). On current subscription plans this is the Fable weekly
+    // limit (it correlates with the usage endpoint's Fable-scoped weekly bucket).
+    // Utilization here is already a 0-1 fraction (can exceed 1 when in overage).
+    const u7dOi = parseFloat(headers['anthropic-ratelimit-unified-7d_oi-utilization']);
+    if (!isNaN(u7dOi)) account.quota.unified7dFable = u7dOi;
+    const r7dOi = headers['anthropic-ratelimit-unified-7d_oi-reset'];
+    if (r7dOi) account.quota.unified7dFableReset = parseInt(r7dOi, 10) * 1000;
+
+    // We switched to this account to discover its weekly quota; now that we
+    // know it, flag for re-evaluation so selection can pick the best account.
+    if (account.probing && account.quota.unified7dReset != null) {
+      account.probing = false;
+      account.requalify = true;
+      console.log(`[TeamClaude] Learned weekly quota for "${account.name}", re-evaluating selection`);
+    }
+
     const uStatus = headers['anthropic-ratelimit-unified-status'];
     if (uStatus) account.quota.unifiedStatus = uStatus;
-
-    // Model-scoped weekly windows (7d_<label>), e.g. `7d_oi` — the weekly limit
-    // for the top model tier ("Fable" in Claude's usage UI). These headers only
-    // appear on responses to requests for that model tier, so the value sticks
-    // around from the last such request. Matched generically so a renamed or
-    // newly added window is picked up as-is.
-    for (const [key, value] of Object.entries(headers)) {
-      const m = /^anthropic-ratelimit-unified-(7d_[a-z0-9_]+)-(utilization|reset)$/.exec(key);
-      if (!m) continue;
-      const win = account.quota.modelWeekly[m[1]]
-        || (account.quota.modelWeekly[m[1]] = { utilization: null, reset: null });
-      if (m[2] === 'utilization') {
-        const u = parseFloat(value);
-        if (!isNaN(u)) win.utilization = u;
-      } else {
-        const r = parseInt(value, 10);
-        if (!isNaN(r)) win.reset = r * 1000;
-      }
-    }
 
     // Standard rate limits (API key accounts)
     const tokensLimit = parseInt(headers['anthropic-ratelimit-tokens-limit'], 10);
@@ -859,8 +896,6 @@ export class AccountManager {
     if (!isNaN(requestsLimit)) account.quota.requestsLimit = requestsLimit;
     if (!isNaN(requestsRemaining)) account.quota.requestsRemaining = requestsRemaining;
 
-    if (tokensReset) account.quota.tokensReset = tokensReset;
-    if (requestsReset) account.quota.requestsReset = requestsReset;
     if (tokensReset) account.quota.resetsAt = tokensReset;
     else if (requestsReset) account.quota.resetsAt = requestsReset;
 
@@ -882,53 +917,90 @@ export class AccountManager {
    * Update cumulative token usage from response body data.
    */
   updateUsage(accountIndex, inputTokens, outputTokens) {
-    const account = this._resolve(accountIndex);
+    const account = this.accounts[accountIndex];
     if (!account) return;
     if (inputTokens) account.usage.totalInputTokens += inputTokens;
     if (outputTokens) account.usage.totalOutputTokens += outputTokens;
   }
 
   /**
-   * Does a 429 from this account indicate genuine *account-level quota
-   * exhaustion* (vs a transient / global / IP / request-level 429)?
-   *
-   * Only exhaustion 429s should throttle the account and trigger a switch to
-   * another account. A non-exhaustion 429 must NOT be replayed across the
-   * fleet — otherwise a single request whose 429 is request-global (e.g. a
-   * malformed request, an org/IP limit, or a momentary upstream blip) would
-   * poison every account and make unrelated requests fail too.
-   *
-   * Call this *after* updateQuota() has folded the 429's rate-limit headers
-   * into the account's quota state.
-   *
-   * Model-scoped windows (quota.modelWeekly, e.g. the Fable 7d_oi limit) are
-   * deliberately NOT consulted here. On a real upstream 429 for that model tier
-   * the top-level `unified-status` is `rejected` too (the binding claim is
-   * reflected there — verified against live traffic), so the exhaustion IS
-   * detected; folding 7d_oi in additionally would change nothing on real
-   * headers, and reacting to it alone would globally throttle an account that
-   * still serves every other model. Per-model routing (skip Fable-exhausted
-   * accounts only for Fable requests, without the 5-min global throttle) would
-   * need the request's model plumbed into selection — a separate feature.
+   * Enable or disable an account. A disabled account is skipped by rotation
+   * until re-enabled. Re-enabling also clears a stuck 'error' state (and any
+   * lingering rate-limit hold) so the account is retried immediately.
    */
-  isExhausted(accountIndex) {
-    const account = this._resolve(accountIndex);
-    if (!account) return false;
-    // Claude Max: upstream explicitly rejects when over the unified limit.
-    if (account.quota.unifiedStatus === 'rejected') return true;
-    // Otherwise rely on measured utilization (unified or standard headers).
-    return this._isNearQuota(account);
+  setDisabled(accountIndex, disabled) {
+    const account = this.accounts[accountIndex];
+    if (!account) return;
+    account.disabled = disabled;
+    if (!disabled && account.status === 'error') {
+      account.status = 'active';
+      account.rateLimitedUntil = null;
+      console.log(`[TeamClaude] Account "${account.name}" re-enabled — clearing error state`);
+    }
+  }
+
+  /**
+   * Apply quota learned from the OAuth usage endpoint (the background probe).
+   * Updates utilization/reset for the 5h, 7d, Sonnet-7d, and Fable-7d buckets WITHOUT
+   * touching usage counters — a probe is not real client traffic.
+   */
+  applyUsageData(accountIndex, usage) {
+    const account = this.accounts[accountIndex];
+    if (!account || !usage) return;
+    const q = account.quota;
+
+    if (usage.fiveHour) {
+      if (usage.fiveHour.utilization != null) q.unified5h = usage.fiveHour.utilization;
+      if (usage.fiveHour.resetAt != null) q.unified5hReset = usage.fiveHour.resetAt;
+    }
+    if (usage.sevenDay) {
+      if (usage.sevenDay.utilization != null) q.unified7d = usage.sevenDay.utilization;
+      if (usage.sevenDay.resetAt != null) q.unified7dReset = usage.sevenDay.resetAt;
+    }
+    if (usage.sevenDaySonnet) {
+      if (usage.sevenDaySonnet.utilization != null) q.unified7dSonnet = usage.sevenDaySonnet.utilization;
+      if (usage.sevenDaySonnet.resetAt != null) q.unified7dSonnetReset = usage.sevenDaySonnet.resetAt;
+    }
+    if (usage.sevenDayFable) {
+      if (usage.sevenDayFable.utilization != null) q.unified7dFable = usage.sevenDayFable.utilization;
+      if (usage.sevenDayFable.resetAt != null) q.unified7dFableReset = usage.sevenDayFable.resetAt;
+    }
+
+    // If we just learned this account's weekly window while probing, re-evaluate
+    // selection (same path as learning it from a live response).
+    if (account.probing && q.unified7dReset != null) {
+      account.probing = false;
+      account.requalify = true;
+    }
   }
 
   /**
    * Mark an account as rate-limited for a given duration.
    */
   markRateLimited(accountIndex, retryAfterSeconds) {
-    const account = this._resolve(accountIndex);
+    const account = this.accounts[accountIndex];
     if (!account) return;
     account.status = 'throttled';
     account.rateLimitedUntil = Date.now() + (retryAfterSeconds * 1000);
+    // Marks when the hold was (re-)armed: a revalidation probe is allowed only
+    // after throttleProbeFloorMs from here, so a probe that 429s again pushes
+    // the next probe out by a full floor rather than hammering upstream.
+    account.throttledAt = Date.now();
     console.log(`[TeamClaude] Account "${account.name}" rate limited for ${retryAfterSeconds}s`);
+  }
+
+  /**
+   * Clear a rate-limit hold after live proof it no longer binds: any non-429
+   * upstream response on a throttled account (a revalidation probe reaching
+   * here, or a hold armed moments before traffic resumed). No-op otherwise.
+   */
+  clearRateLimited(accountIndex) {
+    const account = this.accounts[accountIndex];
+    if (!account || account.status !== 'throttled') return;
+    account.status = 'active';
+    account.rateLimitedUntil = null;
+    account.throttledAt = null;
+    console.log(`[TeamClaude] Account "${account.name}" revalidated — rate limit no longer applies, back in rotation`);
   }
 
   /**
@@ -937,7 +1009,7 @@ export class AccountManager {
    * Concurrent calls for the same account coalesce into a single refresh.
    */
   async ensureTokenFresh(accountIndex, force = false) {
-    const account = this._resolve(accountIndex);
+    const account = this.accounts[accountIndex];
     if (!account || account.type !== 'oauth' || !account.refreshToken) return;
 
     if (!force && !isTokenExpiringSoon(account.expiresAt)) return;
@@ -948,22 +1020,24 @@ export class AccountManager {
     account._refreshPromise = (async () => {
       console.log(`[TeamClaude] Refreshing token for account "${account.name}"...`);
       try {
-        const newTokens = await refreshAccessToken(account.refreshToken);
+        const newTokens = await this._refreshFn(account.refreshToken);
         account.credential = newTokens.accessToken;
         account.refreshToken = newTokens.refreshToken;
         account.expiresAt = newTokens.expiresAt;
         console.log(`[TeamClaude] Token refreshed for account "${account.name}"`);
-        // Only persist if the account is still live at its claimed index. If it was
-        // removed during the (awaited) network refresh, its `.index` is stale and
-        // would misattribute the write to the survivor that shifted into that slot
-        // — and a deleted account's tokens don't need persisting anyway.
-        if (this.accounts[account.index] === account) this._onTokenRefresh?.(account.index, newTokens);
+        this._onTokenRefresh?.(accountIndex, newTokens);
       } catch (err) {
         console.error(`[TeamClaude] Token refresh failed for "${account.name}": ${err.message}`);
-        // Only mark as error if the access token is actually expired;
-        // a failed proactive refresh shouldn't kill a still-valid token
-        if (!account.expiresAt || Date.now() >= account.expiresAt) {
+        // Reserve 'error' (which drops the account from rotation until re-login)
+        // for a GENUINE auth rejection: the refresh token itself is no longer
+        // valid — revoked, or invalidated by an account/plan migration. A
+        // transient failure (network, 5xx, timeout) must NOT sideline a healthy
+        // account: keep its current token and retry on the next request. This is
+        // what kept accounts wrongly "errored" after a momentary refresh blip.
+        const isAuthRejection = err.status === 400 || err.status === 401 || err.status === 403;
+        if (isAuthRejection) {
           account.status = 'error';
+          console.error(`[TeamClaude] Account "${account.name}" needs re-login (refresh token rejected) — run: teamclaude login`);
         }
       } finally {
         account._refreshPromise = null;
@@ -984,7 +1058,7 @@ export class AccountManager {
    * Update a specific account's OAuth tokens (e.g. after intercepting a token refresh).
    */
   updateAccountTokens(accountIndex, { accessToken, refreshToken, expiresAt }) {
-    const account = this._resolve(accountIndex);
+    const account = this.accounts[accountIndex];
     if (!account || account.type !== 'oauth') return;
 
     account.credential = accessToken;
@@ -992,9 +1066,7 @@ export class AccountManager {
     account.expiresAt = expiresAt;
     if (account.status === 'error') account.status = 'active';
     console.log(`[TeamClaude] Updated tokens for account "${account.name}"`);
-    // Same liveness guard as ensureTokenFresh: never emit a stale index for a
-    // removed account (here the path is synchronous, but keep the invariant uniform).
-    if (this.accounts[account.index] === account) this._onTokenRefresh?.(account.index, {
+    this._onTokenRefresh?.(accountIndex, {
       accessToken,
       refreshToken: account.refreshToken,
       expiresAt: account.expiresAt,
@@ -1006,27 +1078,7 @@ export class AccountManager {
    */
   addAccount(acctData) {
     const index = this.accounts.length;
-    this.accounts.push({
-      index,
-      name: acctData.name,
-      type: acctData.type,
-      accountUuid: acctData.accountUuid || null,
-      credential: acctData.accessToken || acctData.apiKey,
-      refreshToken: acctData.refreshToken || null,
-      expiresAt: acctData.expiresAt || null,
-      status: 'active',
-      enabled: acctData.enabled !== false,
-      priority: Number.isFinite(acctData.priority) ? Math.floor(acctData.priority) : null,
-      quota: emptyQuota(),
-      usage: { totalInputTokens: 0, totalOutputTokens: 0, totalRequests: 0, lastUsed: null },
-      rateLimitedUntil: null,
-      inflight: 0,
-      maxConcurrent: coerceMaxConcurrent(acctData.maxConcurrent, this.maxConcurrentDefault),
-    });
-    // The new account has free capacity — hand it to any request waiting in the
-    // overflow queue instead of letting it time out to a 429 while a usable
-    // account sits idle.
-    this._drainWaiters();
+    this.accounts.push(makeAccount(acctData, index));
     return index;
   }
 
@@ -1042,163 +1094,41 @@ export class AccountManager {
     } else if (this.currentIndex > index) {
       this.currentIndex--;
     }
+    // Keep route pins pointing at the right account after the index shift: drop a
+    // pin on the removed account, decrement pins that sat above it.
+    for (const [name, idx] of [...this.routePins.entries()]) {
+      if (idx === index) this.routePins.delete(name);
+      else if (idx > index) this.routePins.set(name, idx - 1);
+    }
   }
 
   /**
-   * Resolve a caller-facing account reference — an account object or a name
-   * string — to the live account object (or null). Used by the public
-   * setEnabled/setPriority.
-   *
-   * A bare numeric index is intentionally NOT accepted here (unlike the internal
-   * `_resolve`): a setter is a mutation, and an index captured before a
-   * removeAccount() re-index would silently disable/reprioritize whatever account
-   * shifted into that slot. Callers pass the account object (TUI / sync) or its
-   * name (CLI) — both survive a re-index.
-   */
-  _resolveRef(ref) {
-    if (typeof ref === 'string') return this.accounts.find(a => a.name === ref) || null;
-    if (ref && typeof ref === 'object') return this.accounts.includes(ref) ? ref : null;
-    return null;
-  }
-
-  /**
-   * Enable or disable an account at runtime. A disabled account is excluded from
-   * rotation (via _isAvailable) but keeps any in-flight requests until they
-   * finish. Re-enabling hands its now-free capacity to any queued waiters.
-   * Returns the affected account, or null if `ref` matched nothing.
-   */
-  setEnabled(ref, enabled) {
-    const account = this._resolveRef(ref);
-    if (!account) return null;
-    account.enabled = enabled !== false;
-    // Re-evaluate the overflow queue either way: re-enabling hands the account's
-    // free slots to waiters; disabling may leave a waiter that could *only* be
-    // served by this account with no hope — _drainWaiters settles those now (so
-    // they release their finite queue slot) instead of stranding them to timeout.
-    this._drainWaiters();
-    this._reprioritize();
-    return account;
-  }
-
-  /**
-   * Set (or clear) an account's explicit selection priority. Lower number =
-   * preferred first; pass null/undefined/NaN to clear it (back to use-or-lose).
-   * Returns the affected account, or null if `ref` matched nothing.
-   */
-  setPriority(ref, priority) {
-    const account = this._resolveRef(ref);
-    if (!account) return null;
-    account.priority = Number.isFinite(priority) ? Math.floor(priority) : null;
-    this._reprioritize();
-    return account;
-  }
-
-  /**
-   * A preference change (enable/disable/priority) should take effect promptly,
-   * not wait out the sticky `reevalIntervalMs` window (and not at all when the
-   * timer is off). Re-pick the active account *directly* here — in either mode —
-   * but ONLY when it actually matters: the current account is no longer usable
-   * (e.g. just disabled), or a strictly higher-priority account is available.
-   *
-   * A no-op change (or one that doesn't dethrone the current account) leaves the
-   * sticky primary untouched, so it can't churn cache locality. We deliberately
-   * do NOT reset `lastEvalAt` to 0 — that would wake the periodic timer re-eval,
-   * whose tie round-robin would switch the primary even when nothing changed.
-   */
-  _reprioritize() {
-    const current = this.accounts[this.currentIndex];
-    const best = this._selectBest();
-    if (!best || best.index === this.currentIndex) return;
-    // Switch only when `best` is *strictly* preferred over the current account by
-    // the full selection order (priority → soonest reset → least used), or the
-    // current account is unusable. Comparing the full order — not priority alone —
-    // means clearing a priority correctly restores use-or-lose routing, while a
-    // true tie (best ranks equal to current) still leaves the sticky primary put
-    // so there's no cache-churn.
-    if (this._isAvailable(current) && !this._strictlyPrefer(best, current)) return;
-    this.currentIndex = best.index;
-    this.lastEvalAt = Date.now(); // just evaluated — don't also trigger a timer re-eval
-  }
-
-  /**
-   * Is account `a` strictly preferred over `b` by the same lexicographic order
-   * `_selectBest` sorts on: explicit priority (lower first), then soonest weekly
-   * reset, then soonest session reset, then lowest utilization. Returns false
-   * when they rank equal (a tie).
-   */
-  _strictlyPrefer(a, b) {
-    const pa = this._priority(a), pb = this._priority(b);
-    if (pa !== pb) return pa < pb;
-    const wa = this._weeklyResetTime(a), wb = this._weeklyResetTime(b);
-    if (wa !== wb) return wa < wb;
-    const ra = this._sessionResetTime(a), rb = this._sessionResetTime(b);
-    if (ra !== rb) return ra < rb;
-    return this._sessionUtilization(a) < this._sessionUtilization(b);
-  }
-
-  /**
-   * Snapshot of per-account quota state for persistence across restarts
-   * (credential-free). Quota lives only in memory otherwise, so a restart used
-   * to blank the whole dashboard (and blind use-or-lose ordering) until traffic
-   * organically re-measured every account.
+   * Serialize persistable quota state for all accounts (no credentials), keyed
+   * by account identity so it can be matched back after a restart.
    */
   exportQuotaState() {
-    return this.accounts.map(a => ({
-      accountUuid: a.accountUuid || null,
-      name: a.name,
-      quota: {
-        ...a.quota,
-        modelWeekly: Object.fromEntries(
-          Object.entries(a.quota.modelWeekly).map(([k, w]) => [k, { ...w }])),
-      },
-      rateLimitedUntil: a.rateLimitedUntil,
-      usage: { ...a.usage },
-    }));
+    return this.accounts.map(a => {
+      const quota = {};
+      for (const f of PERSISTED_QUOTA_FIELDS) quota[f] = a.quota[f];
+      return { accountUuid: a.accountUuid, orgUuid: a.orgUuid, orgName: a.orgName, name: a.name, quota };
+    });
   }
 
   /**
-   * Restore a quota snapshot from a previous run. A snapshot entry WITH an
-   * accountUuid is matched by uuid ONLY — a same-name account with a different
-   * uuid is a *replaced* account (a different underlying identity), and
-   * restoring the old quota/throttle onto it would falsely mark a fresh
-   * account near-quota or throttled. Name matching is the fallback solely for
-   * entries without a uuid (API-key accounts, whose identity key is the name).
-   * Unknown entries are skipped (→ unmeasured, exactly the pre-restore state).
-   * Values may be slightly stale, but the proxy takes no traffic while it's
-   * down, and expired windows are lazily swept by _isNearQuota on first use —
-   * so a restore is strictly better than starting blind. A still-future
-   * rateLimitedUntil re-throttles the account; error/exhausted statuses are
-   * deliberately NOT restored (a bad token may have been fixed since).
+   * Restore quota learned in a previous run. Matches saved entries to accounts
+   * by identity. Stale windows are not special-cased here — _clearExpiredQuotas
+   * wipes any restored window whose reset time has already passed on first use.
    */
-  importQuotaState(saved) {
-    for (const s of Array.isArray(saved) ? saved : []) {
-      if (!s || typeof s !== 'object') continue;
-      const a = s.accountUuid
-        ? this.accounts.find(x => x.accountUuid === s.accountUuid)
-        : this.accounts.find(x => x.name === s.name);
-      if (!a) continue;
-      if (s.quota && typeof s.quota === 'object') {
-        // Merge over emptyQuota so a cache written by an older version (missing
-        // newer fields like modelWeekly) still yields a complete quota object.
-        a.quota = {
-          ...emptyQuota(),
-          ...s.quota,
-          // unifiedStatus is a PER-RESPONSE signal — isExhausted() treats a
-          // 'rejected' here as "this 429 is account exhaustion". Restoring a
-          // stale one would misclassify a later transient/headerless 429 as
-          // exhaustion and wrongly throttle the account. Only a live response
-          // (updateQuota) may set it.
-          unifiedStatus: null,
-          modelWeekly: Object.fromEntries(
-            Object.entries(s.quota.modelWeekly && typeof s.quota.modelWeekly === 'object' ? s.quota.modelWeekly : {})
-              .map(([k, w]) => [k, { ...w }])),
-        };
+  restoreQuotaState(saved) {
+    if (!Array.isArray(saved)) return;
+    for (const account of this.accounts) {
+      const match = saved.find(s => sameIdentity(s, account));
+      if (!match || !match.quota) continue;
+      for (const f of PERSISTED_QUOTA_FIELDS) {
+        if (match.quota[f] != null) account.quota[f] = match.quota[f];
       }
-      if (s.usage && typeof s.usage === 'object') a.usage = { ...a.usage, ...s.usage };
-      if (Number.isFinite(s.rateLimitedUntil) && s.rateLimitedUntil > Date.now()) {
-        a.rateLimitedUntil = s.rateLimitedUntil;
-        a.status = 'throttled';
-      }
+      // We already know this account's weekly window, so it isn't "probing".
+      if (account.quota.unified7dReset != null) account.probing = false;
     }
   }
 
@@ -1209,24 +1139,21 @@ export class AccountManager {
     return {
       currentAccount: this.accounts[this.currentIndex]?.name,
       switchThreshold: this.switchThreshold,
+      routes: this.getRoutes(),
       accounts: this.accounts.map(a => ({
         name: a.name,
         type: a.type,
+        orgName: a.orgName || null,
+        priority: a.priority || 0,
+        disabled: a.disabled || false,
         status: a.status,
-        enabled: a.enabled !== false,
-        priority: a.priority ?? null,
-        // Deep-copy the nested modelWeekly map — the shallow quota spread would
-        // otherwise hand callers a live reference into account state.
-        quota: {
-          ...a.quota,
-          modelWeekly: Object.fromEntries(
-            Object.entries(a.quota.modelWeekly).map(([k, w]) => [k, { ...w }])),
-        },
+        quota: { ...a.quota },
         usage: { ...a.usage },
-        inflight: a.inflight,
-        maxConcurrent: a.maxConcurrent,
         rateLimitedUntil: a.rateLimitedUntil
           ? new Date(a.rateLimitedUntil).toISOString()
+          : null,
+        pausedUntil: a.pausedUntil && a.pausedUntil > Date.now()
+          ? new Date(a.pausedUntil).toISOString()
           : null,
       })),
     };
