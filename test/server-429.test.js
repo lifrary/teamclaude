@@ -182,6 +182,71 @@ test('request-global 429 tries each account once then passes through, no poisoni
   }
 });
 
+// A model-tier weekly rejection carries unified-status=rejected too, but must
+// not globally throttle the account while its account-wide 5h/7d windows are
+// healthy. Otherwise exhausting Fable makes unrelated models unusable for the
+// retry-after interval across the entire fleet.
+test('model-scoped exhaustion fails over once without poisoning other model traffic', async () => {
+  let fableHits = 0;
+  let otherHits = 0;
+  const reset = String(Math.floor((Date.now() + 24 * 3600_000) / 1000));
+  const upstream = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const model = JSON.parse(Buffer.concat(chunks).toString()).model;
+    if (model === 'fable') {
+      fableHits++;
+      res.writeHead(429, {
+        'retry-after': '300',
+        'anthropic-ratelimit-unified-status': 'rejected',
+        'anthropic-ratelimit-unified-5h-utilization': '0.12',
+        'anthropic-ratelimit-unified-5h-reset': reset,
+        'anthropic-ratelimit-unified-7d-utilization': '0.69',
+        'anthropic-ratelimit-unified-7d-reset': reset,
+        'anthropic-ratelimit-unified-7d_oi-utilization': '1.01',
+        'anthropic-ratelimit-unified-7d_oi-reset': reset,
+        'content-type': 'application/json',
+      });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error' } }));
+      return;
+    }
+    otherHits++;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager([
+    { name: 'a', type: 'oauth', accessToken: 'tok-a', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+    { name: 'b', type: 'oauth', accessToken: 'tok-b', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+  ], 0.98);
+  const proxy = startProxy(am, upstreamPort);
+  const proxyPort = await listen(proxy);
+
+  try {
+    const send = model => fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model, messages: [] }),
+    });
+
+    const rejected = await send('fable');
+    await rejected.text();
+    assert.equal(rejected.status, 429);
+    assert.equal(fableHits, 2, 'model request tried each account once');
+    assert.ok(am.accounts.every(a => a.status === 'active'),
+      'model exhaustion must not globally throttle any account');
+
+    const accepted = await send('other');
+    await accepted.text();
+    assert.equal(accepted.status, 200);
+    assert.equal(otherHits, 1, 'unrelated model remains immediately routable');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
 // Regression: when every account is exhausted by measured UTILIZATION (Max 5h/7d
 // windows, no live throttle), the all-blocked 429's retry-after must track the
 // real window reset — not the flat 60s fallback the client would just re-flood

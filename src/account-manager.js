@@ -911,34 +911,35 @@ export class AccountManager {
   }
 
   /**
-   * Does a 429 from this account indicate genuine *account-level quota
-   * exhaustion* (vs a transient / global / IP / request-level 429)?
+   * Does a 429 from this account indicate genuine *account-wide quota
+   * exhaustion* (vs a transient/global/request-level or model-scoped 429)?
    *
-   * Only exhaustion 429s should throttle the account and trigger a switch to
-   * another account. A non-exhaustion 429 must NOT be replayed across the
-   * fleet — otherwise a single request whose 429 is request-global (e.g. a
-   * malformed request, an org/IP limit, or a momentary upstream blip) would
-   * poison every account and make unrelated requests fail too.
+   * Only account-wide exhaustion should throttle the account. A model-scoped
+   * weekly limit (for example 7d_oi) still leaves the account usable for other
+   * models, so it must be handled as a per-request failover instead.
    *
-   * Call this *after* updateQuota() has folded the 429's rate-limit headers
-   * into the account's quota state.
-   *
-   * Model-scoped windows (quota.modelWeekly, e.g. the Fable 7d_oi limit) are
-   * deliberately NOT consulted here. On a real upstream 429 for that model tier
-   * the top-level `unified-status` is `rejected` too (the binding claim is
-   * reflected there — verified against live traffic), so the exhaustion IS
-   * detected; folding 7d_oi in additionally would change nothing on real
-   * headers, and reacting to it alone would globally throttle an account that
-   * still serves every other model. Per-model routing (skip Fable-exhausted
-   * accounts only for Fable requests, without the 5-min global throttle) would
-   * need the request's model plumbed into selection — a separate feature.
+   * `headers` must be the current 429 response's rate-limit headers. Model
+   * windows retained from an older response are deliberately ignored here:
+   * otherwise an unrelated later 429 could be misclassified from stale data.
    */
-  isExhausted(accountIndex) {
+  isExhausted(accountIndex, headers = null) {
     const account = this._resolve(accountIndex);
     if (!account) return false;
-    // Claude Max: upstream explicitly rejects when over the unified limit.
-    if (account.quota.unifiedStatus === 'rejected') return true;
-    // Otherwise rely on measured utilization (unified or standard headers).
+
+    if (account.quota.unifiedStatus === 'rejected') {
+      // A rejected response whose account-wide windows are still healthy can
+      // be bound by a model-specific weekly window. Anthropic reports that
+      // binding window on the same response. Do not globally throttle the
+      // account: retry this request elsewhere while preserving other models.
+      const liveModelExhaustion = headers && Object.entries(headers).some(([key, value]) =>
+        /^anthropic-ratelimit-unified-7d_[a-z0-9_]+-utilization$/.test(key)
+          && Number.parseFloat(value) >= this.switchThreshold);
+      if (liveModelExhaustion && !this._isNearQuota(account)) return false;
+      return true;
+    }
+
+    // Otherwise rely on measured account-wide utilization (unified or
+    // standard API-key headers).
     return this._isNearQuota(account);
   }
 

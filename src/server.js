@@ -881,14 +881,14 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       return;
     }
 
-    // Handle 429s. A 429 can mean two very different things:
-    //   (a) this account is out of quota (account-level exhaustion), or
-    //   (b) a transient / global / IP / request-level limit that would 429 on
-    //       any account.
-    // Only (a) should throttle the account and switch; replaying (b) across the
-    // fleet would mark every account throttled and break unrelated requests.
-    // isExhausted() (checked after updateQuota folds in the 429 headers)
-    // distinguishes them.
+    // Handle 429s. A 429 can mean three different things:
+    //   (a) this account is out of account-wide quota,
+    //   (b) this request's model tier is out of its model-scoped weekly quota,
+    //   (c) a transient / global / IP / request-level limit.
+    // Only (a) should globally throttle the account. Cases (b) and (c) fail
+    // this request over without poisoning other model traffic. isExhausted()
+    // uses the current response headers to distinguish a live model binding
+    // from stale model-weekly quota retained for display.
     if (upstreamRes.status === 429) {
       let retryAfter = parseInt(upstreamRes.headers.get('retry-after'), 10);
       if (Number.isNaN(retryAfter)) retryAfter = 60;
@@ -896,7 +896,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       // Discard the 429 response body
       await upstreamRes.body?.cancel();
 
-      if (accountManager.isExhausted(account)) {
+      if (accountManager.isExhausted(account, rateLimitHeaders)) {
         // (a) Account-level exhaustion: throttle this account (so
         // getActiveAccount skips it until it resets) and immediately
         // re-dispatch to another available account — never sleep holding the
