@@ -428,6 +428,45 @@ test('canonical validation and legacy migration reject nested secrets and unknow
 
   assert.throws(
     () => migrateLegacyState([{ accountUuid: 'p1', orgUuid: 'o1', quota: { unified5h: 0.1, accessToken: 'secret' } }]),
-    /Canonical state validate/,
+    /Canonical state (validate|migrate)/,
   );
+});
+
+test('legacy quota wrapper migrates while dropping transient unified status', () => {
+  const migrated = migrateLegacyState({
+    quota: [{
+      accountUuid: 'p1',
+      orgName: 'Acme',
+      name: 'user@example.com',
+      quota: {
+        unified5h: 0.25,
+        unified5hReset: 30_000,
+        unifiedStatus: 'allowed_warning',
+      },
+    }],
+  });
+  const [account] = Object.values(migrated.accounts);
+  assert.equal(account.quota.unified5h, 0.25);
+  assert.equal(account.quota.unified5hReset, 30_000);
+  assert.equal(Object.hasOwn(account.quota, 'unifiedStatus'), false);
+});
+
+test('legacy migration rejects discarded root/account secrets and malformed transient fields', () => {
+  const account = {
+    accountUuid: 'p1',
+    orgName: 'Acme',
+    name: 'user@example.com',
+    quota: { unified5h: 0.25 },
+  };
+  for (const legacy of [
+    { quota: [account], accessToken: 'secret' },
+    { quota: [{ ...account, refreshToken: 'secret' }] },
+    { quota: [{ ...account, unknown: true }] },
+    { quota: [{ ...account, quota: 'invalid' }] },
+    { quota: [{ ...account, usage: 'invalid' }] },
+    { quota: [{ ...account, rateLimitedUntil: 'tomorrow' }] },
+    { quota: [{ ...account, quota: { unifiedStatus: { accessToken: 'secret' } } }] },
+  ]) {
+    assert.throws(() => migrateLegacyState(legacy), /Canonical state migrate/);
+  }
 });

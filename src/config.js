@@ -138,7 +138,7 @@ const QUOTA_FIELDS = new Set([
   'tokensLimit', 'tokensRemaining', 'requestsLimit', 'requestsRemaining',
   'unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable',
   'unified5hReset', 'unified7dReset', 'unified7dSonnetReset', 'unified7dFableReset',
-  'unifiedStatus', 'resetsAt', 'modelWeekly',
+  'resetsAt', 'modelWeekly',
 ]);
 const USAGE_FIELDS = new Set(['totalInputTokens', 'totalOutputTokens', 'totalRequests', 'lastUsed']);
 const THROTTLE_FIELDS = new Set(['until']);
@@ -391,22 +391,61 @@ export async function loadCanonicalState({
 
 export const loadV2State = loadCanonicalState;
 
+const LEGACY_ROOT_FIELDS = new Set(['accounts', 'quota', 'template']);
+const LEGACY_ACCOUNT_FIELDS = new Set([
+  'type', 'name', 'accountUuid', 'orgUuid', 'orgName',
+  'quota', 'usage', 'rateLimitedUntil',
+]);
+
+function assertLegacyFields(object, allowed, operation) {
+  if (!isObject(object)) throw new CanonicalStateError(operation);
+  for (const field of Object.keys(object)) {
+    if (!allowed.has(field)) throw new CanonicalStateError(operation);
+  }
+}
+
+function migrateLegacyQuota(quota) {
+  if (!isObject(quota)) return undefined;
+  const migrated = {};
+  for (const [field, value] of Object.entries(quota)) {
+    if (field === 'unifiedStatus') {
+      if (value !== null && typeof value !== 'string') throw new CanonicalStateError('migrate quota');
+      continue;
+    }
+    if (!QUOTA_FIELDS.has(field)) throw new CanonicalStateError('migrate quota');
+    migrated[field] = value;
+  }
+  return migrated;
+}
+
 export function migrateLegacyState(legacy, { legacyBytes = stableJson(legacy) } = {}) {
   const sourceDigest = createHash('sha256').update(legacyBytes).digest('hex');
-  const entries = Array.isArray(legacy) ? legacy : legacy?.accounts;
+  if (!Array.isArray(legacy)) assertLegacyFields(legacy, LEGACY_ROOT_FIELDS, 'migrate root');
+  const entries = Array.isArray(legacy) ? legacy : legacy?.accounts ?? legacy?.quota;
   if (!Array.isArray(entries)) throw new CanonicalStateError('migrate');
   const accounts = {};
   createIdentityRegistry(entries);
   for (const entry of entries) {
+    assertLegacyFields(entry, LEGACY_ACCOUNT_FIELDS, 'migrate account');
+    if (Object.hasOwn(entry, 'quota') && !isObject(entry.quota)) throw new CanonicalStateError('migrate quota');
+    if (Object.hasOwn(entry, 'usage') && !isObject(entry.usage)) throw new CanonicalStateError('migrate usage');
+    if (Object.hasOwn(entry, 'rateLimitedUntil') && !Number.isFinite(entry.rateLimitedUntil)) {
+      throw new CanonicalStateError('migrate throttle');
+    }
     const key = accountIdKey(entry);
     if (Object.hasOwn(accounts, key)) throw new CanonicalStateError('migrate duplicate identity');
     const state = {};
-    if (isObject(entry.quota)) state.quota = entry.quota;
+    const quota = migrateLegacyQuota(entry.quota);
+    if (quota) state.quota = quota;
     if (isObject(entry.usage)) state.usage = entry.usage;
     if (Number.isFinite(entry.rateLimitedUntil)) state.throttle = { until: entry.rateLimitedUntil };
     accounts[key] = state;
   }
-  return createCanonicalState({ accounts, migration: { completed: true, sourceDigests: { legacy: sourceDigest } } });
+  return createCanonicalState({
+    accounts,
+    template: legacy?.template ?? null,
+    migration: { completed: true, sourceDigests: { legacy: sourceDigest } },
+  });
 }
 
 export async function loadState() {
