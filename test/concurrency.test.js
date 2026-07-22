@@ -122,6 +122,77 @@ test('overflow queue is bounded: rejects past maxQueueDepth instead of growing',
   const a2 = await w2; assert.ok(a2);
   am.releaseAccount(a2.index);
 });
+test('maxQueueDepth consistently bounds overflow and admission reservations', async () => {
+  for (const depth of [0, 2, 16]) {
+    const am = new AccountManager(makeAccounts(1), 0.98, 0, 1, depth);
+    measureAll(am);
+    const held = await am.acquireAccount(null, 5000);
+    const controllers = Array.from({ length: depth }, () => new AbortController());
+    const waiters = controllers.map(({ signal }) => am.acquireAccount(null, 5000, signal));
+    assert.equal(am._waiters.length, depth, `queue depth ${depth}`);
+    assert.equal(await am.acquireAccount(null, 5000), null, `queue rejects past ${depth}`);
+    controllers.forEach(controller => controller.abort());
+    assert.deepEqual(await Promise.all(waiters), Array(depth).fill(null));
+    am.releaseAccount(held);
+
+    const reservations = Array.from(
+      { length: depth + 1 },
+      () => am.reserveAdmissionPrebuffer({}),
+    );
+    assert.equal(reservations.every(Boolean), true, `prebuffer capacity includes ${depth} overflow slots`);
+    assert.equal(am.reserveAdmissionPrebuffer({}), null, `prebuffer rejects past ${depth}`);
+    assert.equal(
+      reservations.every(reservation => am.transferAdmissionReservation(reservation, 'messages', {})),
+      true,
+      `exact shape capacity includes ${depth} overflow slots`,
+    );
+    reservations.forEach(reservation => {
+      am.releaseAdmissionReservation(reservation);
+      am.releaseAdmissionReservation(reservation);
+    });
+    assert.equal(am._admissionShapes.size, 0, 'idempotent release clears exact reservations');
+  }
+});
+
+test('distinct admission shapes share one global reservation ceiling', () => {
+  const am = new AccountManager(makeAccounts(1), 0.98, {
+    maxConcurrent: 1,
+    maxQueueDepth: 2,
+  });
+  measureAll(am);
+
+  const reservations = ['a', 'b', 'c'].map(key => {
+    const reservation = am.reserveAdmissionPrebuffer({});
+    assert.ok(reservation);
+    assert.equal(am.transferAdmissionReservation(reservation, key, {}), true);
+    return reservation;
+  });
+  assert.equal(am.reserveAdmissionPrebuffer({}), null, 'shape keys cannot multiply the global ceiling');
+
+  reservations.forEach(reservation => am.releaseAdmissionReservation(reservation));
+  assert.equal(am._admissionExact, 0);
+  assert.equal(am._admissionShapes.size, 0);
+});
+
+test('ineligible pinned shapes cannot borrow unrelated admission capacity', () => {
+  const accounts = makeAccounts(2);
+  accounts[0].models = ['executor-a'];
+  accounts[1].models = ['executor-b'];
+  const am = new AccountManager(accounts, 0.98, { maxConcurrent: 1, maxQueueDepth: 16 });
+  measureAll(am);
+
+  const reservation = am.reserveAdmissionPrebuffer({});
+  assert.ok(reservation, 'known accounts admit a conservative prebuffer reservation');
+  assert.equal(
+    am.transferAdmissionReservation(reservation, 'executor-a-on-b', {
+      model: 'executor-a',
+      pinnedAccount: am.accounts[1],
+    }),
+    false,
+  );
+  am.releaseAdmissionReservation(reservation);
+  assert.equal(am._admissionPrebuffered, 0, 'failed transfers remain releasable');
+});
 
 test('proxy rejects an over-sized request body with 413 (bounded buffering)', async () => {
   const upstream = http.createServer((_req, res) => {
@@ -392,13 +463,19 @@ test('a late 429 for a removed in-flight account does not poison a surviving acc
   // The server applies A's late upstream 429 / quota by the account OBJECT A, so
   // it must hit (the now-detached) A, never B.
   am.markRateLimited(A, 60);
-  assert.equal(B.status, 'active', "survivor B must NOT be throttled by A's 429");
+  am.pauseAccount(A, 60);
   am.updateQuota(A, {
     'anthropic-ratelimit-unified-5h-utilization': '0.99',
     'anthropic-ratelimit-unified-5h-reset': String(Math.floor((Date.now() + HOUR) / 1000)),
   });
+  am.updateUsage(A, 1, 1);
+  am.clearRateLimited(A);
+  am.recordSession('removed-account-session', A);
+  assert.equal(B.status, 'active', "survivor B must NOT be throttled by A's 429");
   assert.equal(B.quota.unified5h, 0.1, 'survivor B quota untouched by A response');
-  assert.equal(am.isExhausted(A), true, 'isExhausted targets A (its own quota), object-resolved');
+  assert.equal(B.usage.totalInputTokens, 0, 'survivor B usage untouched by A response');
+  assert.equal(am.sessionStats().perAccount[B.index] || 0, 0,
+    'late session recording for a removed account does not target the re-indexed survivor');
 });
 
 test('token-refresh callback is not emitted with a stale index for a removed account', async () => {
@@ -1036,4 +1113,20 @@ test('disabling the account a waiter needs settles that waiter instead of strand
   assert.equal(am._waiters.length, 0, 'its queue slot is freed for later requests');
 
   am.releaseAccount(x); am.releaseAccount(y);
+});
+
+test('eligible-shape capacity uses only currently eligible stable identities and queue depth is capped at Q=16', () => {
+  const accounts = makeAccounts(2);
+  accounts[0].maxConcurrent = 2;
+  accounts[1].maxConcurrent = 3;
+  accounts[0].models = ['executor-a'];
+  accounts[1].models = ['executor-b'];
+  const am = new AccountManager(accounts, 0.98, { maxConcurrent: 1, maxQueueDepth: 10_000 });
+  measureAll(am);
+
+  assert.equal(am.maxQueueDepth, 16);
+  assert.equal(am.eligibleCapacity({ model: 'executor-a' }), 2);
+  assert.equal(am.eligibleCapacity({ model: 'executor-b' }), 3);
+  assert.equal(am.eligibleCapacity({ model: 'executor-a', pinnedAccount: am.accounts[1] }), 0);
+  assert.equal(am.eligibleCapacity({ model: 'executor-b', pinnedAccount: am.accounts[1] }), 3);
 });

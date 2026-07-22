@@ -69,6 +69,28 @@ test('explicit priority still beats weekly ordering', () => {
   assert.equal(am.getActiveAccount().name, 'acct-0');
 });
 
+test('a session reset does not displace a finite-priority current account for an unranked weekly candidate', () => {
+  const accounts = makeAccounts(2);
+  accounts[0].priority = 100;
+  const am = new AccountManager(accounts, 0.98);
+  const now = Date.now();
+
+  measureSessionAndWeekly(am, 0, 0.20, 4 * HOUR, 0.40, 6 * 24 * HOUR, now);
+  measureSessionAndWeekly(am, 1, 0.99, -MIN, 0.40, 1 * 24 * HOUR, now);
+
+  assert.equal(am.getActiveAccount().name, 'acct-0');
+  assert.equal(am.accounts[1].quota.unified5h, null, 'public refresh cleared the elapsed session window');
+});
+
+test('a session reset switches between unranked accounts by sooner weekly reset', () => {
+  const am = new AccountManager(makeAccounts(2), 0.98);
+  const now = Date.now();
+
+  measureSessionAndWeekly(am, 0, 0.20, 4 * HOUR, 0.40, 6 * 24 * HOUR, now);
+  measureSessionAndWeekly(am, 1, 0.99, -MIN, 0.40, 1 * 24 * HOUR, now);
+
+  assert.equal(am.getActiveAccount().name, 'acct-1');
+});
 test('tie on reset time → lowest utilization wins', () => {
   const am = new AccountManager(makeAccounts(2), 0.98);
   const reset = 60 * MIN;
@@ -162,6 +184,15 @@ function measure(am, idx, util5h, resetInMs, now = Date.now()) {
     'anthropic-ratelimit-unified-5h-reset': String(Math.floor((now + resetInMs) / 1000)),
   });
 }
+function measureSessionAndWeekly(am, idx, sessionUtil, sessionResetInMs, weeklyUtil, weeklyResetInMs, now = Date.now()) {
+  am.updateQuota(idx, {
+    'anthropic-ratelimit-unified-5h-utilization': String(sessionUtil),
+    'anthropic-ratelimit-unified-5h-reset': String(Math.floor((now + sessionResetInMs) / 1000)),
+    'anthropic-ratelimit-unified-7d-utilization': String(weeklyUtil),
+    'anthropic-ratelimit-unified-7d-reset': String(Math.floor((now + weeklyResetInMs) / 1000)),
+  });
+}
+
 
 test('warm-up: routes to each unmeasured account until all measured, then priority', () => {
   const am = new AccountManager(makeAccounts(3), 0.98, 5 * MIN);
@@ -287,8 +318,12 @@ test('a stale reset-only weekly timestamp is cleared (no permanent selection bia
   // acct-0 got a garbled pair: reset set (already in the past), utilization never set.
   am.accounts[0].quota.unified7dReset = now - 1000;
   setWeekly(am, 1, 0.40, 3 * 24 * HOUR, now);
+  am.accounts[0].quota.unified7dSonnetReset = now - 1000;
+  am.accounts[0].quota.unified7dFableReset = now - 1000;
   am.getActiveAccount();                       // _isAvailable → expiry sweep
   assert.equal(am.accounts[0].quota.unified7dReset, null, 'stale reset-only timestamp swept');
+  assert.equal(am.accounts[0].quota.unified7dSonnetReset, null, 'stale Sonnet reset-only timestamp swept');
+  assert.equal(am.accounts[0].quota.unified7dFableReset, null, 'stale Fable reset-only timestamp swept');
   assert.equal(am._weeklyResetTime(am.accounts[0]), Infinity, 'no longer sorts as "resets soonest"');
 });
 
@@ -345,23 +380,23 @@ test('sweepExpired clears rolled-over windows so warm-up can re-measure (idle pr
   assert.equal(am._isMeasured(am.accounts[0]), false, 'back to unmeasured → warm-up target again');
 });
 
-// ── quota snapshot persistence (survives a server restart) ───────────────────
+// ── quota persistence and legacy cache migration ──────────────────────────────
 
-test('exportQuotaState → importQuotaState round-trips quota, modelWeekly and a future throttle', () => {
+test('exportCanonicalState → restoreCanonicalState round-trips quota, modelWeekly and a future throttle', () => {
   const now = Date.now();
-  const am1 = new AccountManager(makeAccounts(2), 0.98);
-  am1.accounts[0].accountUuid = 'uuid-0';
+  const accounts = makeAccounts(2);
+  accounts[0].accountUuid = 'uuid-0';
+  const am1 = new AccountManager(accounts, 0.98);
   setSession(am1, 0, 0.54, 1 * HOUR, now);
   setWeekly(am1, 0, 0.86, 4 * 24 * HOUR, now);
   am1.accounts[0].quota.modelWeekly['7d_oi'] = { utilization: 0.94, reset: now + 4 * 24 * HOUR };
   am1.markRateLimited(0, 120);                       // throttled 2 min into the future
   am1.updateQuota(1, {});                            // bump usage counters only
 
-  const snapshot = JSON.parse(JSON.stringify(am1.exportQuotaState())); // via-disk fidelity
+  const snapshot = JSON.parse(JSON.stringify(am1.exportCanonicalState())); // via-disk fidelity
 
-  const am2 = new AccountManager(makeAccounts(2), 0.98);
-  am2.accounts[0].accountUuid = 'uuid-0';
-  am2.importQuotaState(snapshot);
+  const am2 = new AccountManager(accounts, 0.98);
+  am2.restoreCanonicalState(snapshot);
   assert.equal(am2.accounts[0].quota.unified5h, 0.54);
   assert.equal(am2.accounts[0].quota.unified7d, 0.86);
   assert.equal(am2.accounts[0].quota.modelWeekly['7d_oi'].utilization, 0.94);
@@ -370,11 +405,9 @@ test('exportQuotaState → importQuotaState round-trips quota, modelWeekly and a
   assert.equal(am2.accounts[1].usage.totalRequests, 1, 'usage counters carried over');
 });
 
-// Regression (review finding): unifiedStatus is a per-response signal that
-// isExhausted() reads as "this 429 is account exhaustion". A stale 'rejected'
-// restored from a snapshot would misclassify a later transient/headerless 429
-// as exhaustion and wrongly throttle the account.
-test('importQuotaState never restores unifiedStatus (stale rejected must not classify future 429s)', () => {
+// Regression: unifiedStatus is response-local and must never survive persistence.
+// Otherwise a later header-less response could inherit stale rejection evidence.
+test('legacy importQuotaState never restores unifiedStatus (stale rejected must not classify future 429s)', () => {
   const now = Date.now();
   const am = new AccountManager(makeAccounts(1), 0.98);
   am.importQuotaState([{
@@ -383,14 +416,14 @@ test('importQuotaState never restores unifiedStatus (stale rejected must not cla
   }]);
   assert.equal(am.accounts[0].quota.unified5h, 0.1, 'quota values restored');
   assert.equal(am.accounts[0].quota.unifiedStatus, null, 'stale unifiedStatus dropped');
-  am.updateQuota(0, {});                             // a later header-less 429's updateQuota
-  assert.equal(am.isExhausted(0), false, 'transient 429 not misclassified as exhaustion');
+  am.updateQuota(am.accounts[0], {});
+  assert.equal(am.accounts[0].quota.unifiedStatus, null, 'transient response has no inherited rejection');
 });
 
 // Regression (review finding): a snapshot entry WITH a uuid must never fall
 // back to name matching — a same-name account with a different uuid is a
 // replaced account, and inheriting the old throttle would falsely 429 it.
-test('importQuotaState does not restore state onto a replaced (same-name, new-uuid) account', () => {
+test('legacy importQuotaState does not restore state onto a replaced (same-name, new-uuid) account', () => {
   const now = Date.now();
   const am = new AccountManager(makeAccounts(1), 0.98);
   am.accounts[0].accountUuid = 'uuid-new';
@@ -403,7 +436,7 @@ test('importQuotaState does not restore state onto a replaced (same-name, new-uu
   assert.equal(am.accounts[0].status, 'active', 'old throttle NOT inherited');
 });
 
-test('importQuotaState skips unknown accounts, expired throttles, and tolerates an old cache shape', () => {
+test('legacy importQuotaState skips unknown accounts, expired throttles, and tolerates an old cache shape', () => {
   const now = Date.now();
   const am = new AccountManager(makeAccounts(1), 0.98);
   am.importQuotaState([
@@ -431,4 +464,97 @@ test('getStatus exposes modelWeekly as a detached copy', () => {
   status.accounts[0].quota.modelWeekly['7d_oi'].utilization = 0;
   assert.equal(am.accounts[0].quota.modelWeekly['7d_oi'].utilization, 0.94,
     'mutating the snapshot must not reach live account state');
+});
+test('replaceAccount preserves retired in-flight occupancy and releases it exactly once', async () => {
+  const am = new AccountManager([{ ...makeAccounts(1)[0], maxConcurrent: 2 }], 0.98);
+  const retired = await am.acquireAccount();
+  assert.equal(retired.inFlight, 1);
+
+  const replacement = am.replaceAccount(retired, {
+    ...makeAccounts(1)[0],
+    accountUuid: 'replacement',
+    maxConcurrent: 2,
+  });
+  assert.equal(replacement.inFlight, 1, 'retired reservation occupies replacement capacity');
+  assert.equal(await am.acquireAccount(), replacement, 'one remaining slot is admitted');
+  assert.equal(await am.acquireAccount(), null, 'replacement cap includes retired request');
+
+  am.releaseAccount(retired);
+  assert.equal(replacement.inFlight, 1, 'retired release frees exactly one replacement slot');
+  assert.equal(await am.acquireAccount(), replacement, 'released retired slot becomes available');
+  am.releaseAccount(retired);
+  assert.equal(replacement.inFlight, 2, 'duplicate retired release does not free a second slot');
+});
+
+test('replaceAccount rejects a duplicate canonical identity before publication', () => {
+  const accounts = makeAccounts(2);
+  const am = new AccountManager(accounts, 0.98);
+  assert.throws(
+    () => am.replaceAccount(am.accounts[0], accounts[1]),
+    /Duplicate complete account identity/,
+  );
+  assert.deepEqual(am.accounts.map(account => account.name), ['acct-0', 'acct-1']);
+});
+
+test('late retired-account mutations are forwarded to the live replacement', () => {
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  const retired = am.accounts[0];
+  const replacement = am.replaceAccount(retired, {
+    ...makeAccounts(1)[0],
+    accountUuid: 'replacement',
+  });
+
+  am.updateUsage(retired, 11, 7);
+  am.updateQuota(retired, {
+    'anthropic-ratelimit-unified-5h-utilization': '0.75',
+    'anthropic-ratelimit-unified-5h-reset': String(Math.floor((Date.now() + HOUR) / 1000)),
+  });
+  am.markRateLimited(retired, 30);
+
+  assert.equal(replacement.usage.totalInputTokens, 11);
+  assert.equal(replacement.usage.totalOutputTokens, 7);
+  assert.equal(replacement.quota.unified5h, 0.75);
+  assert.equal(replacement.status, 'throttled');
+  assert.equal(retired.quota.unified5h, null);
+  assert.equal(retired.status, 'active');
+
+  am.clearRateLimited(retired);
+  assert.equal(replacement.status, 'active');
+});
+
+test('quota observations use newest field evidence and response wins equal-time ties', () => {
+  const originalNow = Date.now;
+  let now = 1_000;
+  Date.now = () => now;
+  try {
+    const am = new AccountManager(makeAccounts(1), 0.98);
+    const account = am.accounts[0];
+    am.applyUsageData(0, { fiveHour: { utilization: 0.2, resetAt: 20_000 } });
+    am.updateQuota(account, {
+      'anthropic-ratelimit-unified-5h-utilization': '0.8',
+      'anthropic-ratelimit-unified-5h-reset': '30',
+    });
+    am.applyUsageData(0, { fiveHour: { utilization: 0.1, resetAt: 10_000 } });
+    assert.equal(account.quota.unified5h, 0.8, 'response wins an equal-time source tie');
+    assert.equal(account.quota.unified5hReset, 30_000);
+
+    now += 1;
+    am.updateQuota(account, { 'anthropic-ratelimit-unified-5h-utilization': '0.4' });
+    assert.equal(account.quota.unified5h, 0.4, 'newer utilization wins');
+    assert.equal(account.quota.unified5hReset, null, 'new event never inherits an older reset');
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
+test('canonical state never persists live quota status or observation metadata', () => {
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  am.updateQuota(am.accounts[0], {
+    'anthropic-ratelimit-unified-status': 'rejected',
+    'anthropic-ratelimit-unified-5h-utilization': '1',
+  });
+  const state = am.exportCanonicalState();
+  const [snapshot] = Object.values(state.accounts);
+  assert.equal(Object.hasOwn(snapshot.quota, 'unifiedStatus'), false);
+  assert.equal(Object.hasOwn(snapshot.quota, 'observations'), false);
 });

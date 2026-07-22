@@ -8,8 +8,15 @@
   "maxConcurrentPerAccount": 3,
   "sessionAffinity": true,
   "overflowQueueTimeoutMs": 15000,
+  "overflowQueueMaxDepth": 16,
   "activeWarmup": true,
   "warmupIntervalMs": 300000,
+  "quotaProbeSeconds": 0,
+  "autoUpdate": true,
+  "sx": {
+    "apiKey": "your-sx-org-api-key",
+    "mode": "429"
+  },
   "accounts": [
     {
       "name": "primary-max",
@@ -18,8 +25,11 @@
       "priority": 1
     },
     {
-      "name": "secondary-max",
+      "name": "user@example.com (Acme)",
       "type": "oauth",
+      "accountUuid": "optional-account-uuid",
+      "orgUuid": "optional-organization-uuid",
+      "orgName": "Acme",
       "accessToken": "sk-ant-oat01-your-access-token",
       "refreshToken": "sk-ant-ort01-your-refresh-token",
       "maxConcurrent": 5,
@@ -28,8 +38,17 @@
     {
       "name": "api-fallback",
       "type": "apikey",
-      "apiKey": "sk-ant-api03-your-api-key",
-      "enabled": false
+      "priority": 10,
+      "disabled": false,
+      "apiKey": "sk-ant-api03-your-api-key"
+    }
+  ],
+  "routes": [
+    {
+      "name": "fable",
+      "match": ["*fable*"],
+      "accounts": ["primary-max"],
+      "color": "magenta"
     }
   ]
 }

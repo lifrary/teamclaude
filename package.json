@@ -23,7 +23,18 @@
     "multi-account"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/KarpelesLab/teamclaude.git"
+  },
+  "bugs": {
+    "url": "https://github.com/KarpelesLab/teamclaude/issues"
+  },
+  "homepage": "https://github.com/KarpelesLab/teamclaude#readme",
   "engines": {
     "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "eslint": "^9.0.0"
   }
 }

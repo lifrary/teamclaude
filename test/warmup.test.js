@@ -309,9 +309,9 @@ test('refreshQuotaAll refreshes disabled accounts for display too', async () => 
     });
     const r = await proxy.refreshQuotaAll();
     assert.equal(r.targets, 2, 'the disabled account is included in the refresh targets');
-    assert.equal(r.measured, 2, 'both accounts (incl. disabled) got fresh data');
-    assert.equal(am.accounts[1].quota.modelWeekly['7d_oi']?.utilization, 0.33,
-      "disabled account's Fable window refreshed for display");
+    assert.equal(r.measured, 1, 'the normal admission gate excludes disabled accounts');
+    assert.equal(am.accounts[1].quota.modelWeekly['7d_oi'], undefined,
+      'a disabled account receives no upstream maintenance request');
     assert.equal(am.accounts[1].enabled, false, 'still disabled — probing did not re-enable it');
   } finally {
     await new Promise(r2 => proxy.close(r2));
@@ -474,6 +474,11 @@ test('refreshQuotaAll refreshes lapsed tokens first and reports honest counts', 
       'lapsed-token account was probed WITH its freshly refreshed token');
     assert.equal(r.targets, 3, 'the user asked to refresh 3 accounts');
     assert.equal(r.measured, 2, 'the unrefreshable account is not counted as measured');
+    assert.deepEqual(r.failures, [{
+      account: 'a2',
+      stage: 'token-refresh',
+      message: 'refresh_token revoked',
+    }], 'refresh failure is returned instead of being silently swallowed');
     assert.equal(am.accounts[1].quota.unified5h, 0.1, 'revived account got fresh quota');
   } finally {
     await new Promise(r2 => proxy.close(r2));
@@ -736,12 +741,12 @@ test('an in-flight probe holds no client concurrency slot (client capacity undim
   });
   assert.ok(await waitFor(() => probeArrived), 'a probe reached upstream and is hanging in flight');
 
-  // The hanging probe must occupy ZERO concurrency slots — the whole fleet's cap
-  // stays available to clients, so a probe can never starve / 429 client traffic.
+  // A maintenance probe uses exactly one canonical admission slot and therefore
+  // cannot exceed the account cap; the remaining client slot stays available.
   const totalInflight = am.accounts.reduce((s, a) => s + a.inflight, 0);
-  assert.equal(totalInflight, 0, 'an in-flight probe reserves no client slot');
-
-  proxy.close(); // aborts the hanging probe (warmupAbort)
+  assert.equal(totalInflight, 1, 'the in-flight probe holds one normal admission slot');
+  assert.ok(am.accounts.every(a => a.inflight <= a.maxConcurrent), 'maintenance never bypasses a cap');
+  proxy.close(); // aborts the hanging probe
   upstream.close();
 });
 
