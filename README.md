@@ -270,8 +270,8 @@ teamclaude server --log-to /tmp/requests
 
 Config is stored at `~/.config/teamclaude.json` (or `$XDG_CONFIG_HOME/teamclaude.json`). A random proxy API key is generated on first use.
 
-Observed quota is written separately to `<config>.quota.json` alongside the config, so the config file stays clean and hand-editable. The cache is safe to delete — quota is simply re-learned from traffic.
-The historic `getStatePath()` integration API still resolves `<config>.state.json`; it is not used for quota persistence.
+Observed quota is written separately to `<config>.state.v2.json` alongside the config, so the config file stays clean and hand-editable. The file is safe to delete — quota is simply re-learned from traffic.
+The older `<config>.quota.json` and `<config>.state.json` are legacy migration inputs only — read once when no v2 state exists, never written.
 
 Override the config path with `TEAMCLAUDE_CONFIG`:
 
@@ -568,7 +568,7 @@ TLS is established **end-to-end with `api.anthropic.com` over the tunnel**, so t
    - **Rate/concurrency or transient 429** → pauses the same account for `retry-after` so new requests wait rather than rotate. The proxy retries the same account inline for waits of 15 seconds or less; longer waits are returned as 429 with `retry-after`.
 7. Transient network errors (connection reset, timeout) drop the connection so the client can retry
 8. If all accounts are exhausted, returns 429 with the soonest reset time — or, with `holdSeconds` set, holds the connection open and retries silently until an account recovers
-9. Quota state and the warm-up probe template are persisted to `<config>.quota.json` and restored on startup; stale windows are discarded and the first accepted request replaces the restored template.
+9. Quota state and the warm-up probe template are persisted to `<config>.state.v2.json` and restored on startup; stale windows are discarded and the first accepted request replaces the restored template.
 10. Client token refresh requests (`/v1/oauth/token`) are relayed to upstream untouched — the proxy and client manage their own token lifecycles independently
 
 ## Security
