@@ -811,7 +811,7 @@ export class TUI {
           amAcct.accountUuid = entry.accountUuid;
           amAcct.orgUuid = entry.orgUuid;
           amAcct.orgName = entry.orgName;
-          if (amAcct.status === 'error') amAcct.status = 'active';
+          if (amAcct.status === 'error') { amAcct.status = 'active'; delete amAcct._errorFromRefresh; }
         } else {
           // The matched config entry had no live AccountManager account (it was
           // skipped at load — e.g. previously tokenless). Now that we have fresh

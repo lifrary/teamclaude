@@ -1790,21 +1790,44 @@ export class AccountManager {
         account.credential = newTokens.accessToken;
         account.refreshToken = newTokens.refreshToken;
         account.expiresAt = newTokens.expiresAt;
+        // A successful refresh heals ONLY a refresh-caused 'error' (a refresh
+        // that failed while e.g. the network was down): the refresh succeeding
+        // is exactly the thing that failed, so the account rejoins rotation
+        // without a proxy restart. An error set by the REQUEST path (upstream
+        // 401 despite a fresh token, non-transient send failure — see server.js)
+        // is NOT cleared here: the token endpoint accepting a rotation does not
+        // prove the API accepts the account, and blanket-reviving it would flap
+        // it back into rotation to fail real client requests every sweep. Those
+        // heal only via new credentials (updateAccountTokens) or a restart.
+        if (account.status === 'error' && account._errorFromRefresh) {
+          account.status = 'active';
+          delete account._errorFromRefresh;
+        }
         console.log(`[TeamClaude] Token refreshed for account "${account.name}"`);
         if (this.accounts[account.index] === account) this._onTokenRefresh?.(account.index, newTokens);
         return { ok: true };
       } catch (err) {
         console.error(`[TeamClaude] Token refresh failed for "${account.name}": ${err.message}`);
-        // Reserve 'error' (which drops the account from rotation until re-login)
-        // for a GENUINE auth rejection: the refresh token itself is no longer
-        // valid — revoked, or invalidated by an account/plan migration. A
-        // transient failure (network, 5xx, timeout) must NOT sideline a healthy
-        // account: keep its current token and retry on the next request. This is
-        // what kept accounts wrongly "errored" after a momentary refresh blip.
+        // Park the account only when it is actually unusable: a GENUINE auth
+        // rejection (the refresh token is dead — revoked, or invalidated by an
+        // account/plan migration), or a refresh failure on an already-expired
+        // access token (nothing valid left to serve with). A transient failure
+        // (network, 5xx, timeout) on a still-valid token must NOT sideline a
+        // healthy account — keep the token and retry on the next request; this
+        // is what kept accounts wrongly "errored" after a momentary blip.
+        // Either park is tagged refresh-caused so the keep-alive sweep revives
+        // it the moment a refresh succeeds — but only on the TRANSITION: if the
+        // account was already 'error' from the request path (upstream 401 /
+        // send failure), a later failed sweep refresh must not relabel it, or
+        // the next successful refresh would wrongly revive a rejected account.
         const isAuthRejection = err.status === 400 || err.status === 401 || err.status === 403;
-        if (isAuthRejection) {
-          account.status = 'error';
-          console.error(`[TeamClaude] Account "${account.name}" needs re-login (refresh token rejected) — run: teamclaude login`);
+        const accessExpired = !account.expiresAt || Date.now() >= account.expiresAt;
+        if (isAuthRejection || accessExpired) {
+          if (account.status !== 'error') {
+            account.status = 'error';
+            account._errorFromRefresh = true;
+          }
+          if (isAuthRejection) console.error(`[TeamClaude] Account "${account.name}" needs re-login (refresh token rejected) — run: teamclaude login`);
         }
         return { ok: false, error: err.message };
       } finally {
@@ -1813,6 +1836,55 @@ export class AccountManager {
     })();
 
     return account._refreshPromise;
+  }
+
+  /**
+   * Periodic token keep-alive + recovery sweep (ported from teamclaude-cloud's
+   * recovery timer). Anthropic rotates the refresh token on every refresh, and a
+   * chain that never rotates — an account that sits idle because no client
+   * traffic routes there, while warm-up probes deliberately never refresh
+   * tokens — can eventually be invalidated upstream, permanently killing the
+   * account until a manual re-login. This sweep keeps every account's chain
+   * rotating even with zero traffic:
+   *  - an OAuth account whose access token is expiring (or already expired) is
+   *    refreshed proactively — that's ~once per access-token lifetime, NOT once
+   *    per tick (a fresh token is a no-op inside ensureTokenFresh);
+   *  - an account stuck in 'error' is swept too, so even a parked account's
+   *    chain stays alive — but only a REFRESH-caused error is returned to
+   *    rotation on success (see ensureTokenFresh; an upstream-auth error stays
+   *    parked). An account whose refresh token is genuinely revoked just stays
+   *    'error' (one failed attempt per sweep) until re-imported / re-logged-in.
+   * Disabled accounts are swept too: disable means "out of rotation", not "let
+   * the token chain die" — re-enabling must yield a working account.
+   * Refreshes run SEQUENTIALLY (not Promise.all): a fleet-wide lapse after long
+   * downtime must not burst N concurrent POSTs at the token endpoint — a
+   * provider rate-limit there could fail every refresh and error the whole
+   * fleet. Overlapping sweeps are skipped (`_sweepInFlight`); a slow sweep is
+   * bounded by the per-refresh timeout, and coalescing keeps a concurrent
+   * request-path refresh safe either way.
+   * Never throws; failures are handled (and classified) inside ensureTokenFresh.
+   * Returns the number of accounts a refresh was attempted for.
+   */
+  async refreshLapsedTokens() {
+    if (this._sweepInFlight) return 0;
+    this._sweepInFlight = true;
+    try {
+      const targets = this.accounts.filter(a =>
+        a.type === 'oauth' && a.refreshToken
+        && (a.status === 'error' || isTokenExpiringSoon(a.expiresAt)));
+      for (const a of targets) {
+        // Non-forced is enough for every lapsed token (ensureTokenFresh's own
+        // expiry gate passes); it also makes an 'error' account with a
+        // still-valid token a no-op — no pointless rotation churn each sweep.
+        // Force only when the expiry is UNKNOWN (no expiresAt): the non-forced
+        // gate would never fire for it, so its chain would silently lapse.
+        await this.ensureTokenFresh(a, a.status === 'error' && !a.expiresAt)
+          .catch(() => { /* stays error until the refresh token heals */ });
+      }
+      return targets.length;
+    } finally {
+      this._sweepInFlight = false;
+    }
   }
 
   /**
@@ -1832,7 +1904,10 @@ export class AccountManager {
     account.credential = accessToken;
     if (refreshToken) account.refreshToken = refreshToken;
     account.expiresAt = expiresAt;
-    if (account.status === 'error') account.status = 'active';
+    // New externally-supplied credentials are a verified heal for ANY error
+    // cause (unlike the sweep's refresh-success, which only heals refresh-caused
+    // errors) — the auth material actually changed.
+    if (account.status === 'error') { account.status = 'active'; delete account._errorFromRefresh; }
     console.log(`[TeamClaude] Updated tokens for account "${account.name}"`);
     if (this.accounts[account.index] === account) this._onTokenRefresh?.(account.index, {
       accessToken,

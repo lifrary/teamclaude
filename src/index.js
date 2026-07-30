@@ -451,6 +451,21 @@ async function serverCommand() {
         if (error?.code !== 'ENOENT') reportServerStateFailure({ operation: 'clear', errorClass: error?.code || error?.name || 'Error' });
       }
     });
+    // Token keep-alive + recovery sweep (from teamclaude-cloud): periodically
+    // refresh expiring/expired OAuth tokens and force-retry 'error' accounts,
+    // so an idle account's refresh-token chain keeps rotating (a chain that
+    // never rotates can be invalidated upstream) and a transient refresh
+    // failure self-heals without a restart. One immediate sweep revives the
+    // fleet right after a restart that followed downtime, instead of waiting a
+    // full interval. `tokenRefreshIntervalMs: 0` disables (malformed values
+    // fall back to the 5-minute default, mirroring reevalIntervalMs).
+    const tokenRefreshIntervalMs = Number.isFinite(config.tokenRefreshIntervalMs)
+      ? Math.max(0, config.tokenRefreshIntervalMs)
+      : 300_000;
+    if (tokenRefreshIntervalMs > 0) {
+      setImmediate(() => accountManager.refreshLapsedTokens());
+      setInterval(() => accountManager.refreshLapsedTokens(), tokenRefreshIntervalMs).unref();
+    }
     if (tui) {
       tui.start();
       console.log(`Listening on port ${port} with ${accounts.length} account(s)`);

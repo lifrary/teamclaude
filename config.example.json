@@ -11,6 +11,7 @@
   "overflowQueueMaxDepth": 16,
   "activeWarmup": true,
   "warmupIntervalMs": 300000,
+  "tokenRefreshIntervalMs": 300000,
   "quotaProbeSeconds": 0,
   "autoUpdate": true,
   "sx": {

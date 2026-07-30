@@ -9,7 +9,7 @@ import { parseRequestModel, parseAdvisorModel, weeklyBucketForModel } from './mo
 import { sanitizeToolPairs } from './tool-pair-sanitize.js';
 import { upstreamFetch } from './upstream-fetch.js';
 import { connectThroughProxy, tunnelTls } from './sx.js';
-import { isTokenExpiringSoon } from './oauth.js';
+import { isTokenExpiringSoon, normalizeExpiresAt } from './oauth.js';
 import { parseAccountIdKey, resolveAccount } from './identity.js';
 import { MaintenanceCoordinator } from './maintenance-coordinator.js';
 
@@ -1075,7 +1075,18 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       // or it's an API-key account — fail this account out and switch.
       if (account.status !== 'error') {
         account.status = 'error';
+        // Upstream rejected the account (401 despite a fresh token) — NOT a
+        // refresh failure. The token sweep must not revive it just because the
+        // token endpoint still rotates; only new credentials or a restart do.
+        account._errorFromRefresh = false;
         console.log(`[TeamClaude] 401 on "${account.name}" — auth failed, marking account error`);
+      } else if (account.expiresAt && Date.now() < normalizeExpiresAt(account.expiresAt)) {
+        // Already parked (e.g. a sweep refresh failed first), but THIS 401 came
+        // back on a still-valid token — that is account-level rejection
+        // evidence, so demote a refresh-caused label: the sweep must not revive
+        // the account on the next token-endpoint success. (A 401 on an EXPIRED
+        // token proves nothing beyond the expiry and keeps its label.)
+        account._errorFromRefresh = false;
       }
       if (logDir) {
         logSections.push(`=== RESPONSE 401 — auth failure, account marked error ===\n${formatHeaders(upstreamRes.headers)}`);
@@ -1318,6 +1329,18 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     }
 
     if (retryCount < maxRetries && !res.headersSent) {
+      // Same cause-tagging as the 401 path: a non-transient SEND failure is not
+      // a refresh failure, so the token sweep must not auto-revive it. Only tag
+      // on the transition, preserving an earlier refresh-caused label.
+      // Deliberately NO valid-token demotion here (unlike the 401 path): a send
+      // failure is a transport observation, not deterministic account-level
+      // rejection evidence, so it must not permanently park an account whose
+      // only proven defect was a failed refresh. If the sweep later revives it
+      // and the transport problem persists, the first real request re-parks it
+      // — this time labeled send-caused (the transition above fires from
+      // 'active') — so mislabeling self-corrects in at most one bounded flap,
+      // whereas demoting would trade that for permanent in-run capacity loss.
+      if (account.status !== 'error') account._errorFromRefresh = false;
       account.status = 'error';
       releaseHeld(); // this account errored; fail over to another
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
