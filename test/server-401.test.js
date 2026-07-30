@@ -92,3 +92,50 @@ test('all accounts failing auth → returns 401 to the client', async () => {
     upstream.close();
   }
 });
+
+// The refresh-storm guard. Every request already in flight when a token turns
+// over comes back 401, staggered — so they miss the concurrent-refresh
+// coalescing and would each force their own refresh, rotating the refresh-token
+// family once per request. A 401 for a just-minted token is stale news; the
+// forced refresh must be suppressed for a short window after a successful one.
+test('a forced refresh is suppressed right after a successful refresh', async () => {
+  let refreshes = 0;
+  const am = new AccountManager(
+    [{ name: 'a', type: 'oauth', accessToken: 't0', refreshToken: 'r', expiresAt: Date.now() + 3600_000 }],
+    0.98,
+    {
+      forcedRefreshFloorMs: 10_000,
+      refreshFn: async () => { refreshes++; return { accessToken: `t${refreshes}`, refreshToken: 'r', expiresAt: Date.now() + 3600_000 }; },
+    },
+  );
+
+  await am.ensureTokenFresh(0, true);
+  assert.equal(refreshes, 1);
+  assert.equal(am.accounts[0].credential, 't1');
+
+  // Two more stale 401s land immediately — neither may rotate the family again.
+  await am.ensureTokenFresh(0, true);
+  await am.ensureTokenFresh(0, true);
+  assert.equal(refreshes, 1);
+  assert.equal(am.accounts[0].credential, 't1');       // the good token survives
+});
+
+// The suppression must expire, or a token that really is bad stays stuck.
+test('a forced refresh is allowed again once the floor elapses', async () => {
+  let refreshes = 0;
+  const am = new AccountManager(
+    [{ name: 'a', type: 'oauth', accessToken: 't0', refreshToken: 'r', expiresAt: Date.now() + 3600_000 }],
+    0.98,
+    {
+      forcedRefreshFloorMs: 30,
+      refreshFn: async () => { refreshes++; return { accessToken: `t${refreshes}`, refreshToken: 'r', expiresAt: Date.now() + 3600_000 }; },
+    },
+  );
+
+  await am.ensureTokenFresh(0, true);
+  await am.ensureTokenFresh(0, true);
+  assert.equal(refreshes, 1);                          // second one suppressed
+  await new Promise(r => setTimeout(r, 50));
+  await am.ensureTokenFresh(0, true);
+  assert.equal(refreshes, 2);                          // floor elapsed, allowed
+});
