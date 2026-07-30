@@ -94,8 +94,14 @@ test('a session reset switches between unranked accounts by sooner weekly reset'
 test('tie on reset time → lowest utilization wins', () => {
   const am = new AccountManager(makeAccounts(2), 0.98);
   const reset = 60 * MIN;
-  setSession(am, 0, 0.40, reset);
-  setSession(am, 1, 0.20, reset);
+  // Share one `now`, or there is no tie to break: each setSession would derive its own
+  // Date.now(), and a millisecond boundary between the two calls makes acct-0's reset
+  // 1ms sooner, so the reset comparison decides and utilization never gets a vote.
+  // Observed failing once in eight full-suite runs (`'acct-0' !== 'acct-1'`). Every
+  // other equal-reset test in this file already passes a shared `now`; this one didn't.
+  const now = Date.now();
+  setSession(am, 0, 0.40, reset, now);
+  setSession(am, 1, 0.20, reset, now);
   assert.equal(am.getActiveAccount().name, 'acct-1');
 });
 
