@@ -33,7 +33,10 @@ export class MaintenanceCoordinator {
 
   // Queue one targeted upstream operation.  A later request for the same kind is
   // coalesced; different kinds are ordered by priority then insertion order.
-  run(account, kind, priority, task) {
+  // `capacityOptional` marks work that spends no /v1/messages budget (the
+  // /api/oauth/usage quota read): it still takes an admission slot when one is
+  // free, but is not cancelled for lack of one.  See _drain.
+  run(account, kind, priority, task, { capacityOptional = false } = {}) {
     if (this.closed || !account || this.abortController.signal.aborted) return Promise.resolve(false);
     let state = this.accounts.get(account);
     if (!state) {
@@ -44,7 +47,7 @@ export class MaintenanceCoordinator {
     if (existing) return existing.promise;
     let resolve;
     const promise = new Promise(r => { resolve = r; });
-    state.pending.set(kind, { kind, priority, task, sequence: this.sequence++, promise, resolve });
+    state.pending.set(kind, { kind, priority, task, capacityOptional, sequence: this.sequence++, promise, resolve });
     this._drain(account, state);
     return promise;
   }
@@ -65,7 +68,18 @@ export class MaintenanceCoordinator {
             null, 0, this.abortController.signal, null,
             { pinnedAccount: account, revalidate: true },
           );
-          if (!reserved || reserved !== account || this.closed) {
+          // A capacityOptional job adds no /v1/messages load, so losing the race for
+          // a slot must not cancel it.  The accounts that cannot be admitted — over
+          // their quota threshold, or saturated by client traffic — are precisely the
+          // ones whose quota there is no other cheap way to re-read, so gating this on
+          // admission silently disabled the probe exactly where it earns its keep
+          // (measured 2026-07-30: 0 of 6 accounts probed over 30min of live uptime).
+          // It still takes a slot whenever one is free, so `inflight` never exceeds
+          // `maxConcurrent` either way.
+          const admitted = reserved === account;
+          const runnable = admitted
+            || (job.capacityOptional && this.accountManager.accounts.includes(account));
+          if (!runnable || this.closed) {
             job.resolve(false);
             continue;
           }

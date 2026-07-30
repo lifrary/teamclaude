@@ -204,6 +204,62 @@ test('prober status records account probe results', async () => {
   assert.equal(status.accounts[1].status, 'not-applicable');
 });
 
+// Regression, 2026-07-30: measured 0 of 6 accounts ever probed across 30min of
+// uptime while the 5-minute schedule kept firing. MaintenanceCoordinator._drain
+// reserved a normal request slot for every job and gave up (timeoutMs 0) when it
+// could not get one — so an over-threshold account, which fails _isAvailable, was
+// never probed at all. That is exactly backwards: the /api/oauth/usage read is the
+// only zero-token way to learn an exhausted account recovered, and its exclusion is
+// what makes the probe valuable. Slot sharing is still preserved when a slot is
+// obtainable (test/warmer.test.js pins inflight===1 for an available account).
+test('the zero-spend quota probe still runs for an account over its quota threshold', async () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  am.updateQuota(0, { // weekly spent → excluded from rotation
+    'anthropic-ratelimit-unified-7d-utilization': '1',
+    'anthropic-ratelimit-unified-7d-reset': String(Math.floor((Date.now() + 4 * 86400_000) / 1000)),
+  });
+  assert.equal(am._isAvailable(am.accounts[0]), false, 'precondition: account is excluded from rotation');
+
+  let calls = 0;
+  const prober = new Prober(am, {
+    intervalMs: 0,
+    // Assert on the probe function itself, not getStatus(): a call count cannot be
+    // faked by a bookkeeping bug, so this isolates admission from recording.
+    probeFn: async () => { calls++; return { sevenDay: { utilization: 0.42, resetAt: Date.now() + 3600_000 } }; },
+    log: () => {},
+    ownCoordinator: true,
+  });
+  await prober.probeAll();
+
+  assert.equal(calls, 1, 'an exhausted account must still be probed — it spends no tokens');
+  assert.equal(am.accounts[0].quota.unified7d, 0.42, 'the probe corrected the stale exhaustion');
+});
+
+test('the zero-spend quota probe still runs while the account is at its concurrency cap', async () => {
+  const am = new AccountManager([oauth('a')], 0.98, { maxConcurrent: 1 });
+  am.updateQuota(0, { // measured and well under threshold → available, just busy
+    'anthropic-ratelimit-unified-5h-utilization': '0.1',
+    'anthropic-ratelimit-unified-5h-reset': String(Math.floor((Date.now() + 3600_000) / 1000)),
+  });
+  const held = await am.acquireAccount(null, 0);
+  assert.ok(held, 'precondition: ordinary traffic holds the only slot');
+  assert.equal(await am.acquireAccount(null, 0), null, 'precondition: the account is at its cap');
+
+  let calls = 0;
+  const prober = new Prober(am, {
+    intervalMs: 0,
+    probeFn: async () => { calls++; return { sevenDay: { utilization: 0.5, resetAt: Date.now() + 3600_000 } }; },
+    log: () => {},
+    ownCoordinator: true,
+  });
+  await prober.probeAll();
+  am.releaseAccount(held);
+
+  assert.equal(calls, 1, 'a saturated account must still be probed — the usage read needs no request slot');
+  assert.equal(am.accounts[0].quota.unified7d, 0.5);
+  assert.ok(am.accounts[0].inflight <= am.accounts[0].maxConcurrent, 'and the cap invariant still holds');
+});
+
 test('prober refreshes expired token before probing', async () => {
   const am = new AccountManager(
     [oauth('a', { refreshToken: 'refresh', expiresAt: Date.now() - 1000 })],

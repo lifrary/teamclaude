@@ -52,8 +52,12 @@ export class Prober {
       this.nextRunAt = this.intervalMs > 0 ? this.lastRunStartedAt + this.intervalMs : null;
       try {
         const accounts = this.am.accounts.filter(account => account.type === 'oauth' && account.credential);
+        // capacityOptional: this reads /api/oauth/usage, which spends no message
+        // tokens, so it must not be cancelled when the account has no free slot —
+        // an over-threshold or saturated account is the one whose quota most needs
+        // re-reading. It still shares the admission cap when a slot is free.
         await Promise.all(accounts.map(account => this.coordinator.run(account, 'quota-probe', 30,
-          signal => this.probeAccount(account, signal))));
+          signal => this.probeAccount(account, signal), { capacityOptional: true })));
       } finally {
         this.lastRunFinishedAt = Date.now();
         this._runPromise = null;
