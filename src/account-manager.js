@@ -2157,9 +2157,12 @@ export class AccountManager {
         disabled: a.disabled || false,
         status: a.status,
         sessions: sessions.perAccount[a.index] || 0,
-        // Slot occupancy, so cap saturation is diagnosable over HTTP instead of only
-        // by attaching the TUI: `sessions` counts pinned sessions (most of them idle),
-        // which says nothing about whether requests are queueing behind a full account.
+        // Slot occupancy. `sessions` counts pinned sessions, most of them idle between
+        // turns, so it cannot say whether requests are queueing behind a full account —
+        // and no surface reported this before, the TUI included. Note maxConcurrent is
+        // the CONFIGURED cap: _hasCapacity admits on min(maxConcurrent, _rampCap) and
+        // also gates on pausedUntil, so an account can be at its effective limit while
+        // inflight still reads below this number.
         inflight: a.inflight,
         maxConcurrent: a.maxConcurrent,
         quota: { ...a.quota, modelWeekly: Object.fromEntries(Object.entries(a.quota.modelWeekly || {}).map(([key, value]) => [key, { ...value }])) },
