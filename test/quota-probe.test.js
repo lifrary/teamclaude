@@ -219,6 +219,12 @@ test('the zero-spend quota probe still runs for an account over its quota thresh
     'anthropic-ratelimit-unified-7d-reset': String(Math.floor((Date.now() + 4 * 86400_000) / 1000)),
   });
   assert.equal(am._isAvailable(am.accounts[0]), false, 'precondition: account is excluded from rotation');
+  // The probe's observation must be strictly NEWER than the header one, or
+  // observeQuotaField drops it: on an observedAt tie the higher-priority source wins
+  // and response headers (3) outrank the usage endpoint (2). Without this gap the two
+  // writes can land in the same millisecond and the assertion below becomes a coin
+  // flip — which is exactly how it was first committed.
+  await new Promise(r => setTimeout(r, 2));
 
   let calls = 0;
   const prober = new Prober(am, {
