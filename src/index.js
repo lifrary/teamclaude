@@ -193,7 +193,7 @@ async function serverCommand() {
   }
   const stateMigration = startupState?.migration || { completed: true, sourceDigests: {} };
   let quotaSaveInterval = null;
-let tokenSweepInterval = null;
+  let tokenSweepInterval = null;
   const persistQuotaState = async () => {
     const exported = accountManager.exportCanonicalState(server?.exportProbeTemplate?.() ?? null);
     await saveCanonicalState(createCanonicalState({ ...exported, migration: stateMigration }));
