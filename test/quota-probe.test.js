@@ -266,6 +266,32 @@ test('the zero-spend quota probe still runs while the account is at its concurre
   assert.ok(am.accounts[0].inflight <= am.accounts[0].maxConcurrent, 'and the cap invariant still holds');
 });
 
+// Measured on the live proxy: server up at 11:23:00Z, first probe at 11:28:00Z — a
+// full interval with every account's quota unread, right after a restart restored
+// those values from disk. reschedule()'s `immediate: !wasOn` default cannot fire at
+// startup because the constructor already set intervalMs, so `wasOn` is always true
+// on that path; the flag only ever fired when the probe was switched on from 0 at
+// runtime. start() now asks for the immediate run explicitly.
+test('the quota probe runs once at startup instead of waiting out the first interval', async () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  let calls = 0;
+  const prober = new Prober(am, {
+    intervalMs: 300_000, // the real default; the test must not wait for it
+    probeFn: async () => { calls++; return { sevenDay: { utilization: 0.3, resetAt: Date.now() + 3600_000 } }; },
+    log: () => {},
+    ownCoordinator: true,
+  });
+
+  try {
+    prober.start();
+    await new Promise(r => setTimeout(r, 20));
+    assert.equal(calls, 1, 'a restart must not leave quota unread for a whole interval');
+    assert.equal(am.accounts[0].quota.unified7d, 0.3);
+  } finally {
+    prober.stop();
+  }
+});
+
 test('prober refreshes expired token before probing', async () => {
   const am = new AccountManager(
     [oauth('a', { refreshToken: 'refresh', expiresAt: Date.now() - 1000 })],

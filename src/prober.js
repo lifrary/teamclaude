@@ -23,15 +23,20 @@ export class Prober {
     this.accountStatus = new Map();
   }
 
-  start() { if (this.intervalMs > 0) this.reschedule(this.intervalMs); }
+  // Probe once right away, then on the interval. Without the explicit flag this could
+  // never happen: the constructor has already stored intervalMs, so reschedule() sees
+  // wasOn === true and its !wasOn default suppresses the immediate run — meaning every
+  // restart left quota unread for a full interval, exactly when the values restored
+  // from disk are least trustworthy.
+  start() { if (this.intervalMs > 0) this.reschedule(this.intervalMs, { immediate: true }); }
 
-  reschedule(intervalMs) {
+  reschedule(intervalMs, { immediate } = {}) {
     const wasOn = this.intervalMs > 0;
     this.intervalMs = intervalMs;
     this.coordinator.unschedule(this.scheduleName);
     if (intervalMs > 0) {
       this.nextRunAt = Date.now() + intervalMs;
-      this.coordinator.schedule(this.scheduleName, intervalMs, () => this.probeAll(), { immediate: !wasOn });
+      this.coordinator.schedule(this.scheduleName, intervalMs, () => this.probeAll(), { immediate: immediate ?? !wasOn });
       this.log(`[TeamClaude] Quota probe enabled (every ${Math.round(intervalMs / 1000)}s)`);
     } else if (wasOn) {
       this.nextRunAt = null;
