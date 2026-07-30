@@ -122,6 +122,43 @@ test('overflow queue is bounded: rejects past maxQueueDepth instead of growing',
   const a2 = await w2; assert.ok(a2);
   am.releaseAccount(a2.index);
 });
+// `_drainWaiters` calls `_tryAcquire` and then, if that failed, `anyCapped` — and each
+// takes its own Date.now(). `_hasCapacity` flips at a pausedUntil / throttle boundary,
+// so a drain landing on that boundary reads "still blocked" in the first call and "not
+// even capped" in the second, and settles the waiter null at the instant its account
+// became servable. Surfaced as a rare suite failure (40ms pause, 500ms budget, resolved
+// null at 41ms). The stub reproduces that interleaving deterministically: one failed
+// _tryAcquire against a fleet that is, by then, genuinely free.
+test('a waiter is not settled null when its account frees between the drain’s two clock reads', async () => {
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 1); // one account, cap 1
+  measureAll(am);
+
+  const held = await am.acquireAccount(null, 0);
+  assert.ok(held, 'precondition: the only slot is taken');
+  const pending = am.acquireAccount(null, 500);   // queues behind it
+  await new Promise(r => setTimeout(r, 5));       // let the waiter enqueue
+  assert.equal(am._waiters.length, 1, 'precondition: exactly one queued waiter');
+
+  // Install the one-shot failure and release in the SAME synchronous block, so no
+  // scheduled drain can consume the stub first. releaseAccount drains synchronously.
+  const realTryAcquire = am._tryAcquire.bind(am);
+  let firstCall = true;
+  am._tryAcquire = (...args) => {
+    if (firstCall) { firstCall = false; return null; }  // "landed before the boundary"
+    return realTryAcquire(...args);
+  };
+  am.releaseAccount(held);
+
+  const got = await pending;
+  am._tryAcquire = realTryAcquire;
+
+  assert.ok(got, 'the waiter must receive the account, not null, when it frees mid-drain');
+  assert.equal(got, am.accounts[0]);
+  assert.equal(am.accounts[0].inflight, 1, 'and it holds exactly the one slot it was handed');
+  am.releaseAccount(got);
+  assert.equal(am.accounts[0].inflight, 0);
+});
+
 // getStatus publishes the server's OWN routing verdict. Before this, every consumer
 // re-derived it from the quota numbers, which cannot see `disabled`, a live throttle,
 // `pausedUntil`, or a route restriction — and cannot evaluate routes at all, since the

@@ -887,7 +887,24 @@ export class AccountManager {
       // releases its finite queue slot instead of blocking later, satisfiable
       // overflow requests until its timeout. A waiter that still has a cappable
       // account to hope for is left in place.
-      if (!this.anyCapped(waiter.exclude, waiter.routingContext)) { this._settleWaiter(waiter, null); continue; }
+      if (!this.anyCapped(waiter.exclude, waiter.routingContext)) {
+        // Try once more before giving up. `_tryAcquire` above and `anyCapped` here each
+        // take their OWN Date.now(), and `_hasCapacity` flips at a `pausedUntil` /
+        // throttle boundary — so a drain landing on that boundary sees "still paused"
+        // in the first call and "no longer capped" in the second, and would settle the
+        // waiter null at the exact instant its account became servable, costing the
+        // client a 429 it did not earn. (Observed as a rare suite failure: a 40ms pause
+        // with a 500ms budget resolved null at 41ms.) If this retry also fails, null is
+        // the right answer — nothing is available-with-capacity and nothing is
+        // available-but-capped, so waiting cannot help.
+        const late = this._tryAcquire(waiter.exclude, waiter.affinityKey, waiter.routingContext);
+        if (late) {
+          if (!this._settleWaiter(waiter, late)) { late.inFlight--; i++; }
+          continue;
+        }
+        this._settleWaiter(waiter, null);
+        continue;
+      }
       i++;
     }
     this._scheduleDrain();
