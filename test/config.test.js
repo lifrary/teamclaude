@@ -432,6 +432,25 @@ test('canonical validation and legacy migration reject nested secrets and unknow
   );
 });
 
+// Regression: the template is captured verbatim from live traffic, and extended
+// prompt caching rides a `ttl` ('5m'/'1h') on the ephemeral cache_control.
+// Rejecting that key made EVERY canonical-state save fail once 1h-TTL traffic
+// became the template — the state file froze at its last pre-TTL write and each
+// restart restored days-stale quota.
+test('canonical validation accepts extended-TTL cache_control on the template', () => {
+  const state = cacheControl => ({
+    accounts: {},
+    activeAccountId: null,
+    template: { model: 'claude-test', version: '2023-06-01', beta: null, system: [{ type: 'text', text: 'ping', cache_control: cacheControl }] },
+  });
+  assert.doesNotThrow(() => createCanonicalState(state({ type: 'ephemeral', ttl: '1h' })));
+  assert.doesNotThrow(() => createCanonicalState(state({ type: 'ephemeral', ttl: '5m' })));
+  assert.doesNotThrow(() => createCanonicalState(state({ type: 'ephemeral' })));
+  // Still strict: a non-string ttl and unknown/secret-bearing keys stay rejected.
+  assert.throws(() => createCanonicalState(state({ type: 'ephemeral', ttl: 3600 })), /Canonical state validate template.system.cache_control/);
+  assert.throws(() => createCanonicalState(state({ type: 'ephemeral', ttl: '1h', accessToken: 'secret' })), /Canonical state validate/);
+});
+
 test('legacy quota wrapper migrates while dropping transient unified status', () => {
   const migrated = migrateLegacyState({
     quota: [{

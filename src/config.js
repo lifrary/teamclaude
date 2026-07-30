@@ -174,8 +174,16 @@ function validateTemplateSystem(value) {
       throw new CanonicalStateError('validate template.system');
     }
     if (block.cache_control !== undefined) {
-      assertAllowed(block.cache_control, new Set(['type']), 'template.system.cache_control');
+      // `ttl` ('5m'/'1h') rides on ephemeral cache_control for extended prompt
+      // caching. The captured template must keep it verbatim — it is part of
+      // the known-accepted request shape — and rejecting it here made EVERY
+      // canonical-state save fail once 1h-TTL traffic became the template
+      // (state file frozen at its pre-TTL write, restarts restoring stale quota).
+      assertAllowed(block.cache_control, new Set(['type', 'ttl']), 'template.system.cache_control');
       if (block.cache_control.type !== 'ephemeral') throw new CanonicalStateError('validate template.system.cache_control');
+      if (block.cache_control.ttl !== undefined && typeof block.cache_control.ttl !== 'string') {
+        throw new CanonicalStateError('validate template.system.cache_control');
+      }
     }
   }
 }
