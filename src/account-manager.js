@@ -2157,6 +2157,11 @@ export class AccountManager {
         disabled: a.disabled || false,
         status: a.status,
         sessions: sessions.perAccount[a.index] || 0,
+        // Slot occupancy, so cap saturation is diagnosable over HTTP instead of only
+        // by attaching the TUI: `sessions` counts pinned sessions (most of them idle),
+        // which says nothing about whether requests are queueing behind a full account.
+        inflight: a.inflight,
+        maxConcurrent: a.maxConcurrent,
         quota: { ...a.quota, modelWeekly: Object.fromEntries(Object.entries(a.quota.modelWeekly || {}).map(([key, value]) => [key, { ...value }])) },
         usage: { ...a.usage },
         rateLimitedUntil: a.rateLimitedUntil
