@@ -25,7 +25,13 @@ export async function resolveAccounts(config) {
             console.error(`No token in ${acct.importFrom} for "${acct.name}", skipping`);
             continue;
           }
-          accounts.push({ ...acct, ...creds });
+          // Drop absent credential fields before spreading: importCredentials
+          // returns every key (present-but-undefined when the file lacks one),
+          // and a bare spread would clobber a configured refreshToken/expiresAt
+          // with undefined — the docstring's "config carried through verbatim"
+          // must hold for fields the file does not supply.
+          const present = Object.fromEntries(Object.entries(creds).filter(([, v]) => v !== undefined));
+          accounts.push({ ...acct, ...present });
           console.log(`Imported "${acct.name}" from ${acct.importFrom}`);
         } catch (err) {
           console.error(`Failed to import "${acct.name}": ${err.message}`);

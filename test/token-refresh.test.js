@@ -256,3 +256,32 @@ test('a 401 on an EXPIRED token keeps the refresh-caused label (expiry explains 
   assert.equal(a._errorFromRefresh, true,
     'nothing beyond the expiry was proven — the sweep may still heal this account');
 });
+
+// ── expiresAt unit safety ────────────────────────────────────────────────────
+// expiresAt may arrive in seconds (OAuth endpoints) or milliseconds (Claude
+// Code credentials). The park decision must normalize like every other reader
+// of this field: a raw Date.now() comparison reads a seconds-valued STILL-VALID
+// token as expired, parks the account on a transient blip, and the sweep —
+// which normalizes — then sees a valid token and never attempts the heal.
+
+test('a transient forced-refresh failure on a seconds-valued still-valid token does not park', async () => {
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 3);
+  const acct = am.accounts[0];
+  acct.expiresAt = Math.floor((Date.now() + HOUR) / 1000);   // seconds, one hour of validity left
+  const restore = fetchStub(async () => { throw new Error('fetch failed'); });
+  try { await am.ensureTokenFresh(0, true); } finally { restore(); }
+  assert.equal(acct.status, 'active', 'a still-valid (seconds-unit) token must not be parked by a blip');
+});
+
+// An account whose expiry is UNKNOWN can't be caught by the expiring gate
+// (isTokenExpiringSoon(null) is false), so the sweep must select it and force —
+// otherwise its refresh-token chain silently lapses, the exact failure the
+// sweep exists to prevent. One success learns the real expiry.
+test('an account with unknown expiry is swept forced so its chain cannot silently lapse', async () => {
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 3);
+  am.accounts[0].expiresAt = null;                           // healthy, expiry unknown
+  const calls = [];
+  am.ensureTokenFresh = async (ref, force = false) => { calls.push({ name: am._resolve(ref).name, force }); };
+  assert.equal(await am.refreshLapsedTokens(), 1, 'unknown-expiry account is selected');
+  assert.deepEqual(calls, [{ name: 'a0', force: true }], 'forced — the non-forced gate never fires for null expiry');
+});

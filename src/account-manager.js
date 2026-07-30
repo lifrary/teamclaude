@@ -1805,7 +1805,10 @@ export class AccountManager {
     // reacting to a response and can't stampede.
     if (force && account._lastRefreshAt !== null
         && Date.now() - account._lastRefreshAt < this._forcedRefreshFloorMs) {
-      return { ok: true };
+      // `suppressed` lets callers that follow a forced refresh with a retry
+      // (the usage prober) know no new token was minted — retrying with the
+      // same credential is guaranteed to repeat the 401.
+      return { ok: true, suppressed: true };
     }
 
     // Coalesce concurrent refreshes
@@ -1850,7 +1853,11 @@ export class AccountManager {
         // send failure), a later failed sweep refresh must not relabel it, or
         // the next successful refresh would wrongly revive a rejected account.
         const isAuthRejection = err.status === 400 || err.status === 401 || err.status === 403;
-        const accessExpired = !account.expiresAt || Date.now() >= account.expiresAt;
+        // isTokenExpired normalizes seconds-vs-milliseconds; a raw comparison
+        // here reads a seconds-valued still-valid token as expired, parks the
+        // account on a transient blip, and the sweep (which normalizes) then
+        // sees a valid token and never attempts the heal — a permanent park.
+        const accessExpired = !account.expiresAt || isTokenExpired(account.expiresAt);
         if (isAuthRejection || accessExpired) {
           if (account.status !== 'error') {
             account.status = 'error';
@@ -1892,7 +1899,9 @@ export class AccountManager {
    * bounded by the per-refresh timeout, and coalescing keeps a concurrent
    * request-path refresh safe either way.
    * Never throws; failures are handled (and classified) inside ensureTokenFresh.
-   * Returns the number of accounts a refresh was attempted for.
+   * Returns the number of accounts selected for a refresh attempt (an attempt
+   * may still no-op inside ensureTokenFresh, e.g. a parked account whose token
+   * is not yet expiring).
    */
   async refreshLapsedTokens() {
     if (this._sweepInFlight) return 0;
@@ -1900,14 +1909,16 @@ export class AccountManager {
     try {
       const targets = this.accounts.filter(a =>
         a.type === 'oauth' && a.refreshToken
-        && (a.status === 'error' || isTokenExpiringSoon(a.expiresAt)));
+        && (a.status === 'error' || !a.expiresAt || isTokenExpiringSoon(a.expiresAt)));
       for (const a of targets) {
         // Non-forced is enough for every lapsed token (ensureTokenFresh's own
         // expiry gate passes); it also makes an 'error' account with a
         // still-valid token a no-op — no pointless rotation churn each sweep.
         // Force only when the expiry is UNKNOWN (no expiresAt): the non-forced
-        // gate would never fire for it, so its chain would silently lapse.
-        await this.ensureTokenFresh(a, a.status === 'error' && !a.expiresAt)
+        // gate would never fire for it (isTokenExpiringSoon(null) is false), so
+        // its chain would silently lapse. One successful refresh learns the
+        // real expiry and moves the account onto the normal non-forced path.
+        await this.ensureTokenFresh(a, !a.expiresAt)
           .catch(() => { /* stays error until the refresh token heals */ });
       }
       return targets.length;

@@ -193,6 +193,7 @@ async function serverCommand() {
   }
   const stateMigration = startupState?.migration || { completed: true, sourceDigests: {} };
   let quotaSaveInterval = null;
+let tokenSweepInterval = null;
   const persistQuotaState = async () => {
     const exported = accountManager.exportCanonicalState(server?.exportProbeTemplate?.() ?? null);
     await saveCanonicalState(createCanonicalState({ ...exported, migration: stateMigration }));
@@ -465,7 +466,8 @@ async function serverCommand() {
       : 300_000;
     if (tokenRefreshIntervalMs > 0) {
       setImmediate(() => accountManager.refreshLapsedTokens());
-      setInterval(() => accountManager.refreshLapsedTokens(), tokenRefreshIntervalMs).unref();
+      tokenSweepInterval = setInterval(() => accountManager.refreshLapsedTokens(), tokenRefreshIntervalMs);
+      tokenSweepInterval.unref?.();
     }
     if (tui) {
       tui.start();
@@ -540,6 +542,10 @@ async function serverCommand() {
     warmer?.stop();
     await maintenance.shutdown();
     if (quotaSaveInterval) clearInterval(quotaSaveInterval);
+    // Stop the token sweep before the final persist: a sweep firing during
+    // teardown could rotate a refresh token upstream and lose the new one to
+    // the un-awaited config write racing process.exit.
+    if (tokenSweepInterval) clearInterval(tokenSweepInterval);
     await persistQuotaState();
     // Don't linger waiting on keep-alive / streaming connections: actively
     // destroy them so server.close() can complete promptly, and hard-exit after a
@@ -1799,7 +1805,7 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager, { mig
       }
     } else if (freshCred.apiKey && mgr.credential !== freshCred.apiKey) {
       mgr.credential = freshCred.apiKey;
-      if (mgr.status === 'error') mgr.status = 'active';
+      if (mgr.status === 'error') { mgr.status = 'active'; delete mgr._errorFromRefresh; }
       console.log(`[TeamClaude] Updated API key for "${mgr.name}"`);
     }
   }

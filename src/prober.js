@@ -70,9 +70,13 @@ export class Prober {
       this._throwIfAborted(signal);
       let usage = await this._withTimeout(probeSignal => this.probeFn(account.credential, probeSignal), signal);
       if (usage?.status === 401) {
-        await this.am.ensureTokenFresh(account.index, true);
+        const refreshed = await this.am.ensureTokenFresh(account.index, true);
         this._throwIfAborted(signal);
-        usage = await this._withTimeout(probeSignal => this.probeFn(account.credential, probeSignal), signal);
+        // A floor-suppressed forced refresh minted no new token — re-probing
+        // with the same credential is guaranteed to repeat the 401.
+        if (!refreshed?.suppressed) {
+          usage = await this._withTimeout(probeSignal => this.probeFn(account.credential, probeSignal), signal);
+        }
       }
       const finishedAt = Date.now();
       if (!usage || usage.error) {
