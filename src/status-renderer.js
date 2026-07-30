@@ -128,18 +128,25 @@ function formatAccountStatus(account, now, paint) {
 // specific models" view. Only rendered for accounts that meter a family
 // separately (a Sonnet or Fable weekly bucket), since that is the only case
 // where a request's model changes where it can route. A family reads ✗ when the
-// shared 5h bucket is spent (blocks everything) or when its own weekly bucket is
-// over the switch threshold; the reset is shown when the family bucket is the
-// blocker so it's clear when that model becomes available on this account again.
+// account is benched from rotation at all (`available: false` — disabled, throttled,
+// parked, or over a shared bucket), when the shared 5h bucket is spent, or when its
+// own weekly bucket is over the switch threshold; the reset is shown when the family
+// bucket is the blocker so it's clear when that model becomes available again.
 function modelRoutingLine(account, threshold, now, paint) {
   const q = account.quota || {};
   if (q.unified7dSonnet == null && q.unified7dFable == null) return null;
   const t = Number(threshold);
   const fiveOver = q.unified5h != null && !Number.isNaN(t) && q.unified5h >= t;
+  // Quota is not the only reason a model cannot route here. `available` is the
+  // server's own rotation verdict (disabled / throttled / error / exhausted / over
+  // threshold), and without it this line rendered a green ✓ for an account the
+  // server refuses outright. Strict `=== false` on purpose: an older daemon's
+  // payload omits the field, and absent must mean "don't claim to know".
+  const benched = account.available === false;
 
   const cell = (label, weekly, reset) => {
     const weeklyOver = weekly != null && !Number.isNaN(t) && weekly >= t;
-    const mark = fiveOver || weeklyOver ? paint.red('✗') : paint.green('✓');
+    const mark = benched || fiveOver || weeklyOver ? paint.red('✗') : paint.green('✓');
     const resetTs = parseTs(reset);
     const when = weeklyOver && resetTs && resetTs > now ? paint.dim(` ${formatDuration(resetTs - now)}`) : '';
     return `${label} ${mark}${when}`;
@@ -148,7 +155,12 @@ function modelRoutingLine(account, threshold, now, paint) {
   const cells = [cell('Opus', q.unified7d, q.unified7dReset)];
   if (q.unified7dSonnet != null) cells.push(cell('Sonnet', q.unified7dSonnet, q.unified7dSonnetReset));
   if (q.unified7dFable != null) cells.push(cell('Fable', q.unified7dFable, q.unified7dFableReset));
-  return `${paint.dim('Models'.padEnd(8))} ${cells.join('   ')}`;
+  // Name the cause when it is NOT the quota the bars above already show — three
+  // unexplained ✗ on an account whose quota reads healthy is its own puzzle.
+  const why = benched && account.benchedReason && account.benchedReason !== 'quota'
+    ? paint.dim(`  (${account.benchedReason})`)
+    : '';
+  return `${paint.dim('Models'.padEnd(8))} ${cells.join('   ')}${why}`;
 }
 
 function quotaLines(account, now, paint) {

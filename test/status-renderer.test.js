@@ -44,6 +44,45 @@ test('renderStatus shows the sessions line and per-account session count when pr
   assert.match(output, /a \(oauth, prio 0\).*2 sess/);
 });
 
+// The Models line used to derive its ✓/✗ purely from quota numbers, so an account the
+// server refuses outright — disabled, throttled, parked — rendered `Opus ✓` beside a
+// healthy-looking bar. That was the one place a wrong answer reached a human, since
+// getStatus already publishes the server's own verdict.
+test('renderStatus marks every model unroutable on a benched account, and names the cause', () => {
+  const status = sampleStatus();
+  const a = status.accounts[0];
+  a.quota = {                       // quota is healthy — nothing here says "blocked"
+    unified5h: 0.10, unified5hReset: now + 3600_000,
+    unified7d: 0.20, unified7dReset: now + 86_400_000,
+    unified7dFable: 0.30, unified7dFableReset: now + 86_400_000,
+  };
+  a.disabled = true;
+  a.available = false;
+  a.benchedReason = 'disabled';
+
+  const output = renderStatus(status, { color: false, now });
+  const models = output.split('\n').find(l => l.includes('Models'));
+  assert.ok(models, 'the Models line should render');
+  assert.doesNotMatch(models, /✓/, `a benched account must not advertise a routable model: ${models}`);
+  assert.match(models, /Opus ✗/);
+  assert.match(models, /Fable ✗/);
+  assert.match(models, /\(disabled\)/, 'and it should say why, since the quota bars look fine');
+});
+
+test('renderStatus keeps the quota-only verdict when the payload predates `available`', () => {
+  // An older daemon omits the field; absent must not be read as benched.
+  const status = sampleStatus();
+  status.accounts[0].quota = {
+    unified5h: 0.10, unified5hReset: now + 3600_000,
+    unified7d: 0.20, unified7dReset: now + 86_400_000,
+    unified7dFable: 0.30, unified7dFableReset: now + 86_400_000,
+  };
+  const models = renderStatus(status, { color: false, now }).split('\n').find(l => l.includes('Models'));
+  assert.match(models, /Opus ✓/);
+  assert.match(models, /Fable ✓/);
+  assert.doesNotMatch(models, /\(/, 'no cause suffix when nothing is benched');
+});
+
 test('renderStatus omits the sessions line when the status has no sessions field', () => {
   const output = renderStatus(sampleStatus(), { color: false, now });
   assert.doesNotMatch(output, /Sessions\s/);
