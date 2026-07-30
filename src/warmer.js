@@ -29,6 +29,12 @@ export class Warmer {
     this.accountStatus = new Map();
   }
 
+  // Deliberately NOT `{ immediate: true }`, unlike Prober.start(). Keep-warm spends a
+  // real message per idle account, so firing it at boot would bill the whole fleet on
+  // every restart; waiting one interval is the right default. `reschedule`'s own
+  // `immediate: !wasOn` still gives an immediate run when an operator turns keep-warm
+  // on from 0 at runtime, which is the case that flag is for. The prober is exempt
+  // because its probe is a read — the asymmetry is intentional, not an oversight.
   start() { if (this.intervalMs > 0) this.reschedule(this.intervalMs); }
   reschedule(intervalMs) {
     const wasOn = this.intervalMs > 0;

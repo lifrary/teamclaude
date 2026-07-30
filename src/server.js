@@ -76,6 +76,10 @@ export function isLoopbackAddr(addr) {
 }
 const RETRY_AFTER_FALLBACK_SECONDS = 60;
 const RETRY_AFTER_MAX_SECONDS = 300;
+// A concurrency cap frees the moment an in-flight request finishes — seconds, not the
+// minute a quota window needs. Both capped-fleet 429s (pinned and general) use this,
+// so the two cannot drift apart the way their messages once did.
+const CAPPED_RETRY_AFTER_SECONDS = 1;
 const MODEL_RESPONSE_BUCKETS = Object.freeze({
   unified7dFable: '7d_oi',
   unified7dSonnet: '7d_sonnet',
@@ -854,7 +858,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     ctx.status = capped ? 429 : 503;
     res.writeHead(ctx.status, {
       'Content-Type': 'application/json',
-      ...(capped ? { 'retry-after': '1' } : {}),
+      ...(capped ? { 'retry-after': String(CAPPED_RETRY_AFTER_SECONDS) } : {}),
     });
     res.end(JSON.stringify({
       type: 'error',
@@ -897,20 +901,22 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
     }
     ctx.status = 429;
-    const retryAfter = ctx.terminalQuotaExhaustion
-      ? computeRetryAfter(accountManager.getStatus().accounts, accountManager.switchThreshold)
-      : RETRY_AFTER_FALLBACK_SECONDS;
     // "No quota left anywhere" and "every account is momentarily at its concurrency
     // cap" call for opposite responses — add accounts or wait for a reset, versus
     // reduce concurrency — so reporting the first when it is the second sends the
     // reader hunting quota that is in fact 90% unspent. A request that released its
     // slot for an overload backoff and then lost the race to re-acquire it lands
     // here, which is how the wrong label gets in front of a client. The pinned-account
-    // branch above already draws this line; draw it on the general path too.
+    // branch above already draws this line; draw it on the general path too — and in
+    // the retry-after as well as the wording, or the client is still told to wait a
+    // minute for something that frees when any in-flight request finishes.
     const merelyCapped = !ctx.terminalQuotaExhaustion && accountManager.anyCapped(excludeForSelect, {
       model: ctx.model,
       advisorModel: ctx.advisorModel,
     });
+    const retryAfter = ctx.terminalQuotaExhaustion
+      ? computeRetryAfter(accountManager.getStatus().accounts, accountManager.switchThreshold)
+      : merelyCapped ? CAPPED_RETRY_AFTER_SECONDS : RETRY_AFTER_FALLBACK_SECONDS;
     res.writeHead(429, {
       'Content-Type': 'application/json',
       'retry-after': String(retryAfter),

@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { AccountManager } from '../src/account-manager.js';
+import { AccountManager, QUEUE_DEPTH_CEILING } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 
 const HOUR = 3600_000;
@@ -122,6 +122,44 @@ test('overflow queue is bounded: rejects past maxQueueDepth instead of growing',
   const a2 = await w2; assert.ok(a2);
   am.releaseAccount(a2.index);
 });
+// getStatus publishes the server's OWN routing verdict. Before this, every consumer
+// re-derived it from the quota numbers, which cannot see `disabled`, a live throttle,
+// `pausedUntil`, or a route restriction — and cannot evaluate routes at all, since the
+// payload carries no `models` field. So the re-derivation called accounts usable that
+// the server was benching.
+test('getStatus reports the availability verdict and why an account is benched', () => {
+  const am = new AccountManager(makeAccounts(3), 0.98);
+  measureAll(am);                 // all three healthy and measured
+  am.setDisabled(1, true);        // benched by the operator
+  am.updateQuota(2, {             // benched by quota
+    'anthropic-ratelimit-unified-5h-utilization': '1',
+    'anthropic-ratelimit-unified-5h-reset': String(Math.floor((Date.now() + HOUR) / 1000)),
+  });
+
+  const byName = Object.fromEntries(am.getStatus().accounts.map(a => [a.name, a]));
+  assert.equal(byName.a0.available, true);
+  assert.equal(byName.a0.benchedReason, null);
+  assert.equal(byName.a1.available, false);
+  assert.equal(byName.a1.benchedReason, 'disabled');
+  assert.equal(byName.a2.available, false);
+  assert.equal(byName.a2.benchedReason, 'quota');
+  // `status` could not have told the last two apart from a healthy one: it still reads
+  // 'active' for the quota-benched account. That is why the verdict has to be published.
+  assert.equal(byName.a2.status, 'active');
+});
+
+// The queue depth is a memory bound (totalCapacity x maxRequestBytes), so it has a
+// hard ceiling that overrides config. It used to apply that ceiling in silence, which
+// let `overflowQueueMaxDepth: 256` sit in a live config reading as accepted while the
+// effective queue was 16 — a knob that lies is worse than no knob.
+test('a configured overflow depth above the hard ceiling is clamped, not honored', () => {
+  const am = new AccountManager(makeAccounts(1), 0.98, { maxQueueDepth: 256 });
+  assert.equal(am.maxQueueDepth, QUEUE_DEPTH_CEILING);
+  assert.equal(QUEUE_DEPTH_CEILING, 16);
+  // A value under the ceiling is still honored exactly.
+  assert.equal(new AccountManager(makeAccounts(1), 0.98, { maxQueueDepth: 4 }).maxQueueDepth, 4);
+});
+
 test('maxQueueDepth consistently bounds overflow and admission reservations', async () => {
   for (const depth of [0, 2, 16]) {
     const am = new AccountManager(makeAccounts(1), 0.98, 0, 1, depth);
@@ -770,6 +808,11 @@ test('a capped-but-healthy fleet reports its concurrency cap, not quota exhausti
     assert.match(body.error.message, /concurrency cap/,
       `a fleet with 90% of its quota unspent must not be called exhausted: ${body.error.message}`);
     assert.doesNotMatch(body.error.message, /exhausted/);
+    // The number has to agree with the words: a cap frees when any in-flight request
+    // finishes, so the 60s quota-window fallback would still tell the client to wait
+    // a minute for something that clears in seconds.
+    assert.equal(res.headers.get('retry-after'), '1',
+      'a capped fleet must not be given the quota-window retry-after');
   } finally {
     proxy.close();
     upstream.close();

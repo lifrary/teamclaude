@@ -6,7 +6,7 @@ import { rm } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
 import net from 'node:net';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getServerStatePath, getRekeyPath, writeServerState, readServerState, clearServerState, loadCanonicalState, saveCanonicalState, createCanonicalState, createRekeyRecord, reconcilePendingRekey, rekeyCanonicalState, saveRekeyRecord, formatServerStateFailure } from './config.js';
-import { AccountManager } from './account-manager.js';
+import { AccountManager, QUEUE_DEPTH_CEILING } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import { resolveAccounts } from './resolve-accounts.js';
@@ -162,9 +162,11 @@ async function serverCommand() {
   const maxConcurrentDefault = Number.isFinite(config.maxConcurrentPerAccount) && config.maxConcurrentPerAccount >= 1
     ? config.maxConcurrentPerAccount
     : 3;
+  // Fall back to the ceiling, not past it: a 256 here was dead code, since the
+  // AccountManager clamps to QUEUE_DEPTH_CEILING regardless.
   const overflowQueueMaxDepth = Number.isFinite(config.overflowQueueMaxDepth) && config.overflowQueueMaxDepth >= 0
     ? config.overflowQueueMaxDepth
-    : 256;
+    : QUEUE_DEPTH_CEILING;
   const accountManager = new AccountManager(accounts, threshold, {
     reevalIntervalMs,
     maxConcurrent: maxConcurrentDefault,

@@ -48,6 +48,10 @@ function emptyQuota() {
   };
 }
 const QUOTA_SOURCE_PRIORITY = Object.freeze({ migration: 1, usage: 2, response: 3 });
+// Hard ceiling on the overflow queue, independent of `overflowQueueMaxDepth`: the
+// queue is a memory bound (totalCapacity x maxRequestBytes), not a tuning dial.
+// Named because it silently overrode a configured 256 — see the constructor.
+export const QUEUE_DEPTH_CEILING = 16;
 function finiteHeaderNumber(value) {
   if (typeof value !== 'string' || value.trim() === '') return NaN;
   return Number(value);
@@ -163,7 +167,15 @@ export class AccountManager {
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     this._refreshFn = refreshFn;
     this.maxConcurrentDefault = coerceMaxConcurrent(maxConcurrent, 3);
-    this.maxQueueDepth = Number.isFinite(maxQueueDepth) && maxQueueDepth >= 0 ? Math.min(16, Math.floor(maxQueueDepth)) : 16;
+    // A configured depth above the ceiling used to be discarded in silence, so
+    // `overflowQueueMaxDepth: 256` read as accepted while the effective queue was 16.
+    // Say so once at startup rather than letting the knob lie.
+    const requestedQueueDepth = Number.isFinite(maxQueueDepth) && maxQueueDepth >= 0
+      ? Math.floor(maxQueueDepth) : QUEUE_DEPTH_CEILING;
+    this.maxQueueDepth = Math.min(QUEUE_DEPTH_CEILING, requestedQueueDepth);
+    if (requestedQueueDepth > this.maxQueueDepth) {
+      console.log(`[TeamClaude] overflowQueueMaxDepth ${requestedQueueDepth} exceeds the hard ceiling — using ${this.maxQueueDepth}`);
+    }
     this.queueTimeoutMs = Number.isFinite(queueTimeoutMs) && queueTimeoutMs >= 0 ? Math.floor(queueTimeoutMs) : 0;
     this.accounts = accounts.map((acct, index) => { const account = makeAccount(acct, index); account.maxConcurrent = coerceMaxConcurrent(acct.maxConcurrent, this.maxConcurrentDefault); return account; });
     createIdentityRegistry(this.accounts);
@@ -1220,43 +1232,57 @@ export class AccountManager {
     return best;
   }
 
-  _isAvailable(account, model = null, advisorModel = null) {
-    if (!account) return false;
+  /**
+   * WHY this account cannot serve the request right now, as a short stable slug, or
+   * null when it can. This is the single source of truth for availability —
+   * `_isAvailable` is just `=== null` on it — and `getStatus` publishes the slug as
+   * `benchedReason`, so an operator reads the server's own verdict instead of
+   * re-deriving it from the quota numbers. That re-derivation is a trap: it cannot
+   * evaluate `_routeAllows` at all (the status payload carries no `models` field),
+   * and it silently misses `disabled`, `throttled`, `pausedUntil` and the
+   * model-scoped weekly bucket, so it calls accounts usable that the server benches.
+   */
+  _unavailableReason(account, model = null, advisorModel = null) {
+    if (!account) return 'missing';
 
     // Manually disabled accounts are skipped entirely until re-enabled.
-    if (account.disabled) return false;
+    if (account.disabled) return 'disabled';
 
     // Check rate limit expiry
     if (account.status === 'throttled' && account.rateLimitedUntil) {
-      if (Date.now() < account.rateLimitedUntil) return false;
+      if (Date.now() < account.rateLimitedUntil) return 'throttled';
       account.status = 'active';
       account.rateLimitedUntil = null;
       account.throttledAt = null;
       console.log(`[TeamClaude] Account "${account.name}" rate limit expired, marking active`);
     }
 
-    if (account.status === 'exhausted' || account.status === 'error') return false;
+    if (account.status === 'exhausted' || account.status === 'error') return account.status;
     // Model-scoped: _isNearQuota checks the shared 5h bucket plus only the weekly
     // bucket that governs this model, so a spent Fable/Sonnet bucket bars just
     // that family — the account still serves every other model normally.
-    if (this._isNearQuota(account, model)) return false;
+    if (this._isNearQuota(account, model)) return 'quota';
 
     // Route/ownership restriction: a configured route can pin a model pattern to
     // an exclusive set of accounts; failing that, a per-account `models` claim
     // restricts an owned model to its owners. Either way an account not eligible
     // for this model is skipped so the request never lands somewhere it can't run.
-    if (model && !this._routeAllows(account, model)) return false;
+    if (model && !this._routeAllows(account, model)) return 'route';
 
     // An advisor request additionally needs the account to serve the ADVISOR's
     // model: its family bucket must have headroom (the shared buckets were
     // already checked above for the executor) and any route/ownership rule for
     // it must allow this account.
     if (advisorModel) {
-      if (this._modelWeeklyExhausted(account, advisorModel)) return false;
-      if (!this._routeAllows(account, advisorModel)) return false;
+      if (this._modelWeeklyExhausted(account, advisorModel)) return 'advisor-quota';
+      if (!this._routeAllows(account, advisorModel)) return 'advisor-route';
     }
 
-    return true;
+    return null;
+  }
+
+  _isAvailable(account, model = null, advisorModel = null) {
+    return this._unavailableReason(account, model, advisorModel) === null;
   }
 
   /**
@@ -2148,7 +2174,9 @@ export class AccountManager {
       switchThreshold: this.switchThreshold,
       routes: this.getRoutes(),
       sessions: { ...sessions, distribute: this.distributeSessions },
-      accounts: this.accounts.map(a => ({
+      accounts: this.accounts.map(a => {
+        const benchedReason = this._unavailableReason(a);
+        return {
         name: a.name,
         type: a.type,
         orgName: a.orgName || null,
@@ -2156,6 +2184,11 @@ export class AccountManager {
         enabled: !a.disabled,
         disabled: a.disabled || false,
         status: a.status,
+        // The server's OWN routing verdict, not a number to re-interpret. `status`
+        // is not a substitute: an account reading `active` is still benched when it
+        // is over threshold, route-excluded, or ramp-capped.
+        available: benchedReason === null,
+        benchedReason,
         sessions: sessions.perAccount[a.index] || 0,
         // Slot occupancy. `sessions` counts pinned sessions, most of them idle between
         // turns, so it cannot say whether requests are queueing behind a full account —
@@ -2173,7 +2206,8 @@ export class AccountManager {
         pausedUntil: a.pausedUntil && a.pausedUntil > Date.now()
           ? new Date(a.pausedUntil).toISOString()
           : null,
-      })),
+        };
+      }),
     };
   }
 }
