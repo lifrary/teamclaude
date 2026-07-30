@@ -900,6 +900,17 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     const retryAfter = ctx.terminalQuotaExhaustion
       ? computeRetryAfter(accountManager.getStatus().accounts, accountManager.switchThreshold)
       : RETRY_AFTER_FALLBACK_SECONDS;
+    // "No quota left anywhere" and "every account is momentarily at its concurrency
+    // cap" call for opposite responses — add accounts or wait for a reset, versus
+    // reduce concurrency — so reporting the first when it is the second sends the
+    // reader hunting quota that is in fact 90% unspent. A request that released its
+    // slot for an overload backoff and then lost the race to re-acquire it lands
+    // here, which is how the wrong label gets in front of a client. The pinned-account
+    // branch above already draws this line; draw it on the general path too.
+    const merelyCapped = !ctx.terminalQuotaExhaustion && accountManager.anyCapped(excludeForSelect, {
+      model: ctx.model,
+      advisorModel: ctx.advisorModel,
+    });
     res.writeHead(429, {
       'Content-Type': 'application/json',
       'retry-after': String(retryAfter),
@@ -908,7 +919,9 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       type: 'error',
       error: {
         type: 'rate_limit_error',
-        message: `All ${accts.length} accounts exhausted. Retry in ${retryAfter}s.`,
+        message: merelyCapped
+          ? `All ${accts.length} accounts are at their concurrency cap. Retry in ${retryAfter}s.`
+          : `All ${accts.length} accounts exhausted. Retry in ${retryAfter}s.`,
       },
     }));
     return;
@@ -1250,13 +1263,15 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         writeRequestLog(logDir, reqId, logSections);
       }
       if (res.destroyed) return;
-      // Carry a retry-after. Without one the client SDK falls back to its own backoff,
-      // which on an early attempt is ~0s ("Retrying in 0s") — so the moment we give up
-      // it re-floods the upstream we just measured as overloaded for maxOverload
-      // rounds, and each of those retries walks the whole backoff ladder again. Clamp
-      // to the backoff cap: long enough to be a real pause, short enough that an SDK
-      // which sleeps for retry-after cannot stall past its own request watchdog.
-      const overloadRetryAfter = Math.max(1, Math.ceil(backoffCap / 1000));
+      // Carry a retry-after: without one the client SDK falls back to its own backoff,
+      // which on an early attempt is ~0s ("Retrying in 0s"), so the moment we give up it
+      // re-floods an upstream we just measured as overloaded for every backoff round —
+      // and each such retry walks the whole ladder again. parseRetryAfter honors the
+      // 529's own guidance when it carries any, falls back to RETRY_AFTER_FALLBACK_SECONDS
+      // when it does not, and bounds the result at RETRY_AFTER_MAX_SECONDS — so "a client
+      // cannot sleep past its own request watchdog" is enforced by the code rather than
+      // asserted by this comment.
+      const overloadRetryAfter = parseRetryAfter(upstreamRes.headers.get('retry-after'));
       if (!res.headersSent) {
         res.writeHead(code, {
           'Content-Type': 'application/json',

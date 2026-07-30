@@ -685,9 +685,11 @@ test('a client disconnect during a stalled SSE stream releases the slot (no capa
   proxy.close();
 });
 
-test('a 5xx overload backoff holds no account slot, and an abort mid-backoff leaks none', async () => {
+test('a 5xx overload backoff holds no account slot, and an abort stops the retry', async () => {
   // Upstream always 529 → the proxy enters its backoff sleep between fleet retries.
+  let upstreamHits = 0;
   const upstream = http.createServer((_req, res) => {
+    upstreamHits++;
     res.writeHead(529, { 'content-type': 'application/json' });
     res.end('{"type":"error"}');
   });
@@ -718,15 +720,59 @@ test('a 5xx overload backoff holds no account slot, and an abort mid-backoff lea
     assert.ok(spare, 'freed capacity is usable by another request during the backoff');
     am.releaseAccount(spare);
 
-    ac.abort(); // client drops during the 1s backoff
+    // Abort mid-backoff. `p` settles client-side the instant we abort, so it proves
+    // nothing about the server — the server-side observable is that the backoff must
+    // NOT elapse and fire another upstream attempt for a client that is already gone.
+    const hitsAtAbort = upstreamHits;
+    ac.abort();
     await p;
-    await new Promise(r => setTimeout(r, 120)); // far less than the 1000ms backoff
-    assert.equal(am.accounts[0].inflight, 0, 'no capacity leak after an abort mid-backoff');
+    await new Promise(r => setTimeout(r, 1200)); // past when the 1000ms backoff would have fired
+    assert.equal(upstreamHits, hitsAtAbort, 'an aborted request must not wake up and retry upstream');
+    assert.equal(am.accounts[0].inflight, 0, 'and no capacity leaked');
   } finally {
     if (prevR === undefined) delete process.env.TEAMCLAUDE_OVERLOAD_RETRIES; else process.env.TEAMCLAUDE_OVERLOAD_RETRIES = prevR;
     if (prevB === undefined) delete process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS; else process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS = prevB;
     upstream.close();
     proxy.close();
+  }
+});
+
+// A fleet that is merely busy must not be reported as out of quota. The two states
+// call for opposite responses — reduce concurrency, versus add accounts or wait for a
+// reset — and a request that released its slot for an overload backoff and then lost
+// the race to re-acquire it lands on exactly this path, so the wrong label reaches a
+// real client. (Found by review of the backoff-release change, 2026-07-30.)
+test('a capped-but-healthy fleet reports its concurrency cap, not quota exhaustion', async () => {
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}');
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 1); // cap 1
+  measureAll(am); // quota healthy — 10% of the 5h window used
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    overflowQueueTimeoutMs: 0, // fail fast rather than queue, to reach the 429 directly
+  });
+  const port = await listen(proxy);
+
+  try {
+    const held = await am.acquireAccount(null, 0);
+    assert.ok(held, 'precondition: ordinary traffic holds the only slot');
+
+    const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', body: '{}' });
+    const body = await res.json();
+    am.releaseAccount(held);
+
+    assert.equal(res.status, 429);
+    assert.match(body.error.message, /concurrency cap/,
+      `a fleet with 90% of its quota unspent must not be called exhausted: ${body.error.message}`);
+    assert.doesNotMatch(body.error.message, /exhausted/);
+  } finally {
+    proxy.close();
+    upstream.close();
   }
 });
 
