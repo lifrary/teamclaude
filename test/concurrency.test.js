@@ -159,6 +159,33 @@ test('a waiter is not settled null when its account frees between the drain’s 
   assert.equal(am.accounts[0].inflight, 0);
 });
 
+// The other half of the drain branch: when the RETRY also fails, settling null is the
+// point — it hands the finite queue slot back instead of blocking later, satisfiable
+// requests until this waiter's own timeout. Coverage, not a regression test: this path
+// behaves the same before and after 4d1a5cd. What it guards is that the added retry
+// never turns a correct null into a hang, and never hands out an account the server has
+// stopped allowing.
+test('a waiter whose account becomes unusable is settled promptly, not left to time out', async () => {
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 1); // one account, cap 1
+  measureAll(am);
+
+  const held = await am.acquireAccount(null, 5000);
+  assert.ok(held, 'precondition: the only slot is taken');
+  const pending = am.acquireAccount(null, 5000);   // queues behind it
+  await new Promise(r => setTimeout(r, 5));
+  assert.equal(am._waiters.length, 1, 'precondition: exactly one queued waiter');
+
+  const startedAt = Date.now();
+  am.setDisabled(0, true);      // the account it was queued for is now unusable...
+  am.releaseAccount(held);      // ...and freeing the slot drives the drain
+  const got = await pending;
+  const waited = Date.now() - startedAt;
+
+  assert.equal(got, null, 'nothing can ever free for this waiter, so it must be settled');
+  assert.ok(waited < 500, `expected a prompt settle, took ${waited}ms of a 5000ms timeout`);
+  assert.equal(am.accounts[0].inflight, 0, 'and no slot was handed out on a disabled account');
+});
+
 // getStatus publishes the server's OWN routing verdict. Before this, every consumer
 // re-derived it from the quota numbers, which cannot see `disabled`, a live throttle,
 // `pausedUntil`, or a route restriction — and cannot evaluate routes at all, since the

@@ -341,6 +341,62 @@ test('temporarily exhausted fleet waits and retries instead of surfacing synthet
   }
 });
 
+// `holdMs` is the only thing that lets a request keep waiting once `retryCount` has
+// reached `maxRetries` (= accounts.length), and it also caps how long the
+// throttle-recovery sleep may be: min(throttleWait + THROTTLE_WAKE_MARGIN_MS,
+// holdRemaining). Nothing in the suite referenced holdMs at all, so both halves of that
+// expression were uncovered while a fix was being made to it. Note what this does NOT
+// pin: the 5ms margin is far below timing resolution here, so this proves the hold is
+// respected as a ceiling, not that the margin is excluded from it.
+test('holdMs extends the retry budget past maxRetries and caps the throttle wait', async () => {
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ type: 'message', role: 'assistant', content: [] }));
+  });
+  const upstreamPort = await listen(upstream);
+  const acct = () => [{ name: 'a', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 }];
+  const post = port => fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'x', messages: [] }),
+  });
+
+  // Hold longer than the throttle → the request rides the throttle out and succeeds.
+  const amLong = new AccountManager(acct(), 0.98);
+  amLong.markRateLimited(0, 0.2);
+  const proxyLong = createProxyServer(amLong, {
+    proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}`, holdMs: 3000,
+  });
+  const portLong = await listen(proxyLong);
+
+  // Hold SHORTER than the throttle → give up when the hold runs out, not 30s later.
+  const amShort = new AccountManager(acct(), 0.98);
+  amShort.markRateLimited(0, 30);
+  const proxyShort = createProxyServer(amShort, {
+    proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}`, holdMs: 150,
+  });
+  const portShort = await listen(proxyShort);
+
+  try {
+    const t1 = Date.now();
+    const rLong = await post(portLong);
+    await rLong.text();
+    assert.equal(rLong.status, 200, 'a hold longer than the throttle must let the request through');
+    assert.ok(Date.now() - t1 >= 190, 'and it must actually wait the throttle out, not fail fast');
+
+    const t2 = Date.now();
+    const rShort = await post(portShort);
+    await rShort.text();
+    const waited = Date.now() - t2;
+    assert.equal(rShort.status, 429, 'a hold shorter than the throttle must give up');
+    assert.ok(waited < 2000, `the hold, not the 30s throttle, must cap the wait: waited ${waited}ms`);
+  } finally {
+    proxyLong.close();
+    proxyShort.close();
+    upstream.close();
+  }
+});
+
 // Regression for #46: a stale/poisoned cached quota (e.g. 0.98 from before a
 // plan upgrade, with a reset still in the future) must NOT pin the proxy in a
 // permanent synthetic 429. The next request should probe upstream, succeed, and
