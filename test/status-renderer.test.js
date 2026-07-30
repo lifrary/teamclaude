@@ -90,6 +90,27 @@ test('renderStatus marks models unroutable while an account is paused', () => {
   assert.match(models, /\(paused\)/, 'and the cause must be named — `available` carries none for a pause');
 });
 
+// The cause suffix is deliberately suppressed for `quota`: the Session/Weekly/Fable
+// bars printed directly above already carry that number, and repeating it as a word
+// adds nothing. Without this test, deleting `&& cause !== 'quota'` leaves the whole
+// suite green — verified — so the suppression was a plausible "simplification" away
+// from silently regressing.
+test('renderStatus does not repeat a quota cause the bars above already show', () => {
+  const status = sampleStatus();
+  const a = status.accounts[0];
+  a.quota = {
+    unified5h: 0.99, unified5hReset: now + 3600_000,
+    unified7d: 0.20, unified7dReset: now + 86_400_000,
+    unified7dFable: 0.30, unified7dFableReset: now + 86_400_000,
+  };
+  a.available = false;
+  a.benchedReason = 'quota';
+
+  const models = renderStatus(status, { color: false, now }).split('\n').find(l => l.includes('Models'));
+  assert.doesNotMatch(models, /✓/, 'over the shared 5h bucket, nothing routes here');
+  assert.doesNotMatch(models, /\(quota\)/, `the bars above already say this: ${models}`);
+});
+
 test('renderStatus keeps the quota-only verdict when the payload predates `available`', () => {
   // An older daemon omits the field; absent must not be read as benched.
   const status = sampleStatus();
