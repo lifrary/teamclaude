@@ -1,6 +1,8 @@
 // Single owner for every background upstream-maintenance action.
 // It serializes work per account, coalesces duplicate work deterministically, and
-// takes the same AccountManager admission slot used by ordinary requests.
+// takes the same AccountManager admission slot used by ordinary requests — except for
+// a `zeroSpend` job, which prefers a slot but is not cancelled without one, because it
+// sends no /v1/messages at all. See _drain.
 export class MaintenanceCoordinator {
   constructor(accountManager, { log = console.error } = {}) {
     this.accountManager = accountManager;
