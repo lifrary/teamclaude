@@ -154,7 +154,7 @@ export class AccountManager {
       forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS,
       reevalIntervalMs = 5 * 60 * 1000,
       maxConcurrent = 3,
-      maxQueueDepth = 16,
+      maxQueueDepth = QUEUE_DEPTH_CEILING,
       queueTimeoutMs = 0,
       routes,
       stormRamp,
@@ -1237,10 +1237,13 @@ export class AccountManager {
    * null when it can. This is the single source of truth for availability —
    * `_isAvailable` is just `=== null` on it — and `getStatus` publishes the slug as
    * `benchedReason`, so an operator reads the server's own verdict instead of
-   * re-deriving it from the quota numbers. That re-derivation is a trap: it cannot
-   * evaluate `_routeAllows` at all (the status payload carries no `models` field),
-   * and it silently misses `disabled`, `throttled`, `pausedUntil` and the
-   * model-scoped weekly bucket, so it calls accounts usable that the server benches.
+   * re-deriving it from the quota numbers — a re-derivation silently misses
+   * `disabled`, `throttled` and `error`, and calls accounts usable that the server
+   * benches. Know the two limits of the published slug: `getStatus` calls this with
+   * NO model, so `route`/`advisor-*` cannot appear there (the model-scoped verdict is
+   * `routes[].accounts[].eligible`, which passes a sample model), and capacity is not
+   * checked here at all — `pausedUntil` and the storm ramp live in `_hasCapacity`, so
+   * an account can read `available: true` while admission would still refuse it.
    */
   _unavailableReason(account, model = null, advisorModel = null) {
     if (!account) return 'missing';
@@ -2184,9 +2187,10 @@ export class AccountManager {
         enabled: !a.disabled,
         disabled: a.disabled || false,
         status: a.status,
-        // The server's OWN routing verdict, not a number to re-interpret. `status`
-        // is not a substitute: an account reading `active` is still benched when it
-        // is over threshold, route-excluded, or ramp-capped.
+        // The server's OWN rotation verdict, not a number to re-interpret. `status` is
+        // not a substitute: an account reading `active` is still benched when it is
+        // over threshold. Scope: rotation eligibility WITHOUT a model — not capacity
+        // (see inflight below) and not per-model routing (see routes[].accounts[]).
         available: benchedReason === null,
         benchedReason,
         sessions: sessions.perAccount[a.index] || 0,
