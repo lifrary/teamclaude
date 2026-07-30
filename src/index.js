@@ -9,6 +9,7 @@ import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConf
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
+import { resolveAccounts } from './resolve-accounts.js';
 import { accountIdKey, createIdentityRegistry, sameIdentity, orgKey, matchAccounts } from './identity.js';
 import * as alias from './alias.js';
 import { ensureCerts } from './mitm.js';
@@ -1806,32 +1807,6 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager, { mig
 }
 
 // ── helpers ─────────────────────────────────────────────────
-
-async function resolveAccounts(config) {
-  const accounts = [];
-  for (const acct of config.accounts) {
-    if (acct.type === 'oauth') {
-      if (acct.importFrom) {
-        try {
-          const creds = await importCredentials(acct.importFrom);
-          // Carry accountUuid through so the live account can be matched UUID-first
-          // on sync (otherwise it stays null and a name change misroutes the update).
-          accounts.push({ name: acct.name, type: 'oauth', accountUuid: acct.accountUuid, orgUuid: acct.orgUuid, orgName: acct.orgName, maxConcurrent: acct.maxConcurrent, enabled: acct.enabled, priority: acct.priority, ...creds });
-          console.log(`Imported "${acct.name}" from ${acct.importFrom}`);
-        } catch (err) {
-          console.error(`Failed to import "${acct.name}": ${err.message}`);
-        }
-      } else if (acct.accessToken) {
-        accounts.push(acct);
-      } else {
-        console.error(`No token for "${acct.name}", skipping`);
-      }
-    } else if (acct.type === 'apikey' && acct.apiKey) {
-      accounts.push(acct);
-    }
-  }
-  return accounts;
-}
 
 function argValue(flag) {
   const i = args.indexOf(flag);
