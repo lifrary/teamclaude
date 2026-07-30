@@ -894,9 +894,12 @@ export class AccountManager {
         // in the first call and "no longer capped" in the second, and would settle the
         // waiter null at the exact instant its account became servable, costing the
         // client a 429 it did not earn. (Observed as a rare suite failure: a 40ms pause
-        // with a 500ms budget resolved null at 41ms.) If this retry also fails, null is
-        // the right answer — nothing is available-with-capacity and nothing is
-        // available-but-capped, so waiting cannot help.
+        // with a 500ms budget resolved null at 41ms.) If the retry also fails we settle
+        // null exactly as before — this branch deliberately does not claim more than the
+        // original did. A null `_tryAcquire` is NOT by itself proof that no account is
+        // usable (it re-checks capacity after selection, so it can decline while another
+        // account is fine); all this removes is the case where the first call was simply
+        // reading a stale clock.
         const late = this._tryAcquire(waiter.exclude, waiter.affinityKey, waiter.routingContext);
         if (late) {
           if (!this._settleWaiter(waiter, late)) { late.inFlight--; i++; }

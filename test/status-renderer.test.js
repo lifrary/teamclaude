@@ -69,6 +69,27 @@ test('renderStatus marks every model unroutable on a benched account, and names 
   assert.match(models, /\(disabled\)/, 'and it should say why, since the quota bars look fine');
 });
 
+// A rate-limit 429 pauses an account without marking it throttled, and pause lives in
+// `_hasCapacity` — which the `available` verdict does not consult. So an account whose
+// requests are all queueing behind a pause reads `available: true` and would otherwise
+// still advertise every model as routable.
+test('renderStatus marks models unroutable while an account is paused', () => {
+  const status = sampleStatus();
+  const a = status.accounts[0];
+  a.quota = {
+    unified5h: 0.10, unified5hReset: now + 3600_000,
+    unified7d: 0.20, unified7dReset: now + 86_400_000,
+    unified7dFable: 0.30, unified7dFableReset: now + 86_400_000,
+  };
+  a.available = true;                                       // the verdict says fine…
+  a.benchedReason = null;
+  a.pausedUntil = new Date(now + 30_000).toISOString();      // …but nothing can acquire
+
+  const models = renderStatus(status, { color: false, now }).split('\n').find(l => l.includes('Models'));
+  assert.doesNotMatch(models, /✓/, `a paused account must not advertise a routable model: ${models}`);
+  assert.match(models, /\(paused\)/, 'and the cause must be named — `available` carries none for a pause');
+});
+
 test('renderStatus keeps the quota-only verdict when the payload predates `available`', () => {
   // An older daemon omits the field; absent must not be read as benched.
   const status = sampleStatus();

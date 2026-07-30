@@ -80,6 +80,15 @@ const RETRY_AFTER_MAX_SECONDS = 300;
 // minute a quota window needs. Both capped-fleet 429s (pinned and general) use this,
 // so the two cannot drift apart the way their messages once did.
 const CAPPED_RETRY_AFTER_SECONDS = 1;
+// Sleep PAST a throttle deadline, never exactly to it. `setTimeout` fires on libuv's
+// cached loop clock while the availability check re-reads `Date.now()`, and a loaded
+// event loop leaves that cache behind wall time — so the sleep can return while the
+// account still reads `throttled`. With `maxRetries = accounts.length`, a one-account
+// fleet spends its entire retry budget on that single early wake and answers 429 after
+// having waited the full window. Margin is negligible against waits measured in
+// seconds. (Same class as the `_drainWaiters` pause boundary: sleep to a deadline,
+// then re-read a different clock and find it has not arrived.)
+const THROTTLE_WAKE_MARGIN_MS = 5;
 const MODEL_RESPONSE_BUCKETS = Object.freeze({
   unified7dFable: '7d_oi',
   unified7dSonnet: '7d_sonnet',
@@ -896,7 +905,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     if (holdMs > 0 && ctx.holdUntil == null) ctx.holdUntil = Date.now() + holdMs;
     const holdRemaining = ctx.holdUntil == null ? 0 : ctx.holdUntil - Date.now();
     if (Number.isFinite(waitingUntil) && (retryCount < maxRetries || holdRemaining > 0)) {
-      await sleepOrAbort(Math.min(waitingUntil - Date.now(), holdRemaining > 0 ? holdRemaining : Infinity), ctx.abortSignal);
+      await sleepOrAbort(Math.min(waitingUntil - Date.now() + THROTTLE_WAKE_MARGIN_MS, holdRemaining > 0 ? holdRemaining : Infinity), ctx.abortSignal);
       if (ctx.abortSignal?.aborted || res.destroyed) return;
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
     }

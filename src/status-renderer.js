@@ -142,7 +142,12 @@ function modelRoutingLine(account, threshold, now, paint) {
   // threshold), and without it this line rendered a green ✓ for an account the
   // server refuses outright. Strict `=== false` on purpose: an older daemon's
   // payload omits the field, and absent must mean "don't claim to know".
-  const benched = account.available === false;
+  // `pausedUntil` has to be checked separately: a rate-limit 429 pauses an account
+  // WITHOUT marking it throttled, and pause lives in `_hasCapacity`, which the
+  // `available` verdict does not consult — so without this a paused account whose
+  // requests are all queueing still advertised every model as routable.
+  const pausedTs = parseTs(account.pausedUntil);
+  const benched = account.available === false || (pausedTs != null && pausedTs > now);
 
   const cell = (label, weekly, reset) => {
     const weeklyOver = weekly != null && !Number.isNaN(t) && weekly >= t;
@@ -157,9 +162,10 @@ function modelRoutingLine(account, threshold, now, paint) {
   if (q.unified7dFable != null) cells.push(cell('Fable', q.unified7dFable, q.unified7dFableReset));
   // Name the cause when it is NOT the quota the bars above already show — three
   // unexplained ✗ on an account whose quota reads healthy is its own puzzle.
-  const why = benched && account.benchedReason && account.benchedReason !== 'quota'
-    ? paint.dim(`  (${account.benchedReason})`)
-    : '';
+  // A pause has no `benchedReason` — the verdict does not cover capacity — so name it
+  // here rather than leaving three unexplained ✗ on an account that reads active.
+  const cause = account.benchedReason || (pausedTs != null && pausedTs > now ? 'paused' : null);
+  const why = benched && cause && cause !== 'quota' ? paint.dim(`  (${cause})`) : '';
   return `${paint.dim('Models'.padEnd(8))} ${cells.join('   ')}${why}`;
 }
 
