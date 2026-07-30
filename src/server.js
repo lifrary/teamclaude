@@ -1218,17 +1218,27 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       if (!res.destroyed && ctx.overloadRetries < maxOverload) {
         const waitMs = Math.min(backoffBase * 2 ** ctx.overloadRetries, backoffCap);
         ctx.overloadRetries += 1;
-        console.log(`[TeamClaude] ${code} on every account — upstream overloaded, backing off ${waitMs}ms (retry ${ctx.overloadRetries}/${maxOverload})`);
+        // Say how many accounts actually 5xx'd, not "every account": when quota has
+        // benched the rest of the fleet the eligible set can be a single account, and
+        // "every account" then reads as a fleet-wide upstream outage — which sends the
+        // next person debugging this at api.anthropic.com instead of at the empty pool.
+        const tried = ctx.tried5xx.size;
+        console.log(`[TeamClaude] ${code} on all ${tried} eligible account(s) — upstream overloaded, backing off ${waitMs}ms (retry ${ctx.overloadRetries}/${maxOverload})`);
         if (logDir) {
-          logSections.push(`=== RESPONSE ${code} — all accounts overloaded, backoff ${waitMs}ms (retry ${ctx.overloadRetries}/${maxOverload}) ===`);
+          logSections.push(`=== RESPONSE ${code} — all ${tried} eligible account(s) overloaded, backoff ${waitMs}ms (retry ${ctx.overloadRetries}/${maxOverload}) ===`);
           writeRequestLog(logDir, reqId, logSections);
         }
-        await sleepOrAbort(waitMs, ctx.abortSignal);
-        // Client gone during the backoff → bail; the outer finally releases the
-        // slot promptly instead of holding it for the rest of the wait.
-        if (res.destroyed || ctx.abortSignal?.aborted) return;
+        // Release the slot BEFORE sleeping, not after. A backing-off request needs no
+        // upstream capacity, but the slot it holds is capacity on the one account every
+        // other request is queued behind — so each concurrent backoff removes
+        // 1/maxConcurrent of the usable fleet for the whole wait and times waiters out
+        // (overflowQueueTimeoutMs) into 429s that a free slot would have served. The
+        // next round re-acquires from the full set anyway, so nothing is lost by
+        // queueing fairly for it.
         ctx.tried5xx.clear(); // fresh round: let every account be tried again
-        releaseHeld();        // re-acquire from the full set on the next round
+        releaseHeld();
+        await sleepOrAbort(waitMs, ctx.abortSignal);
+        if (res.destroyed || ctx.abortSignal?.aborted) return; // client gone mid-backoff
         return forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
       }
 
@@ -1240,11 +1250,21 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         writeRequestLog(logDir, reqId, logSections);
       }
       if (res.destroyed) return;
+      // Carry a retry-after. Without one the client SDK falls back to its own backoff,
+      // which on an early attempt is ~0s ("Retrying in 0s") — so the moment we give up
+      // it re-floods the upstream we just measured as overloaded for maxOverload
+      // rounds, and each of those retries walks the whole backoff ladder again. Clamp
+      // to the backoff cap: long enough to be a real pause, short enough that an SDK
+      // which sleeps for retry-after cannot stall past its own request watchdog.
+      const overloadRetryAfter = Math.max(1, Math.ceil(backoffCap / 1000));
       if (!res.headersSent) {
-        res.writeHead(code, { 'Content-Type': 'application/json' });
+        res.writeHead(code, {
+          'Content-Type': 'application/json',
+          'retry-after': String(overloadRetryAfter),
+        });
         res.end(JSON.stringify({
           type: 'error',
-          error: { type: 'overloaded_error', message: `Upstream overloaded (HTTP ${code}). Retried ${ctx.overloadRetries}x.` },
+          error: { type: 'overloaded_error', message: `Upstream overloaded (HTTP ${code}). Retried ${ctx.overloadRetries}x, retry in ${overloadRetryAfter}s.` },
         }));
       }
       return;
