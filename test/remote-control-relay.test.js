@@ -124,3 +124,49 @@ test('relays a WebSocket Upgrade handshake and echoes bytes both ways', async ()
   proxy.close();
   upstream.close();
 });
+
+// The 101 detaches the upstream socket from upstreamReq, so the request's own
+// 'error' listener stops covering it — and `pipe()` never handles errors on its
+// destination. A mid-session reset therefore raised 'error' on a stream with no
+// listener, which Node escalates to an uncaught exception: one dropped upgraded
+// connection took the entire proxy down, every unrelated session with it. This
+// test surviving to its assertions IS the assertion — without the handler the
+// process dies here and the whole file goes red.
+test('an upstream reset mid-session closes the pair instead of killing the proxy', async () => {
+  const { server: upstream, port: upstreamPort } = await listen(() => {});
+  let upstreamSide = null;
+  upstream.on('upgrade', (req, socket) => {
+    upstreamSide = socket;
+    socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n');
+  });
+
+  const proxy = http.createServer();
+  proxy.on('upgrade', (req, socket, head) => relayUpgrade(req, socket, head, `http://127.0.0.1:${upstreamPort}`, null));
+  proxy.listen(0);
+  await once(proxy, 'listening');
+  const port = proxy.address().port;
+
+  const client = net.connect(port, '127.0.0.1');
+  client.on('error', () => {}); // the client legitimately sees the teardown; not what we test
+  await once(client, 'connect');
+  client.write(
+    'GET /v1/session_ingress/ws/abc HTTP/1.1\r\n' +
+    'Host: 127.0.0.1\r\n' +
+    'Upgrade: websocket\r\n' +
+    'Connection: Upgrade\r\n' +
+    '\r\n',
+  );
+  const [handshake] = await once(client, 'data');
+  assert.match(handshake.toString(), /101 Switching Protocols/);
+
+  // RST rather than a clean FIN: a FIN only produces 'end'/'close', which were
+  // already handled. ECONNRESET is the event that had no listener.
+  upstreamSide.resetAndDestroy();
+
+  await once(client, 'close');
+  assert.ok(true, 'the proxy outlived the reset');
+
+  client.destroy();
+  proxy.close();
+  upstream.close();
+});

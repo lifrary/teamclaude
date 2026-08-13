@@ -1781,6 +1781,15 @@ export function relayUpgrade(req, socket, head, upstream, sx = null, headersTime
       socket.destroy();
       agent?.destroy();
     });
+    // The 101 detaches this socket from upstreamReq, so the request's 'error'
+    // listener below no longer covers it — and `pipe()` does not handle errors on
+    // its destination either. A link that flaps mid-session then raises 'error'
+    // (ECONNRESET / EPIPE) on a stream with no listener, which Node escalates to
+    // an uncaught exception: one dropped upgraded connection would take the whole
+    // proxy down, and with it every other session it was routing. Close the pair
+    // instead; `socket.destroy()` reaches the agent through the 'close' handler
+    // just above. The client side is already covered outside this callback.
+    upstreamSocket.on('error', () => socket.destroy());
   });
   upstreamReq.once('response', () => { clearTimer(); socket.destroy(); });
   upstreamReq.on('error', () => { clearTimer(); socket.destroy(); });
