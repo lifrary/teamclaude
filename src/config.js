@@ -118,6 +118,17 @@ export function getCanonicalStatePath() {
     ? configPath.replace(/\.json$/, '.state.v2.json') : `${configPath}.state.v2.json`;
 }
 
+/**
+ * Where a fatal error is recorded before the server process exits. A sibling of
+ * the config, so it follows TEAMCLAUDE_CONFIG / XDG_CONFIG_HOME wherever they
+ * point. `.log`, not `.json`: it is appended to and holds stacks, not a document.
+ */
+export function getCrashLogPath() {
+  const configPath = getConfigPath();
+  return configPath.endsWith('.json')
+    ? configPath.replace(/\.json$/, '.crash.log') : `${configPath}.crash.log`;
+}
+
 export function getRekeyPath() {
   return `${getCanonicalStatePath()}.rekey`;
 }

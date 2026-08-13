@@ -5,7 +5,8 @@ import { createWriteStream, unlinkSync } from 'node:fs';
 import { rm } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
 import net from 'node:net';
-import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getServerStatePath, getRekeyPath, writeServerState, readServerState, clearServerState, loadCanonicalState, saveCanonicalState, createCanonicalState, createRekeyRecord, reconcilePendingRekey, rekeyCanonicalState, saveRekeyRecord, formatServerStateFailure } from './config.js';
+import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getServerStatePath, getCrashLogPath, getRekeyPath, writeServerState, readServerState, clearServerState, loadCanonicalState, saveCanonicalState, createCanonicalState, createRekeyRecord, reconcilePendingRekey, rekeyCanonicalState, saveRekeyRecord, formatServerStateFailure } from './config.js';
+import { installCrashHandlers } from './crash-log.js';
 import { AccountManager, QUEUE_DEPTH_CEILING } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
@@ -126,6 +127,12 @@ switch (command) {
 // ── server ──────────────────────────────────────────────────
 
 async function serverCommand() {
+  // First thing in the process that matters: this is the long-lived command, it
+  // runs under a TUI that repaints over anything Node prints on the way out, and
+  // a crash here takes every routed session with it. Installed before the config
+  // load so a failure in that load is recorded too.
+  installCrashHandlers(getCrashLogPath());
+
   const config = await loadOrCreateConfig();
 
   // --log-to <dir>
@@ -1579,6 +1586,7 @@ on the next launch). Disable with TEAMCLAUDE_DISABLE_AUTOUPDATE=1 or
 "autoUpdate": false in the config.
 
 Config: ${getConfigPath()}
+Crash log: ${getCrashLogPath()} (server only; written when the process dies unexpectedly)
 `);
 }
 
