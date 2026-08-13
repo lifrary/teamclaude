@@ -51,6 +51,7 @@ function createLiveRequestContext(req, body, {
     authRetried: new Set(),
     tried429: new Set(),
     tried5xx: new Set(),
+    tried403: new Set(),
     overloadRetries: 0,
     held: null,
     queueTimeoutMs,
@@ -757,6 +758,31 @@ function formatHeaders(headers) {
 // forwardRequest fails them over to another account and, when the whole fleet is
 // overloaded, retries with a bounded exponential backoff before giving up.
 const RETRYABLE_STATUS = new Set([500, 502, 503, 504, 529]);
+
+// Upstream refusal (403) cooldown ladder. Base doubles per consecutive refusal
+// round, capped at the same ceiling the 429 throttle path uses.
+export const REFUSAL_BASE_SECONDS = 60;
+export const REFUSAL_MAX_SECONDS = 300;
+
+/**
+ * How long to cool an account down after its Nth consecutive upstream refusal,
+ * and whether that cooldown may replace a hold already in place.
+ *
+ * Pure, and takes `now` rather than reading the clock, for two reasons. The
+ * "don't shorten" answer guards against a concurrent quota 429 arming a much
+ * longer retry-after on the same account between our dispatch and our response —
+ * a race no deterministic integration test can stage, so the only way to pin it
+ * is to test the decision directly. And a second clock read here would compare
+ * `existingUntil` against a different instant than the one the caller arms from.
+ *
+ * @param {number} strikes consecutive refusal rounds, 1-based
+ * @param {number|null} existingUntil epoch ms of a hold already armed, if any
+ * @param {number} now epoch ms, read once by the caller
+ */
+export function refusalCooldown(strikes, existingUntil, now) {
+  const seconds = Math.min(REFUSAL_MAX_SECONDS, REFUSAL_BASE_SECONDS * 2 ** Math.max(0, strikes - 1));
+  return { seconds, arm: !(existingUntil > now + seconds * 1000) };
+}
 // Sleep that also resolves immediately if `signal` aborts — so a client that
 // disconnects during an overload backoff doesn't keep its account slot reserved
 // for the whole (up to multi-second) wait. Cleans up its timer/listener either way.
@@ -813,11 +839,11 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   const maxRetries = accountManager.accounts.length;
   if (ctx.useSx == null) ctx.useSx = ctx.transport?.sx?.useByDefault?.() === true;
 
-  // Select account. On a failover retry (a prior account 429'd / 5xx'd for this
-  // request) ctx.tried* is non-empty → pick a different account, skipping the
+  // Select account. On a failover retry (a prior account 429'd / 5xx'd / 403'd for
+  // this request) ctx.tried* is non-empty → pick a different account, skipping the
   // ones already tried.
-  const excludeForSelect = (ctx.tried429.size || ctx.tried5xx.size)
-    ? new Set([...ctx.tried429, ...ctx.tried5xx])
+  const excludeForSelect = (ctx.tried429.size || ctx.tried5xx.size || ctx.tried403.size)
+    ? new Set([...ctx.tried429, ...ctx.tried5xx, ...ctx.tried403])
     : null;
 
   // Reserve a per-account concurrency slot. On a 401 same-account refresh-retry
@@ -934,9 +960,14 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       type: 'error',
       error: {
         type: 'rate_limit_error',
-        message: merelyCapped
-          ? `All ${accts.length} accounts are at their concurrency cap. Retry in ${retryAfter}s.`
-          : `All ${accts.length} accounts exhausted. Retry in ${retryAfter}s.`,
+        // A refusal is a third cause with its own operator response — check the
+        // subscription, not add accounts and not lower concurrency — so it does not
+        // share either string, for the same reason those two do not share one.
+        message: ctx.tried403.size
+          ? `Upstream refused ${ctx.tried403.size} of ${accts.length} accounts (${[...ctx.tried403].map(a => a.name).join(', ')}) and the rest are unavailable. Retry in ${retryAfter}s.`
+          : merelyCapped
+            ? `All ${accts.length} accounts are at their concurrency cap. Retry in ${retryAfter}s.`
+            : `All ${accts.length} accounts exhausted. Retry in ${retryAfter}s.`,
       },
     }));
     return;
@@ -1032,6 +1063,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   }
 
   try {
+    // When THIS attempt left for upstream. The 403 branch below compares it against
+    // the account's last recorded refusal to tell a fresh refusal round from the
+    // echo of one already counted — read once here, never re-read from the clock.
+    const sentAt = Date.now();
     const upstreamRes = await fetchUpstream(upstreamUrl, {
       method,
       headers,
@@ -1069,7 +1104,90 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       })
       : null;
     accountManager.updateQuota(account, rateLimitHeaders);
-    if (upstreamRes.status !== 429) accountManager.clearRateLimited(account);
+    // A non-429 is normally live proof a hold no longer binds — but a 403 is proof
+    // of the opposite: upstream is refusing this account, not serving it. Clearing
+    // here would also erase the deadline the 403 branch must not shorten, leaving it
+    // unable to tell its own 60s refusal cooldown from a much longer quota throttle
+    // a concurrent request had just armed on the same account.
+    if (upstreamRes.status !== 429 && upstreamRes.status !== 403) accountManager.clearRateLimited(account);
+
+    // 403 = upstream authenticated the credential but refuses to SERVE it — a
+    // lapsed subscription, an org that turned off Claude Code access, an edge/WAF
+    // block. Unlike a 401 there is no token to refresh, so re-authenticating cannot
+    // clear it. How long it lasts is NOT knowable from here, which is why the
+    // cooldown below re-probes instead of concluding. There was no branch at all, so a 403
+    // fell through to the pass-through response below, which hands it to the client
+    // AND leaves the account 'active' — neither throttled nor errored, so the very
+    // next request selects it again and fails the same way. One lapsed account
+    // served every request while the healthy ones sat idle.
+    //
+    // Two things this branch will not do:
+    //   - Hand the 403 to the client. The client never sees the credential we
+    //     inject, so a refusal of it is not actionable there — and the upstream
+    //     project reports (KarpelesLab#149) that Claude Code reads a 403 as its own
+    //     session dying and drops its login over it. That second half is their
+    //     observation, not ours; the first half alone already settles the choice.
+    //   - Park the account. Which upstream conditions mean "lapsed" is not knowable
+    //     from here, and every account in a fleet leaves through one egress IP, so
+    //     an IP-level block would park them one by one. Parking is one-way and
+    //     costs a human re-login; this branch only ever arms a self-expiring
+    //     cooldown. A permanently dead account then costs one wasted round-trip per
+    //     cooldown window rather than one per request, which is what the bug was.
+    if (upstreamRes.status === 403) {
+      await upstreamRes.body?.cancel();
+
+      // One clock read for the whole branch: the strike stamp, the round test and
+      // the "don't shorten" comparison must all describe the same instant.
+      const refusedAt = Date.now();
+
+      // A strike counts a refusal ROUND, not a response. This account can hold
+      // maxConcurrent requests at once and one upstream blip returns 403 to all of
+      // them; counting each would jump the cooldown to its ceiling on a single
+      // incident. A response dispatched at or before the last recorded refusal is
+      // an echo of that same round, so it re-arms the cooldown but earns no strike.
+      if (!(account._403LastAt >= sentAt)) {
+        account._403Strikes = (account._403Strikes || 0) + 1;
+        account._403LastAt = refusedAt;
+      }
+      const strikes = account._403Strikes || 0;
+      // Never SHORTEN a hold already in place — see refusalCooldown's contract.
+      const { seconds: cool, arm } = refusalCooldown(strikes, account.rateLimitedUntil, refusedAt);
+      if (arm) {
+        accountManager.markRateLimited(account, cool);
+        // Records that THIS deadline came from a refusal, so replacing the
+        // credentials can lift it without releasing a real quota throttle.
+        account._403CooldownUntil = account.rateLimitedUntil;
+      }
+      console.log(`[TeamClaude] 403 on "${account.name}" ×${strikes} — upstream refused the account, cooling down ${cool}s`);
+      if (logDir) {
+        logSections.push(`=== RESPONSE 403 — refused, strike ${strikes}, cooling down ${cool}s ===\n${formatHeaders(upstreamRes.headers)}`);
+        writeRequestLog(logDir, reqId, logSections);
+      }
+      if (res.destroyed) return;
+
+      ctx.tried403.add(account);
+      if (retryCount < maxRetries) {
+        releaseHeld(); // this account is cooling down; fail over to another
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+      }
+      // Out of retry budget with every attempt refused. Answer with a shortage the
+      // client can back off from, never the 403 itself (see above). The retry-after
+      // is THIS account's cooldown — a safe upper bound, not the exact soonest:
+      // accounts refused earlier in this request were armed earlier and so free up
+      // sooner. Waiting slightly too long is the harmless direction.
+      ctx.status = 503;
+      if (!res.headersSent) {
+        res.writeHead(503, { 'Content-Type': 'application/json', 'retry-after': String(cool) });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: {
+            type: 'upstream_refused_error',
+            message: `Upstream refused every account tried (${[...ctx.tried403].map(a => a.name).join(', ')}). Check the subscription, then re-add with: teamclaude login`,
+          },
+        }));
+      }
+      return;
+    }
 
     // 401 = auth failure (stale or revoked token). For OAuth, attempt one
     // forced token refresh and retry the same account (the token may be stale

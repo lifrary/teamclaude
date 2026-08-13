@@ -1993,6 +1993,24 @@ export class AccountManager {
     account.credential = accessToken;
     if (refreshToken) account.refreshToken = refreshToken;
     account.expiresAt = expiresAt;
+    // A cooldown armed because upstream refused the credentials being REPLACED is
+    // void the moment they change. Matched on the exact deadline so a genuine quota
+    // throttle armed by the 429 path is never lifted along with it, and written
+    // field-by-field rather than through clearRateLimited because that is guarded on
+    // status === 'throttled' — an account parked for some other reason while a
+    // refusal cooldown was still armed would keep the stale deadline and stay
+    // benched past its heal.
+    if (account._403CooldownUntil && account.rateLimitedUntil === account._403CooldownUntil) {
+      account.rateLimitedUntil = null;
+      account.throttledAt = null;
+      if (account.status === 'throttled') account.status = 'active';
+    }
+    delete account._403CooldownUntil;
+    // The refusal run describes the credentials just replaced. Keeping it would
+    // leave a freshly re-authenticated account one refusal short of a
+    // ceiling-length cooldown it has not earned.
+    delete account._403Strikes;
+    delete account._403LastAt;
     // New externally-supplied credentials are a verified heal for ANY error
     // cause (unlike the sweep's refresh-success, which only heals refresh-caused
     // errors) — the auth material actually changed.
@@ -2222,6 +2240,11 @@ export class AccountManager {
         // inflight still reads below this number.
         inflight: a.inflight,
         maxConcurrent: a.maxConcurrent,
+        // Consecutive upstream refusals (403). A refused account is cooled down, so
+        // it reads `throttled` exactly like a quota hold — but the two call for
+        // opposite responses (check the subscription vs wait for a reset), and this
+        // is the only field that separates them.
+        refusals: a._403Strikes || 0,
         quota: { ...a.quota, modelWeekly: Object.fromEntries(Object.entries(a.quota.modelWeekly || {}).map(([key, value]) => [key, { ...value }])) },
         usage: { ...a.usage },
         rateLimitedUntil: a.rateLimitedUntil
