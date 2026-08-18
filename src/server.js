@@ -35,6 +35,7 @@ function createLiveRequestContext(req, body, {
   affinityKey = null,
   pinnedAccount = null,
   transport = null,
+  overloadFallbackModel = null,
 } = {}) {
   const sanitizedBody = sanitizeToolPairs(body, req.url, req.headers['content-type']);
   const sessionHeader = req.headers['x-claude-code-session-id'];
@@ -60,6 +61,8 @@ function createLiveRequestContext(req, body, {
     sawModelWeekly: false,
     pinnedAccount,
     transport,
+    overloadFallbackModel: resolveOverloadFallbackModel(model, overloadFallbackModel),
+    overloadFallbackAttempted: false,
     holdUntil: null,
     sessionRecorded: false,
   };
@@ -136,6 +139,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
   const upstream = config.upstream || 'https://api.anthropic.com';
   const proxyApiKey = config.proxy?.apiKey;
   const logDir = config.logDir || null;
+  const overloadFallbackModel = config.overloadFallbackModel || null;
   // How long a request may wait for a per-account concurrency slot to free when
   // every available account is at its cap, before giving up with a 429. 0 = never
   // queue (fail fast). Default 15s.
@@ -543,6 +547,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
             affinityKey: sessionAffinity ? req.socket : null,
             transport,
             pinnedAccount,
+            overloadFallbackModel,
           });
           const shapeContext = { model: ctx.model, advisorModel: ctx.advisorModel, pinnedAccount: ctx.pinnedAccount };
           if (!accountManager.transferAdmissionReservation(admissionReservation, admissionShape(req, ctx), shapeContext)) {
@@ -1036,7 +1041,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 
   const upstreamUrl = `${account.upstream || upstream}${req.url}`;
   const method = req.method;
-  const outboundBody = rewriteModel(patchAccountUuid(body, account.accountUuid), account.modelMap);
+  let outboundBody = patchAccountUuid(body, account.accountUuid);
+  outboundBody = ctx.overloadFallbackAttempted
+    ? setRequestModel(outboundBody, ctx.overloadFallbackModel)
+    : rewriteModel(outboundBody, account.modelMap);
   if (outboundBody !== body) headers['content-length'] = String(outboundBody.length);
 
   // Build log sections
@@ -1348,6 +1356,15 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       // Preserve a longer upstream deadline, but reject its common 1-second hint:
       // it is too short once many clients are already retrying the same model.
       if (code === 529) {
+        if (ctx.overloadFallbackModel && !ctx.overloadFallbackAttempted && !res.destroyed) {
+          ctx.overloadFallbackAttempted = true;
+          console.log(`[TeamClaude] 529 on "${account.name}" for "${ctx.model}" — retrying once as "${ctx.overloadFallbackModel}"`);
+          if (logDir) {
+            logSections.push(`=== RESPONSE 529 — retrying once with fallback model ${ctx.overloadFallbackModel} ===\n${formatHeaders(upstreamRes.headers)}`);
+            writeRequestLog(logDir, reqId, logSections);
+          }
+          return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+        }
         const retryAfter = Math.max(
           OVERLOAD_RETRY_AFTER_MIN_SECONDS,
           parseRetryAfter(upstreamRes.headers.get('retry-after')),
@@ -1720,6 +1737,26 @@ export function rewriteModel(body, modelMap) {
   } catch {
     return body;
   }
+}
+
+export function setRequestModel(body, model) {
+  if (!model) return body;
+  try {
+    const parsed = JSON.parse(body.toString('utf8'));
+    if (!parsed.model || parsed.model === model) return body;
+    return Buffer.from(JSON.stringify({ ...parsed, model }));
+  } catch {
+    return body;
+  }
+}
+
+export function resolveOverloadFallbackModel(requestedModel, configuredModel) {
+  if (typeof requestedModel !== 'string' || !requestedModel.toLowerCase().includes('opus')) return null;
+  if (typeof configuredModel !== 'string' || !configuredModel.trim()) return null;
+  const fallback = configuredModel.trim();
+  return requestedModel.endsWith('[1m]') && !fallback.endsWith('[1m]')
+    ? `${fallback}[1m]`
+    : fallback;
 }
 
 const DEFAULT_BODY_IDLE_TIMEOUT_MS = 120_000;

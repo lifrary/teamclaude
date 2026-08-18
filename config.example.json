@@ -4,6 +4,7 @@
     "apiKey": "tc-change-me-to-a-secret"
   },
   "upstream": "https://api.anthropic.com",
+  "overloadFallbackModel": null,
   "switchThreshold": 0.98,
   "maxConcurrentPerAccount": 3,
   "sessionAffinity": true,
