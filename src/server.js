@@ -36,6 +36,7 @@ function createLiveRequestContext(req, body, {
   pinnedAccount = null,
   transport = null,
   overloadFallbackModel = null,
+  transientRetries = 1,
 } = {}) {
   const sanitizedBody = sanitizeToolPairs(body, req.url, req.headers['content-type']);
   const sessionHeader = req.headers['x-claude-code-session-id'];
@@ -63,6 +64,8 @@ function createLiveRequestContext(req, body, {
     transport,
     overloadFallbackModel: resolveOverloadFallbackModel(model, overloadFallbackModel),
     overloadFallbackAttempted: false,
+    transientRetries: 0,
+    maxTransientRetries: Math.max(0, transientRetries),
     holdUntil: null,
     sessionRecorded: false,
   };
@@ -140,6 +143,9 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
   const proxyApiKey = config.proxy?.apiKey;
   const logDir = config.logDir || null;
   const overloadFallbackModel = config.overloadFallbackModel || null;
+  const transientRetries = Number.isFinite(config.transientRetries)
+    ? Math.max(0, Math.floor(config.transientRetries))
+    : 1;
   // How long a request may wait for a per-account concurrency slot to free when
   // every available account is at its cap, before giving up with a 429. 0 = never
   // queue (fail fast). Default 15s.
@@ -548,6 +554,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
             transport,
             pinnedAccount,
             overloadFallbackModel,
+            transientRetries,
           });
           const shapeContext = { model: ctx.model, advisorModel: ctx.advisorModel, pinnedAccount: ctx.pinnedAccount };
           if (!accountManager.transferAdmissionReservation(admissionReservation, admissionShape(req, ctx), shapeContext)) {
@@ -1549,9 +1556,36 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
     }
 
-    // Other transient network errors: just close the connection and let the client retry
+    // Retry a pre-headers transport reset inside the proxy. The request body is
+    // already buffered and no response reached the client, so replay is safe.
+    // Closing the client socket here used to make Claude Code print
+    // "Connection dropped (ECONNRESET)" and immediately start its own retry
+    // ladder, multiplying a single stale pooled socket into repeated turns.
+    if (isTransient && !res.headersSent && ctx.transientRetries < ctx.maxTransientRetries) {
+      ctx.transientRetries += 1;
+      console.log(`[TeamClaude] transient upstream error on "${account.name}" (${err.code || err.message}) — retrying internally (${ctx.transientRetries}/${ctx.maxTransientRetries})`);
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir);
+    }
+
+    // If an Opus transport retry also failed, make one configured model fallback
+    // before giving the client an error. This stays on the same account and is
+    // bounded by overloadFallbackAttempted.
+    if (isTransient && !res.headersSent && ctx.overloadFallbackModel
+        && !ctx.overloadFallbackAttempted) {
+      ctx.overloadFallbackAttempted = true;
+      console.log(`[TeamClaude] persistent transient error on "${account.name}" for "${ctx.model}" — retrying once as "${ctx.overloadFallbackModel}"`);
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir);
+    }
+
+    // Never turn an upstream reset into a downstream reset. A structured 503
+    // carries an actual backoff deadline and preserves the diagnostic.
     if (isTransient) {
-      res.destroy();
+      ctx.status = 503;
+      res.writeHead(503, { 'Content-Type': 'application/json', 'retry-after': '5' });
+      res.end(JSON.stringify({
+        type: 'error',
+        error: { type: 'overloaded_error', message: `Upstream connection failed after ${ctx.transientRetries} internal retry attempt(s). Retry in 5s.` },
+      }));
       return;
     }
 

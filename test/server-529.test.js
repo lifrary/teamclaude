@@ -184,3 +184,77 @@ test('configured Opus fallback also recovers a pre-headers timeout', async () =>
   }
 });
 
+test('ECONNRESET is retried internally instead of dropping the client connection', async () => {
+  let attempts = 0;
+  const am = new AccountManager([
+    { name: 'a', type: 'oauth', accessToken: 'tok-a', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+  ], 0.98);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: 'https://unused.example',
+    activeWarmup: false,
+  }, {
+    fetch: async () => {
+      attempts++;
+      if (attempts === 1) {
+        const error = new Error('fetch failed');
+        error.code = 'ECONNRESET';
+        throw error;
+      }
+      return new globalThis.Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-opus-5', messages: [] }),
+    });
+    await res.text();
+    assert.equal(res.status, 200);
+    assert.equal(attempts, 2);
+  } finally {
+    proxy.close();
+  }
+});
+
+test('persistent ECONNRESET becomes a structured 503, never a downstream reset', async () => {
+  let attempts = 0;
+  const am = new AccountManager([
+    { name: 'a', type: 'oauth', accessToken: 'tok-a', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+  ], 0.98);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: 'https://unused.example',
+    activeWarmup: false,
+  }, {
+    fetch: async () => {
+      attempts++;
+      const error = new Error('fetch failed');
+      error.code = 'ECONNRESET';
+      throw error;
+    },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-sonnet-5', messages: [] }),
+    });
+    const body = await res.json();
+    assert.equal(res.status, 503);
+    assert.equal(res.headers.get('retry-after'), '5');
+    assert.equal(attempts, 2);
+    assert.match(body.error.message, /1 internal retry/);
+  } finally {
+    proxy.close();
+  }
+});
+

@@ -344,6 +344,7 @@ When on, teamclaude routes each **new** session to the least-loaded eligible acc
   },
   "upstream": "https://api.anthropic.com",
   "overloadFallbackModel": null,
+  "transientRetries": 1,
   "switchThreshold": 0.98,
   "sx": { "apiKey": "your-sx-org-api-key", "mode": "always" },
   "accounts": [
@@ -370,6 +371,7 @@ When on, teamclaude routes each **new** session to the least-loaded eligible acc
 | `proxy.apiKey` | API key clients use to authenticate with the proxy (required for any non-loopback client; the proxy injects real account tokens, so an unauthenticated open port would leak them) |
 | `upstream` | Upstream API base URL |
 | `overloadFallbackModel` | Optional model used for one same-account retry when an Opus request receives HTTP 529 or times out before response headers. A `[1m]` request keeps its long-context suffix. `null` (default) passes 529 through without account fan-out |
+| `transientRetries` | Number of safe in-proxy retries for a connection failure before any configured model fallback (`1` by default). Persistent failures become a structured 503 with `retry-after`, never a downstream `ECONNRESET` |
 | `switchThreshold` | Quota utilization (0–1) at which to switch accounts (TUI: `g` → `t`) |
 | `quotaProbeSeconds` | Background quota-probe interval in seconds (`0` = off, the default; CLI `probe` or TUI `g` → `p`) |
 | `warmupSeconds` | Keep-warm interval in seconds (`0` = off, the default; CLI `warmup`). Spawns a minimal `claude` per idle account to start its 5h timer — **spends a little quota**, unlike the probe |
