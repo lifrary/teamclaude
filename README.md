@@ -369,7 +369,7 @@ When on, teamclaude routes each **new** session to the least-loaded eligible acc
 | `proxy.host` | Interface to bind. Defaults to `127.0.0.1` (localhost only). Set to `0.0.0.0` (or override with env `TEAMCLAUDE_HOST`) to accept off-box clients — in which case **set `proxy.apiKey`**, since remote clients must present it (via `x-api-key`, or `Proxy-Authorization` for CONNECT/HTTPS-proxy usage); loopback is always exempt |
 | `proxy.apiKey` | API key clients use to authenticate with the proxy (required for any non-loopback client; the proxy injects real account tokens, so an unauthenticated open port would leak them) |
 | `upstream` | Upstream API base URL |
-| `overloadFallbackModel` | Optional model used for one same-account retry when an Opus request receives HTTP 529. A `[1m]` request keeps its long-context suffix. `null` (default) passes 529 through without account fan-out |
+| `overloadFallbackModel` | Optional model used for one same-account retry when an Opus request receives HTTP 529 or times out before response headers. A `[1m]` request keeps its long-context suffix. `null` (default) passes 529 through without account fan-out |
 | `switchThreshold` | Quota utilization (0–1) at which to switch accounts (TUI: `g` → `t`) |
 | `quotaProbeSeconds` | Background quota-probe interval in seconds (`0` = off, the default; CLI `probe` or TUI `g` → `p`) |
 | `warmupSeconds` | Keep-warm interval in seconds (`0` = off, the default; CLI `warmup`). Spawns a minimal `claude` per idle account to start its 5h timer — **spends a little quota**, unlike the probe |
@@ -569,7 +569,7 @@ TLS is established **end-to-end with `api.anthropic.com` over the tunnel**, so t
    - **Model-family quota exhaustion** → fails over only that matching request; the account remains available for every other model family.
    - **Rate/concurrency or transient 429** → pauses the same account for `retry-after` so new requests wait rather than rotate. The proxy retries the same account inline for waits of 15 seconds or less; longer waits are returned as 429 with `retry-after`.
 7. Transient network errors (connection reset, timeout) drop the connection so the client can retry
-8. An HTTP 529 is model-capacity overload, not account health, so it is never fanned out across accounts. When `overloadFallbackModel` is configured, an Opus request is retried once on the same account with that model; otherwise 529 is returned with a bounded retry deadline.
+8. An HTTP 529 is model-capacity overload, not account health, so it is never fanned out across accounts. When `overloadFallbackModel` is configured, an Opus request that receives 529 or times out before response headers is retried once on the same account with that model; otherwise 529 is returned with a bounded retry deadline.
 9. If all accounts are exhausted, returns 429 with the soonest reset time — or, with `holdSeconds` set, holds the connection open and retries silently until an account recovers
 10. Quota state and the warm-up probe template are persisted to `<config>.state.v2.json` and restored on startup; stale windows are discarded and the first accepted request replaces the restored template.
 11. Client token refresh requests (`/v1/oauth/token`) are relayed to upstream untouched — the proxy and client manage their own token lifecycles independently

@@ -143,3 +143,44 @@ test('configured Opus fallback retries once as Sonnet on the same account', asyn
   }
 });
 
+test('configured Opus fallback also recovers a pre-headers timeout', async () => {
+  const models = [];
+  const am = new AccountManager([
+    { name: 'a', type: 'oauth', accessToken: 'tok-a', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+  ], 0.98);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: 'https://unused.example',
+    activeWarmup: false,
+    overloadFallbackModel: 'claude-sonnet-5',
+  }, {
+    fetch: async (_url, options) => {
+      const model = JSON.parse(options.body.toString()).model;
+      models.push(model);
+      if (models.length === 1) {
+        const error = new Error('upstream response headers timed out after 10ms');
+        error.code = 'TEAMCLAUDE_HEADERS_TIMEOUT';
+        throw error;
+      }
+      return new globalThis.Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-opus-5', messages: [] }),
+    });
+    await res.text();
+    assert.equal(res.status, 200);
+    assert.deepEqual(models, ['claude-opus-5', 'claude-sonnet-5']);
+  } finally {
+    proxy.close();
+  }
+});
+

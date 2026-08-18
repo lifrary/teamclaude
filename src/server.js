@@ -1537,7 +1537,19 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         err.code === 'UND_ERR_HEADERS_TIMEOUT' || err.code === 'UND_ERR_BODY_TIMEOUT' ||
         err.code === 'TEAMCLAUDE_HEADERS_TIMEOUT' || err.code === 'TEAMCLAUDE_BODY_TIMEOUT');
 
-    // Transient network errors: just close the connection and let the client retry
+    // A pre-headers timeout on an Opus request is indistinguishable to the client
+    // from the capacity incident that commonly precedes it. When an explicit
+    // overload fallback is configured, use the same single same-account fallback
+    // as a 529 instead of making Claude Code wait through another outer retry.
+    if (isTransient && err.code === 'TEAMCLAUDE_HEADERS_TIMEOUT'
+        && ctx.overloadFallbackModel && !ctx.overloadFallbackAttempted
+        && !res.headersSent) {
+      ctx.overloadFallbackAttempted = true;
+      console.log(`[TeamClaude] headers timeout on "${account.name}" for "${ctx.model}" — retrying once as "${ctx.overloadFallbackModel}"`);
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+    }
+
+    // Other transient network errors: just close the connection and let the client retry
     if (isTransient) {
       res.destroy();
       return;
