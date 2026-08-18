@@ -751,13 +751,13 @@ function formatHeaders(headers) {
   return Object.entries(headers).map(([k, v]) => `  ${k}: ${v}`).join('\n');
 }
 
-// Upstream statuses that are transient and safe to retry instead of surfacing to
-// the client. 529 = "Overloaded" (Anthropic at capacity); 500/502/503/504 =
-// gateway / availability blips. Passing these straight through fails the client's
-// turn — e.g. Claude Code prints "API Error: 529 Overloaded" and stops — so
-// forwardRequest fails them over to another account and, when the whole fleet is
-// overloaded, retries with a bounded exponential backoff before giving up.
+// Upstream statuses that are transient and safe to retry. 500/502/503/504 may
+// differ by account or edge, so they use the fleet failover below. 529 is
+// different: it is Anthropic model capacity, not account health, and Claude Code
+// already retries it. Fan-out plus proxy retries plus client retries multiplies
+// one turn into hundreds of identical upstream calls and prolongs the incident.
 const RETRYABLE_STATUS = new Set([500, 502, 503, 504, 529]);
+const OVERLOAD_RETRY_AFTER_MIN_SECONDS = 10;
 
 // Upstream refusal (403) cooldown ladder. Base doubles per consecutive refusal
 // round, capped at the same ceiling the 429 throttle path uses.
@@ -1340,6 +1340,36 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     if (RETRYABLE_STATUS.has(upstreamRes.status)) {
       const code = upstreamRes.status;
       await upstreamRes.body?.cancel();
+
+      // A 529 is global model capacity, not an account-specific failure. Do not
+      // fan it out across accounts and do not nest an internal retry ladder under
+      // Claude Code's own retry ladder. A live incident showed one 120-second
+      // client turn producing 118 upstream calls through that multiplication.
+      // Preserve a longer upstream deadline, but reject its common 1-second hint:
+      // it is too short once many clients are already retrying the same model.
+      if (code === 529) {
+        const retryAfter = Math.max(
+          OVERLOAD_RETRY_AFTER_MIN_SECONDS,
+          parseRetryAfter(upstreamRes.headers.get('retry-after')),
+        );
+        console.log(`[TeamClaude] 529 on "${account.name}" — model capacity overloaded, passing through with ${retryAfter}s retry-after`);
+        ctx.status = code;
+        if (logDir) {
+          logSections.push(`=== RESPONSE 529 — model capacity overloaded, no account fan-out, retry after ${retryAfter}s ===\n${formatHeaders(upstreamRes.headers)}`);
+          writeRequestLog(logDir, reqId, logSections);
+        }
+        if (!res.destroyed && !res.headersSent) {
+          res.writeHead(code, {
+            'Content-Type': 'application/json',
+            'retry-after': String(retryAfter),
+          });
+          res.end(JSON.stringify({
+            type: 'error',
+            error: { type: 'overloaded_error', message: `Upstream overloaded (HTTP 529). Retry in ${retryAfter}s.` },
+          }));
+        }
+        return;
+      }
 
       const maxOverload = Math.max(0, envInt('TEAMCLAUDE_OVERLOAD_RETRIES', 6));
       const backoffBase = Math.max(50, envInt('TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS', 1000));

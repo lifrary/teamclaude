@@ -788,11 +788,11 @@ test('a client disconnect during a stalled SSE stream releases the slot (no capa
 });
 
 test('a 5xx overload backoff holds no account slot, and an abort stops the retry', async () => {
-  // Upstream always 529 → the proxy enters its backoff sleep between fleet retries.
+  // Upstream always 503 → the proxy enters its backoff sleep between fleet retries.
   let upstreamHits = 0;
   const upstream = http.createServer((_req, res) => {
     upstreamHits++;
-    res.writeHead(529, { 'content-type': 'application/json' });
+    res.writeHead(503, { 'content-type': 'application/json' });
     res.end('{"type":"error"}');
   });
   const upstreamPort = await listen(upstream);
@@ -811,7 +811,7 @@ test('a 5xx overload backoff holds no account slot, and an abort stops the retry
     const ac = new AbortController();
     const p = fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', body: '{}', signal: ac.signal })
       .catch(() => 'aborted');
-    await new Promise(r => setTimeout(r, 120)); // request has 529'd and is now in backoff sleep
+    await new Promise(r => setTimeout(r, 120)); // request has 503'd and is now in backoff sleep
     // The slot is released BEFORE the backoff sleep, not after it. This assertion
     // used to read inflight===1 — merely a scaffold confirming the request had
     // reached the backoff, but it pinned the slot-squatting that starved a
@@ -884,18 +884,18 @@ test('a capped-but-healthy fleet reports its concurrency cap, not quota exhausti
 });
 
 // Regression, 2026-07-30 incident: with the fleet benched down to ONE usable
-// account, a request sleeping in 529 overload backoff kept its concurrency slot for
+// account, a request sleeping in 5xx overload backoff kept its concurrency slot for
 // the whole wait. On a cap-1 account that is 100% of fleet capacity, so every other
 // request queued behind it and timed out into "All N accounts exhausted" 429s — the
 // proxy manufacturing its own outage on top of a brief upstream blip. Here the
 // backoff (1500ms) deliberately outlasts the queue timeout (400ms): if the slot were
 // held, the second request could only 429.
-test('a request in 529 overload backoff frees capacity for a concurrent request', async () => {
+test('a request in 5xx overload backoff frees capacity for a concurrent request', async () => {
   let hits = 0;
   const upstream = http.createServer((_req, res) => {
     hits++;
     if (hits === 1) { // only the first attempt is overloaded
-      res.writeHead(529, { 'content-type': 'application/json' });
+      res.writeHead(503, { 'content-type': 'application/json' });
       res.end('{"type":"error"}');
       return;
     }
@@ -919,7 +919,7 @@ test('a request in 529 overload backoff frees capacity for a concurrent request'
   process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS = '1500';
   try {
     const first = fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', body: '{}' });
-    await new Promise(r => setTimeout(r, 150)); // first request has 529'd → now in backoff
+    await new Promise(r => setTimeout(r, 150)); // first request has 503'd → now in backoff
     const second = await fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', body: '{}' });
     await second.text();
     assert.equal(second.status, 200, 'a concurrent request must be served while the other backs off');
