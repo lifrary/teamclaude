@@ -30,11 +30,24 @@ const CONNECTION_SPECIFIC_HEADERS = new Set([
 // transport fault reached the operator as the same three words and err.code
 // checks never matched. Flatten the chain so both the log and the classifier
 // see the actual cause.
-function describeErrorChain(err) {
+// Node's happy-eyeballs dialer (autoSelectFamily, on by default) reports a
+// connect where EVERY address failed as an AggregateError whose own message is
+// EMPTY — the per-address reasons sit in `.errors`. api.anthropic.com is
+// multi-address (measured: an A and an AAAA record), so this is reachable here,
+// and walking only the cause chain prints the useless "AggregateError: " with
+// nothing after it. Expanding `.errors` is upstream's describeConnectError
+// (KarpelesLab 44477b1); the per-link name/code that the chain adds is ours and
+// is what makes a log line say which fault class it was. Keep both: the chain
+// gives the shape, the expansion gives the reasons.
+export function describeErrorChain(err) {
   const parts = [];
   let e = err, depth = 0;
   while (e && depth++ < 5) {
-    parts.push(`${e.name || 'Error'}: ${e.message}${e.code ? ` (code=${e.code})` : ''}`);
+    const reasons = Array.isArray(e.errors)
+      ? e.errors.map(c => c?.message).filter(Boolean).join('; ')
+      : '';
+    const detail = e.message || reasons;
+    parts.push(`${e.name || 'Error'}: ${detail}${reasons && e.message ? ` [${reasons}]` : ''}${e.code ? ` (code=${e.code})` : ''}`);
     e = e.cause;
   }
   return parts.join(' <- ');
