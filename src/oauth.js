@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { randomBytes, createHash } from 'node:crypto';
-import { exec } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import http from 'node:http';
 
@@ -444,10 +444,16 @@ function startCallbackServer(expectedState) {
   });
 }
 
+export function getBrowserLaunchSpec(url, platform = process.platform) {
+  if (platform === 'darwin') return { command: 'open', args: [url] };
+  if (platform === 'win32') {
+    // Avoid cmd.exe entirely: it reparses OAuth query delimiters such as `&`.
+    return { command: 'rundll32.exe', args: ['url.dll,FileProtocolHandler', url] };
+  }
+  return { command: 'xdg-open', args: [url] };
+}
+
 function openBrowser(url) {
-  const platform = process.platform;
-  const cmd = platform === 'darwin' ? 'open'
-    : platform === 'win32' ? 'start'
-    : 'xdg-open';
-  exec(`${cmd} ${JSON.stringify(url)}`, () => {});
+  const { command, args } = getBrowserLaunchSpec(url);
+  execFile(command, args, () => {});
 }

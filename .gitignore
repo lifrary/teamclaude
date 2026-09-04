@@ -3,3 +3,4 @@ config.json
 *.log
 package-lock.json
 .claude-sessions/
+.DS_Store
