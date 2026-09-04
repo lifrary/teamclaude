@@ -24,6 +24,31 @@ const CONNECTION_SPECIFIC_HEADERS = new Set([
 ]);
 
 
+// undici wraps every transport failure as a bare TypeError("fetch failed") and
+// puts the real reason (ECONNRESET, socket hang up, TLS, DNS) on err.cause. The
+// handler below classified and logged only err.message, so every distinct
+// transport fault reached the operator as the same three words and err.code
+// checks never matched. Flatten the chain so both the log and the classifier
+// see the actual cause.
+function describeErrorChain(err) {
+  const parts = [];
+  let e = err, depth = 0;
+  while (e && depth++ < 5) {
+    parts.push(`${e.name || 'Error'}: ${e.message}${e.code ? ` (code=${e.code})` : ''}`);
+    e = e.cause;
+  }
+  return parts.join(' <- ');
+}
+
+function rootErrorCode(err) {
+  let e = err, depth = 0;
+  while (e && depth++ < 5) {
+    if (e.code) return e.code;
+    e = e.cause;
+  }
+  return undefined;
+}
+
 function admissionShape(req, ctx) {
   const route = (req.url || '').split('?')[0];
   const pin = ctx.pinnedAccount?.accountIdKey || null;
@@ -1052,7 +1077,25 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   outboundBody = ctx.overloadFallbackAttempted
     ? setRequestModel(outboundBody, ctx.overloadFallbackModel)
     : rewriteModel(outboundBody, account.modelMap);
-  if (outboundBody !== body) headers['content-length'] = String(outboundBody.length);
+  // The forwarded content-length MUST describe the bytes this proxy actually
+  // sends, not the bytes the client sent us. undici enforces that and aborts a
+  // disagreeing request with UND_ERR_REQ_CONTENT_LENGTH_MISMATCH, surfaced to the
+  // operator as a bare TypeError("fetch failed") and to Claude Code as a 503 —
+  // per-request and seemingly random, since only some turns carry a body whose
+  // length the client's own header disagrees with. The proxy buffers the whole
+  // body, so it always knows the true length: derive the header unconditionally.
+  // The old form updated it only when a rewrite changed the buffer, leaving a
+  // stale client-supplied length in place on every other request.
+  const bodylessMethod = ['GET', 'HEAD'].includes(method);
+  const inboundContentLength = headers['content-length'];
+  if (bodylessMethod) {
+    delete headers['content-length'];
+  } else {
+    headers['content-length'] = String(outboundBody.length);
+    if (inboundContentLength != null && String(inboundContentLength) !== headers['content-length']) {
+      console.log(`[TeamClaude] content-length corrected ${inboundContentLength} -> ${outboundBody.length} (account "${account.name}")`);
+    }
+  }
 
   // Build log sections
   const logSections = [];
@@ -1530,25 +1573,26 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       return;
     }
 
-    console.error(`[TeamClaude] Upstream error (account "${account.name}"):`, err.message);
+    console.error(`[TeamClaude] Upstream error (account "${account.name}"):`, describeErrorChain(err));
 
     if (logDir) {
       logSections.push(`=== ERROR ===\n${err.stack || err.message}`);
       writeRequestLog(logDir, reqId, logSections);
     }
 
+    const errCode = rootErrorCode(err);
     const isTransient = err instanceof Error &&
       (err.message.includes('fetch failed') ||
-        err.code === 'ECONNRESET' || err.code === 'ECONNREFUSED' ||
-        err.code === 'ETIMEDOUT' || err.code === 'UND_ERR_CONNECT_TIMEOUT' ||
-        err.code === 'UND_ERR_HEADERS_TIMEOUT' || err.code === 'UND_ERR_BODY_TIMEOUT' ||
-        err.code === 'TEAMCLAUDE_HEADERS_TIMEOUT' || err.code === 'TEAMCLAUDE_BODY_TIMEOUT');
+        errCode === 'ECONNRESET' || errCode === 'ECONNREFUSED' ||
+        errCode === 'ETIMEDOUT' || errCode === 'UND_ERR_CONNECT_TIMEOUT' ||
+        errCode === 'UND_ERR_HEADERS_TIMEOUT' || errCode === 'UND_ERR_BODY_TIMEOUT' ||
+        errCode === 'TEAMCLAUDE_HEADERS_TIMEOUT' || errCode === 'TEAMCLAUDE_BODY_TIMEOUT');
 
     // A pre-headers timeout on an Opus request is indistinguishable to the client
     // from the capacity incident that commonly precedes it. When an explicit
     // overload fallback is configured, use the same single same-account fallback
     // as a 529 instead of making Claude Code wait through another outer retry.
-    if (isTransient && err.code === 'TEAMCLAUDE_HEADERS_TIMEOUT'
+    if (isTransient && errCode === 'TEAMCLAUDE_HEADERS_TIMEOUT'
         && ctx.overloadFallbackModel && !ctx.overloadFallbackAttempted
         && !res.headersSent) {
       ctx.overloadFallbackAttempted = true;
@@ -1563,7 +1607,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     // ladder, multiplying a single stale pooled socket into repeated turns.
     if (isTransient && !res.headersSent && ctx.transientRetries < ctx.maxTransientRetries) {
       ctx.transientRetries += 1;
-      console.log(`[TeamClaude] transient upstream error on "${account.name}" (${err.code || err.message}) — retrying internally (${ctx.transientRetries}/${ctx.maxTransientRetries})`);
+      console.log(`[TeamClaude] transient upstream error on "${account.name}" (${errCode || err.message}) — retrying internally (${ctx.transientRetries}/${ctx.maxTransientRetries})`);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir);
     }
 
