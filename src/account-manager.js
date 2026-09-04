@@ -1767,6 +1767,10 @@ export class AccountManager {
     if (!disabled && account.status === 'error') {
       account.status = 'active';
       account.rateLimitedUntil = null;
+      // Operator escape hatch: re-enabling is an explicit "try this again", so
+      // drop the dead-token guard too — otherwise the account would come back
+      // active but never attempt a refresh (see ensureTokenFresh).
+      account._deadRefreshToken = null;
       console.log(`[TeamClaude] Account "${account.name}" re-enabled — clearing error state`);
     }
   }
@@ -1840,6 +1844,25 @@ export class AccountManager {
     const account = this._resolveLive(accountOrIndex);
     if (!account || account.type !== 'oauth' || !account.refreshToken) return { ok: true };
 
+    // Dead-token guard (adopted from upstream be9cb8d): a refresh token upstream
+    // already rejected with invalid_grant is rejected every time, so re-sending
+    // it only floods the OAuth endpoint. Marking the account 'error' does NOT
+    // stop it, because the warmer and prober pin an account by name and skip
+    // _isAvailable. Observed here on 2026-09-04 as a rejected refresh for one
+    // account roughly once a minute, indefinitely. Keyed on the token VALUE, so
+    // a different token (re-login, config reload, updateAccountTokens) lifts the
+    // guard by itself.
+    if (account._deadRefreshToken && account._deadRefreshToken === account.refreshToken) {
+      // Upstream returns nothing here; our callers read a result object, and the
+      // two fields carry different obligations. ok:false so the forced-refresh
+      // maintenance path records a truthful failure rather than counting a
+      // refresh it never attempted as success. suppressed:true so the prober
+      // does not immediately re-probe with the credential we just declined to
+      // renew (prober.js re-probes unless the refresh was suppressed) — that
+      // re-probe is part of the flood this guard exists to stop.
+      return { ok: false, suppressed: true, error: 'refresh token already rejected upstream — re-login required' };
+    }
+
     if (!force && !isTokenExpiringSoon(account.expiresAt)) return { ok: true };
 
     // A forced refresh answers a 401, but 401s arrive in bursts: every request
@@ -1884,6 +1907,9 @@ export class AccountManager {
           account.status = 'active';
           delete account._errorFromRefresh;
         }
+        // Unconditional, unlike the heal above: this token demonstrably works,
+        // so no stale guard may survive whatever set the account's error state.
+        account._deadRefreshToken = null;
         console.log(`[TeamClaude] Token refreshed for account "${account.name}"`);
         if (this.accounts[account.index] === account) this._onTokenRefresh?.(account.index, newTokens);
         return { ok: true };
@@ -1912,7 +1938,14 @@ export class AccountManager {
             account.status = 'error';
             account._errorFromRefresh = true;
           }
-          if (isAuthRejection) console.error(`[TeamClaude] Account "${account.name}" needs re-login (refresh token rejected) — run: teamclaude login`);
+          if (isAuthRejection) {
+            // Arm the dead-token guard ONLY on a genuine rejection. The
+            // accessExpired arm of this condition is a transient-failure park
+            // whose refresh token may still be perfectly good, and arming there
+            // would stop the retry that heals it.
+            account._deadRefreshToken = account.refreshToken;
+            console.error(`[TeamClaude] Account "${account.name}" needs re-login (refresh token rejected) — run: teamclaude login`);
+          }
         }
         return { ok: false, error: err.message };
       } finally {
