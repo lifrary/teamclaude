@@ -927,8 +927,17 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   if (ctx.held != null) {
     account = ctx.held;
   } else {
+    // Clamp the overflow-queue wait by the request's remaining wait budget. This
+    // wait is the OTHER silent path, and the larger one: overflowQueueTimeoutMs is
+    // 60s in production here (repo default 15s), and forwardRequest recurses once
+    // per account on failover, so the queue wait alone can hold a request quiet for
+    // minutes. Bounding only the throttle sleep left that untouched — measured
+    // after that fix, 4 of 6 probes still returned nothing before the client gave
+    // up at 60s, and the two that answered took 28-45s to say the pool was
+    // exhausted. The budget has to cover every pre-header wait, not one of them.
+    const acquireWaitMs = Math.max(0, Math.min(ctx.queueTimeoutMs, remainingWaitBudget(ctx)));
     account = await accountManager.acquireAccount(
-      excludeForSelect, ctx.queueTimeoutMs, ctx.abortSignal, ctx.affinityKey,
+      excludeForSelect, acquireWaitMs, ctx.abortSignal, ctx.affinityKey,
       {
         model: ctx.model,
         advisorModel: ctx.advisorModel,
