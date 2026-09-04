@@ -62,6 +62,7 @@ function createLiveRequestContext(req, body, {
   transport = null,
   overloadFallbackModel = null,
   transientRetries = 1,
+  maxPredispatchWaitMs = DEFAULT_MAX_PREDISPATCH_WAIT_MS,
 } = {}) {
   const sanitizedBody = sanitizeToolPairs(body, req.url, req.headers['content-type']);
   const sessionHeader = req.headers['x-claude-code-session-id'];
@@ -82,6 +83,8 @@ function createLiveRequestContext(req, body, {
     overloadRetries: 0,
     held: null,
     queueTimeoutMs,
+    maxPredispatchWaitMs,
+    predispatchWaitDeadline: null,
     abortSignal,
     affinityKey,
     sawModelWeekly: false,
@@ -121,6 +124,32 @@ const CAPPED_RETRY_AFTER_SECONDS = 1;
 // seconds. (Same class as the `_drainWaiters` pause boundary: sleep to a deadline,
 // then re-read a different clock and find it has not arrived.)
 const THROTTLE_WAKE_MARGIN_MS = 5;
+// A request may wait through several throttle windows before an account frees.
+// Each individual sleep is correctly bounded by the soonest deadline, but the SUM
+// was not: with `maxRetries = accounts.length` the loop can sleep once per account,
+// and throughout it the client receives NOTHING — no status line, no headers, no
+// body. Claude Code's watchdog then reports "Waiting for API response ... check
+// your network", which names neither the cause (no quota left) nor the cure, and
+// sends the reader after a network fault that does not exist.
+//
+// A 429 carrying a real retry-after is strictly more useful than silence: the
+// client already knows how to honour it. So bound the total time a request may
+// spend waiting before it MUST answer. Riding out a short throttle still works —
+// only a wait longer than the budget is converted into an answer.
+// 2x the overflow queue timeout (15s), the existing precedent for how long a
+// request may wait before it owes the client a 429.
+const DEFAULT_MAX_PREDISPATCH_WAIT_MS = 30_000;
+
+// Remaining wait budget in ms. The deadline is armed on first use rather than at
+// request start, so a request that never waits is unaffected, and time already
+// spent talking to upstream never counts against a later throttle wait.
+function remainingWaitBudget(ctx) {
+  if (!(ctx.maxPredispatchWaitMs > 0)) return Infinity;
+  if (ctx.predispatchWaitDeadline == null) {
+    ctx.predispatchWaitDeadline = Date.now() + ctx.maxPredispatchWaitMs;
+  }
+  return ctx.predispatchWaitDeadline - Date.now();
+}
 const MODEL_RESPONSE_BUCKETS = Object.freeze({
   unified7dFable: '7d_oi',
   unified7dSonnet: '7d_sonnet',
@@ -177,6 +206,11 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
   const queueTimeoutMs = Number.isFinite(config.overflowQueueTimeoutMs)
     ? Math.max(0, config.overflowQueueTimeoutMs)
     : 15000;
+  // Total time a request may spend WAITING before it must answer (throttle sleeps).
+  // 0 disables the bound and restores the old unbounded-silence behaviour.
+  const maxPredispatchWaitMs = Number.isFinite(config.maxPredispatchWaitMs)
+    ? Math.max(0, config.maxPredispatchWaitMs)
+    : DEFAULT_MAX_PREDISPATCH_WAIT_MS;
   // Cap the buffered request body. The proxy must buffer the whole body to replay
   // it across accounts on a 429/5xx, so an unbounded body is an unbounded buffer.
   const maxBodyBytes = Number.isFinite(config.maxRequestBytes) && config.maxRequestBytes > 0
@@ -574,6 +608,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
           res.on('close', onClose);
           ctx = createLiveRequestContext(req, body, {
             queueTimeoutMs,
+            maxPredispatchWaitMs,
             abortSignal: ac.signal,
             affinityKey: sessionAffinity ? req.socket : null,
             transport,
@@ -967,8 +1002,17 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     const holdMs = ctx.transport?.holdMs || 0;
     if (holdMs > 0 && ctx.holdUntil == null) ctx.holdUntil = Date.now() + holdMs;
     const holdRemaining = ctx.holdUntil == null ? 0 : ctx.holdUntil - Date.now();
-    if (Number.isFinite(waitingUntil) && (retryCount < maxRetries || holdRemaining > 0)) {
-      await sleepOrAbort(Math.min(waitingUntil - Date.now() + THROTTLE_WAKE_MARGIN_MS, holdRemaining > 0 ? holdRemaining : Infinity), ctx.abortSignal);
+    const waitBudgetLeft = remainingWaitBudget(ctx);
+    if (Number.isFinite(waitingUntil) && waitBudgetLeft > 0
+        && (retryCount < maxRetries || holdRemaining > 0)) {
+      // Clamp by the budget as well as by the deadline. When the budget is what
+      // ran out, the recursion below re-enters with waitBudgetLeft <= 0 and falls
+      // through to the 429 under it, which already computes the right retry-after.
+      await sleepOrAbort(Math.min(
+        waitingUntil - Date.now() + THROTTLE_WAKE_MARGIN_MS,
+        holdRemaining > 0 ? holdRemaining : Infinity,
+        waitBudgetLeft,
+      ), ctx.abortSignal);
       if (ctx.abortSignal?.aborted || res.destroyed) return;
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
     }
