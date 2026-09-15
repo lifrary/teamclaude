@@ -106,6 +106,12 @@ The cold-start warm-up above is **passive**: it only measures an account when a 
 
 ### Concurrency semantics & limits (what the cap is and isn't)
 
+`overflowQueueTimeoutMs: null` keeps an admitted request queued until a healthy
+account has capacity or its client disconnects, without the 30-second predispatch
+deadline expiring it. Finite values retain a timed wait; `0` fails fast. This does
+not increase concurrency, bypass quota/auth failures, or remove the bounded
+admission/queue/body-size guards. Clients can still impose their own timeout.
+
 - The cap is on **concurrent in-flight requests per account, not "terminals."** A terminal is usually idle (waiting on the user / model), so it holds a slot only mid-request. `maxConcurrent: 3` means "≤3 requests upstream *at once* on this account," which is the right unit for burst rate-limiting — not a hard binding of 3 terminals to an account.
 - **Spreading only kicks in on overflow.** While concurrent in-flight ≤ cap, traffic concentrates on the sticky primary (good for cache); other accounts stay idle until the primary is capped, then fill by use-or-lose. To spread *eagerly* across accounts, lower `maxConcurrentPerAccount` (e.g. `1`) at the cost of intra-account cache sharing.
 - **The cap stops *burst / request-rate* 429s, not *quota-exhaustion* 429s.** A single large request can still exhaust an account's 5h/7d token quota with one slot in use; that path is handled separately (`isExhausted` → throttle the account + switch, in `forwardRequest`). Two complementary mechanisms — the cap is not a blanket 429 cure.

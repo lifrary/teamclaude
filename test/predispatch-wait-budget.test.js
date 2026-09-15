@@ -90,3 +90,61 @@ test('a throttle shorter than the budget is still ridden out, not converted to a
   assert.equal(r.status, 200, 'a throttle that clears inside the budget must still be waited out');
   assert.equal(r.upstreamHits, 1, 'the request must have been dispatched after the throttle lifted');
 });
+
+test('capacity wait survives the throttle deadline, runs FIFO, and cancels disconnected work', { timeout: 5000 }, async () => {
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    seen.push(req.headers['x-test-order']);
+    res.end('{}');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([{ name: 'a', type: 'api-key', apiKey: 'test' }], 0.98, 0, 1);
+  const held = await am.acquireAccount(null, 0);
+  assert.ok(held);
+  const proxy = createProxyServer(am, {
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    overflowQueueTimeoutMs: null,
+    maxPredispatchWaitMs: 20,
+    activeWarmup: false,
+  });
+  const port = await listen(proxy);
+  const controllers = [];
+  const requests = [];
+  const waitForDepth = async depth => {
+    const deadline = Date.now() + 2000;
+    while (am._waiters.length !== depth && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    assert.equal(am._waiters.length, depth);
+  };
+  try {
+    for (const order of ['first', 'cancelled', 'last']) {
+      const controller = new AbortController();
+      controllers.push(controller);
+      requests.push(fetch(`http://127.0.0.1:${port}/v1/messages`, {
+        method: 'POST', body: '{}', signal: controller.signal,
+        headers: { 'x-test-order': order },
+      }).then(async res => { await res.text(); return res.status; }, () => 'aborted'));
+      await waitForDepth(requests.length);
+    }
+    await new Promise(resolve => setTimeout(resolve, 100));
+    assert.equal(am._waiters.length, 3, 'capacity waits must survive the 20ms throttle budget');
+    assert.deepEqual(seen, [], 'queued work must not bypass the account cap');
+    controllers[1].abort();
+    assert.equal(await requests[1], 'aborted');
+    await waitForDepth(2);
+    am.releaseAccount(held);
+    assert.deepEqual(await Promise.all(requests), [200, 'aborted', 200]);
+    assert.deepEqual(seen, ['first', 'last']);
+    assert.equal(am._waiters.length, 0);
+    assert.equal(am.accounts[0].inFlight, 0);
+  } finally {
+    for (const controller of controllers) controller.abort();
+    am.releaseAccount(held);
+    await Promise.all(requests);
+    proxy.closeAllConnections();
+    proxy.close();
+    upstream.closeAllConnections();
+    upstream.close();
+  }
+});

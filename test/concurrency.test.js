@@ -874,9 +874,8 @@ test('a capped-but-healthy fleet reports its concurrency cap, not quota exhausti
     assert.doesNotMatch(body.error.message, /exhausted/);
     // The number has to agree with the words: a cap frees when any in-flight request
     // finishes, so the 60s quota-window fallback would still tell the client to wait
-    // a minute for something that clears in seconds. One second is too short:
-    // Claude Code renders it as "Retrying in 0s" and all waiting sessions retry
-    // together, refilling the overflow queue.
+    // a minute for something that clears in seconds. This response is for
+    // fail-fast mode, not proof that queued work eventually executes.
     assert.equal(res.headers.get('retry-after'), '5',
       'a capped fleet must give clients a short, non-zero backoff');
   } finally {

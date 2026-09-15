@@ -814,7 +814,11 @@ export class AccountManager {
   _enqueue(exclude, timeoutMs, signal = null, affinityKey = null, routingContext = {}) {
     return new Promise(resolve => {
       const waiter = { exclude, resolve, done: false, timer: null, signal, onAbort: null, affinityKey, routingContext };
-      waiter.timer = setTimeout(() => this._settleWaiter(waiter, null), timeoutMs);
+      // Infinity means wait for capacity or disconnect, not a timer. Passing it
+      // to setTimeout would overflow Node's timer range and expire after 1ms.
+      if (Number.isFinite(timeoutMs)) {
+        waiter.timer = setTimeout(() => this._settleWaiter(waiter, null), timeoutMs);
+      }
       if (signal) {
         waiter.onAbort = () => this._settleWaiter(waiter, null);
         signal.addEventListener('abort', waiter.onAbort, { once: true });

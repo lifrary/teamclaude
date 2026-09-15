@@ -124,10 +124,8 @@ export function isLoopbackAddr(addr) {
 }
 const RETRY_AFTER_FALLBACK_SECONDS = 60;
 const RETRY_AFTER_MAX_SECONDS = 300;
-// A concurrency cap frees as an in-flight request completes. Five seconds is still
-// far shorter than a quota-window retry, but one second is rendered by Claude Code
-// as "Retrying in 0s"; every waiting session then re-enters together and refills the
-// overflow queue. Both capped-fleet 429s (pinned and general) use this value.
+// A short backoff for requests that cannot enter the bounded queue. This does not
+// solve capacity shortages; admitted requests should wait for a slot instead.
 const CAPPED_RETRY_AFTER_SECONDS = 5;
 // Sleep PAST a throttle deadline, never exactly to it. `setTimeout` fires on libuv's
 // cached loop clock while the availability check re-reads `Date.now()`, and a loaded
@@ -216,8 +214,10 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
     : 1;
   // How long a request may wait for a per-account concurrency slot to free when
   // every available account is at its cap, before giving up with a 429. 0 = never
-  // queue (fail fast). Default 15s.
-  const queueTimeoutMs = Number.isFinite(config.overflowQueueTimeoutMs)
+  // queue (fail fast). null = wait until capacity frees or the client disconnects.
+  // The bounded queue and admission/body-size limits still apply.
+  const queueTimeoutMs = config.overflowQueueTimeoutMs === null ? Infinity
+    : Number.isFinite(config.overflowQueueTimeoutMs)
     ? Math.max(0, config.overflowQueueTimeoutMs)
     : 15000;
   // Total time a request may spend WAITING before it must answer (throttle sleeps).
@@ -949,7 +949,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     // after that fix, 4 of 6 probes still returned nothing before the client gave
     // up at 60s, and the two that answered took 28-45s to say the pool was
     // exhausted. The budget has to cover every pre-header wait, not one of them.
-    const acquireWaitMs = Math.max(0, Math.min(ctx.queueTimeoutMs, remainingWaitBudget(ctx)));
+    // A capacity wait is not quota exhaustion. In wait-until-free mode it must
+    // not inherit the throttle deadline and turn healthy queued work into 429s.
+    const acquireWaitMs = ctx.queueTimeoutMs === Infinity ? Infinity
+      : Math.max(0, Math.min(ctx.queueTimeoutMs, remainingWaitBudget(ctx)));
     account = await accountManager.acquireAccount(
       excludeForSelect, acquireWaitMs, ctx.abortSignal, ctx.affinityKey,
       {
