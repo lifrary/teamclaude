@@ -124,10 +124,11 @@ export function isLoopbackAddr(addr) {
 }
 const RETRY_AFTER_FALLBACK_SECONDS = 60;
 const RETRY_AFTER_MAX_SECONDS = 300;
-// A concurrency cap frees the moment an in-flight request finishes — seconds, not the
-// minute a quota window needs. Both capped-fleet 429s (pinned and general) use this,
-// so the two cannot drift apart the way their messages once did.
-const CAPPED_RETRY_AFTER_SECONDS = 1;
+// A concurrency cap frees as an in-flight request completes. Five seconds is still
+// far shorter than a quota-window retry, but one second is rendered by Claude Code
+// as "Retrying in 0s"; every waiting session then re-enters together and refills the
+// overflow queue. Both capped-fleet 429s (pinned and general) use this value.
+const CAPPED_RETRY_AFTER_SECONDS = 5;
 // Sleep PAST a throttle deadline, never exactly to it. `setTimeout` fires on libuv's
 // cached loop clock while the availability check re-reads `Date.now()`, and a loaded
 // event loop leaves that cache behind wall time — so the sleep can return while the
