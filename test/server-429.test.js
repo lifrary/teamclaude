@@ -24,7 +24,7 @@ async function runAgainstThrottlingUpstream(retryAfterHeader) {
     0.98,
   );
   const proxy = createProxyServer(am, {
-    proxy: { apiKey: 'k' },
+    activeWarmup: false, proxy: { apiKey: 'k' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
   });
   const proxyPort = await listen(proxy);
@@ -66,8 +66,33 @@ test('429 classifier only accepts the current request governing model bucket', (
     'anthropic-ratelimit-unified-5h-status': 'rejected',
   }, { model: 'claude-fable-5' }), 'account-quota');
 });
-test('server classifies 429s from current model/advisor headers before sx observes residuals', async () => {
+test('429 classifier resolves numeric thresholds separately for model and advisor buckets', () => {
+  const headers = {
+    'anthropic-ratelimit-unified-status': 'rejected',
+    'anthropic-ratelimit-unified-7d_oi-utilization': '0.85',
+    'anthropic-ratelimit-unified-7d_sonnet-utilization': '0.7',
+  };
+  const switchThreshold = { default: 0.98, unified7dFable: 0.8, unified7dSonnet: 0.9 };
+  assert.equal(classify429(headers, { model: 'claude-fable-5', switchThreshold }), 'model-quota');
+  assert.equal(classify429(headers, { model: 'claude-sonnet-5', switchThreshold }), 'account-quota');
+  assert.equal(classify429(headers, {
+    model: 'claude-sonnet-5', advisorModel: 'claude-fable-5', switchThreshold,
+  }), 'model-quota');
+  assert.equal(classify429(headers, {
+    model: 'claude-fable-5', switchThreshold: { default: 0.9 },
+  }), 'account-quota');
+  for (const threshold of [0.98, { default: 0.98 }, { session: 0.98, weekly: 0.98, models: 0.98 }]) {
+    assert.equal(classify429({
+      ...headers, 'anthropic-ratelimit-unified-7d_oi-utilization': '1',
+    }, { model: 'claude-fable-5', switchThreshold: threshold }), 'model-quota');
+  }
+});
+
+test('server classifies 429s from current model/advisor headers before sx observes residuals', { timeout: 4000 }, async () => {
   const events = [];
+  let transientReached, releaseTransient;
+  const dispatched = new Promise(resolve => { transientReached = resolve; });
+  const held = new Promise(resolve => { releaseTransient = resolve; });
   const sx = {
     useByDefault: () => false,
     useOn429: () => true,
@@ -75,18 +100,23 @@ test('server classifies 429s from current model/advisor headers before sx observ
   };
   const am = new AccountManager([
     { name: 'a', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
-  ], 0.98);
-  // A retained rejection must never turn a later headerless 429 into account quota.
-  am.accounts[0].quota.unifiedStatus = 'rejected';
+  ], { default: 0.98, unified7dFable: 0.95 });
+  // Both requests dispatch while eligible. The model-quota response then lands
+  // before the residual response, establishing a real retained rejection.
+  // No spending probe may bypass the exhausted account to set up this race.
   const updateQuota = am.updateQuota.bind(am);
   am.updateQuota = (account, headers) => {
     events.push(`quota:${headers['anthropic-ratelimit-unified-status'] || 'none'}`);
     return updateQuota(account, headers);
   };
-  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: 'http://upstream.invalid' }, {
+  const proxy = createProxyServer(am, { activeWarmup: false, proxy: { apiKey: 'k' }, upstream: 'http://upstream.invalid' }, {
     fetch: async (_url, options) => {
       const body = options.body.toString();
       const advisorRequest = body.includes('"advisor_20260301"');
+      if (!advisorRequest) {
+        transientReached();
+        await held;
+      }
       return new globalThis.Response(JSON.stringify({ type: 'error' }), {
         status: 429,
         headers: advisorRequest
@@ -105,6 +135,8 @@ test('server classifies 429s from current model/advisor headers before sx observ
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
     });
 
+    const transientResponse = send({ model: 'claude-other-5', messages: [] });
+    await dispatched;
     const modelQuota = await send({
       model: 'claude-other-5',
       tools: [{ type: 'advisor_20260301', name: 'advisor', model: 'claude-fable-5' }],
@@ -114,8 +146,12 @@ test('server classifies 429s from current model/advisor headers before sx observ
     assert.equal(modelQuota.status, 429);
     assert.deepEqual(events, ['quota:rejected'],
       'the advisor-governing model bucket classifies this response as model quota, not sx residual');
+    assert.equal(am.accounts[0].status, 'active', 'object thresholds must not throttle every model');
+    assert.equal(am.accounts[0].rateLimitedUntil, null);
+    assert.equal(am.accounts[0].quota.unifiedStatus, 'rejected', 'the residual arrives after a real retained rejection');
 
-    const transient = await send({ model: 'claude-other-5', messages: [] });
+    releaseTransient();
+    const transient = await transientResponse;
     await transient.text();
     assert.equal(transient.status, 429);
     assert.equal(events.indexOf('quota:none') < events.indexOf('sx'), true,
@@ -124,6 +160,7 @@ test('server classifies 429s from current model/advisor headers before sx observ
       'stale rejected quota does not poison a later transient 429 classification');
     assert.equal(am.accounts[0].status, 'active', 'residual 429 does not globally throttle the account');
   } finally {
+    releaseTransient();
     proxy.close();
   }
 });
@@ -181,6 +218,118 @@ test('negative Retry-After is clamped and still terminates', async () => {
   assert.ok(paused);
 });
 
+test('headerless request-scoped 429 never pauses the fleet or invents Retry-After', async () => {
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    seen.push(req.headers.authorization);
+    res.writeHead(429, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: 'Unsupported request model' } }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(['a', 'b', 'c'].map(name => ({
+    name, type: 'oauth', accessToken: `t-${name}`, expiresAt: Date.now() + 3600_000,
+  })), 0.98);
+  const proxy = createProxyServer(am, {
+    activeWarmup: false, upstream: `http://127.0.0.1:${upstreamPort}`,
+  });
+  const port = await listen(proxy);
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'unsupported', messages: [] }),
+      signal: AbortSignal.timeout(2000),
+    });
+    assert.equal(res.status, 429);
+    assert.equal(res.headers.get('retry-after'), null);
+    assert.match(await res.text(), /Unsupported request model/);
+    assert.equal(seen.length, 2, 'at most one sibling attempt');
+    assert.ok(am.accounts.every(a => !a.pausedUntil && a.status === 'active'));
+    assert.ok(am.accounts.every(a => a.inflight === 0), 'all object handles released');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+for (const cancel of [false, true]) {
+  test(`headerless 429 backoff releases capacity and ${cancel ? 'cancels without reacquiring' : 'reacquires through the bounded queue'}`, { timeout: 8000 }, async t => {
+    const am = new AccountManager([
+      { name: 'a', type: 'oauth', accessToken: 't', expiresAt: Date.now() + 3600_000 },
+    ], 0.98, { maxConcurrent: 1 });
+    const controller = new AbortController();
+    const healthyController = new AbortController();
+    let hits = 0;
+    let releaseHealthy;
+    const healthyHeld = new Promise(resolve => { releaseHealthy = resolve; });
+    const ended = [];
+    const proxy = createProxyServer(am, {
+      activeWarmup: false, upstream: 'http://upstream.invalid',
+      overflowQueueTimeoutMs: null,
+    }, {
+      fetch: async () => {
+        hits++;
+        assert.equal(am.accounts[0].inFlight, 1, 'every dispatch owns exactly one slot');
+        if (hits === 1) return new globalThis.Response('{"error":{"message":"retry"}}', { status: 429 });
+        if (hits === 2) await healthyHeld;
+        return new globalThis.Response('{"content":[]}', {
+          headers: { 'content-type': 'application/json' },
+        });
+      },
+      onRequestEnd: (_id, info) => ended.push(info.status),
+    });
+    const port = await listen(proxy);
+    t.after(() => {
+      controller.abort();
+      healthyController.abort();
+      releaseHealthy();
+      proxy.closeAllConnections();
+      proxy.close();
+    });
+    const waitFor = async (predicate, timeout = 1000) => {
+      const deadline = Date.now() + timeout;
+      while (!predicate() && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      assert.ok(predicate(), 'expected observable request state before deadline');
+    };
+    const send = signal => fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-haiku-4', messages: [] }), signal,
+    }).then(async response => {
+      await response.text();
+      return response.status;
+    });
+    // Handle rejection immediately: cancellation is an expected outcome.
+    const retrying = send(controller.signal).catch(error => error);
+    await waitFor(() => hits === 1 && am.accounts[0].inFlight === 0);
+    const healthy = send(healthyController.signal).catch(error => error);
+    await waitFor(() => hits === 2);
+    assert.equal(am.accounts[0].inFlight, 1, 'another request uses capacity during backoff');
+    if (cancel) {
+      controller.abort();
+      await waitFor(() => ended.includes(499));
+      assert.ok(await retrying instanceof Error);
+      await new Promise(resolve => setTimeout(resolve, 2100));
+      assert.equal(hits, 2, 'cancelled backoff never dispatches its retry');
+      assert.equal(am.accounts[0].inFlight, 1, 'cancellation does not release another request’s slot');
+      releaseHealthy();
+      assert.equal(await healthy, 200);
+      await waitFor(() => am.accounts[0].inFlight === 0);
+      assert.equal(am._waiters.length, 0);
+    } else {
+      await waitFor(() => am._waiters.length === 1, 3500);
+      assert.equal(hits, 2, 'retry queues behind the healthy request instead of bypassing the cap');
+      assert.equal(am.accounts[0].inFlight, 1);
+      releaseHealthy();
+      assert.equal(await healthy, 200);
+      assert.equal(await retrying, 200, 'the previously tried account remains eligible for retry');
+      assert.equal(hits, 3);
+      assert.equal(am.accounts[0].inFlight, 0);
+      assert.equal(am._waiters.length, 0);
+    }
+  });
+}
+
 test('long upstream Retry-After is surfaced without sleeping in client request', async () => {
   let upstreamHits = 0;
   const upstream = http.createServer((_req, res) => {
@@ -195,7 +344,7 @@ test('long upstream Retry-After is surfaced without sleeping in client request',
     0.98,
   );
   const proxy = createProxyServer(am, {
-    proxy: { apiKey: 'k' },
+    activeWarmup: false, proxy: { apiKey: 'k' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
   });
   const proxyPort = await listen(proxy);
@@ -241,7 +390,7 @@ test('a residual 429 spills accounts in bounded order when sx is unavailable', a
     { name: 'a', type: 'oauth', accessToken: 't-a', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
     { name: 'b', type: 'oauth', accessToken: 't-b', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
   ], 0.98);
-  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const proxy = createProxyServer(am, { activeWarmup: false, proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
   const proxyPort = await listen(proxy);
 
   try {
@@ -284,7 +433,7 @@ test('a quota-rejection 429 rotates to the next account', async () => {
     { name: 'a', type: 'oauth', accessToken: 't-a', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
     { name: 'b', type: 'oauth', accessToken: 't-b', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
   ], 0.98);
-  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const proxy = createProxyServer(am, { activeWarmup: false, proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
   const proxyPort = await listen(proxy);
 
   try {
@@ -318,7 +467,7 @@ test('temporarily exhausted fleet waits and retries instead of surfacing synthet
   am.markRateLimited(0, 1);
 
   const proxy = createProxyServer(am, {
-    proxy: { apiKey: 'k' },
+    activeWarmup: false, proxy: { apiKey: 'k' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
   });
   const proxyPort = await listen(proxy);
@@ -365,7 +514,7 @@ test('holdMs extends the retry budget past maxRetries and caps the throttle wait
   const amLong = new AccountManager(acct(), 0.98);
   amLong.markRateLimited(0, 0.2);
   const proxyLong = createProxyServer(amLong, {
-    proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}`, holdMs: 3000,
+    activeWarmup: false, proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}`, holdMs: 3000,
   });
   const portLong = await listen(proxyLong);
 
@@ -373,7 +522,7 @@ test('holdMs extends the retry budget past maxRetries and caps the throttle wait
   const amShort = new AccountManager(acct(), 0.98);
   amShort.markRateLimited(0, 30);
   const proxyShort = createProxyServer(amShort, {
-    proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}`, holdMs: 150,
+    activeWarmup: false, proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}`, holdMs: 150,
   });
   const portShort = await listen(proxyShort);
 
@@ -399,9 +548,9 @@ test('holdMs extends the retry budget past maxRetries and caps the throttle wait
 
 // Regression for #46: a stale/poisoned cached quota (e.g. 0.98 from before a
 // plan upgrade, with a reset still in the future) must NOT pin the proxy in a
-// permanent synthetic 429. The next request should probe upstream, succeed, and
-// refresh the cached quota — rather than refusing locally without any call.
-test('stale over-threshold quota is re-probed, not refused forever', async () => {
+// permanent synthetic 429. Recovery uses quota metadata, never a spending
+// inference against a fleet that currently reads exhausted.
+test('stale over-threshold quota recovers from metadata without a spending probe', async () => {
   let upstreamHits = 0;
   const upstream = http.createServer((_req, res) => {
     upstreamHits++;
@@ -424,21 +573,27 @@ test('stale over-threshold quota is re-probed, not refused forever', async () =>
   ]);
 
   const proxy = createProxyServer(am, {
-    proxy: { apiKey: 'k' },
+    activeWarmup: false, proxy: { apiKey: 'k' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
   });
   const proxyPort = await listen(proxy);
 
   try {
-    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+    const send = () => fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ model: 'x', messages: [] }),
     });
+    const refused = await send();
+    await refused.text();
+    assert.equal(refused.status, 429);
+    assert.equal(upstreamHits, 0, 'exhaustion must not authorize an inference probe');
+    am.applyUsageData(0, { sevenDay: { utilization: 0.10, resetAt: Date.now() + 7 * 24 * 3600_000 } });
+    const res = await send();
     await res.text();
-    assert.equal(res.status, 200, 'request should be proxied, not refused with a synthetic 429');
-    assert.equal(upstreamHits, 1, 'a real upstream probe should have been made');
-    assert.equal(am.accounts[0].quota.unified7d, 0.10, 'cached quota should be refreshed from the probe');
+    assert.equal(res.status, 200, 'fresh metadata must restore request eligibility');
+    assert.equal(upstreamHits, 1, 'only the recovered client request spends inference');
+    assert.equal(am.accounts[0].quota.unified7d, 0.10, 'fresh headroom remains recorded');
   } finally {
     proxy.close();
     upstream.close();
@@ -480,7 +635,7 @@ test('model-scoped exhaustion fails over once without poisoning other model traf
     { name: 'b', type: 'oauth', accessToken: 'tok-b', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
   ], 0.98);
   const proxy = createProxyServer(am, {
-    proxy: { apiKey: 'k' },
+    activeWarmup: false, proxy: { apiKey: 'k' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
   });
   const proxyPort = await listen(proxy);

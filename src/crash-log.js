@@ -13,9 +13,11 @@ import { appendFileSync } from 'node:fs';
  * registering real process-level listeners, which would outlive the test and
  * swallow genuine failures in the same file. `exit` and `log` are injectable
  * for the same reason.
+ * @param {string} path
+ * @param {{ exit?: (code: number) => void, log?: { write: (s: string) => void } }} [options]
  */
 export function createCrashReporter(path, { exit = process.exit, log = process.stderr } = {}) {
-  return (kind) => (err) => {
+  return (/** @type {string} */ kind) => (/** @type {any} */ err) => {
     const stack = err?.stack || String(err);
     const entry = `\n=== ${new Date().toISOString()} ${kind} ===\n${stack}\n`;
     // Appended, never truncated: the FIRST crash of a repeating cycle is the one
@@ -36,6 +38,8 @@ export function createCrashReporter(path, { exit = process.exit, log = process.s
  * leave the proxy serving on unknown state. Note the exit skips the awaited
  * state persistence in shutdown() — the same loss a SIGKILL takes, bounded by
  * the once-a-minute canonical-state write.
+ * @param {string} path
+ * @param {{ exit?: (code: number) => void, log?: { write: (s: string) => void } }} [options]
  */
 export function installCrashHandlers(path, options = {}) {
   const report = createCrashReporter(path, options);

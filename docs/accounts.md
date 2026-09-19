@@ -1,0 +1,253 @@
+# Accounts
+
+Adding, naming, and managing the accounts TeamClaude rotates between.
+
+## OAuth login (recommended)
+
+```bash
+teamclaude login
+```
+
+Opens your browser and uses the same OAuth flow as Claude Code. Auto-detects the account email and subscription tier. Logging in with the same account again updates its credentials.
+
+Run it once per account. You can add accounts while the server is running — press **R** in the TUI to reload.
+
+If the profile cannot be identified, login stops without adding a placeholder
+account. Retry after confirming the credential is valid, or pass
+`teamclaude login --name <name>` to add it without profile detection.
+
+## Import from Claude Code
+
+If you already have Claude Code set up, import its credentials directly:
+
+```bash
+claude /login           # log into an account in Claude Code
+teamclaude import       # import its credentials
+```
+
+Re-importing the same account updates its credentials. You can also import from a custom path:
+
+```bash
+teamclaude import --from /path/to/credentials.json
+```
+
+Automatic naming requires a successful profile lookup. If credentials are
+invalid or the profile cannot be identified, the import stops without adding a
+placeholder account. Pass `--name <name>` to explicitly import without profile
+detection.
+
+## Delegating credentials to a file (`importFrom`)
+
+Instead of storing an OAuth account's tokens in `teamclaude.json`, an account entry can name the file to read them from:
+
+```json
+{ "name": "me@example.com", "type": "oauth", "importFrom": "~/.claude/.credentials.json" }
+```
+
+The tokens (`accessToken`, `refreshToken`, `expiresAt`) are read from that file at startup and again on every config reload, so a login refreshed by Claude Code itself is picked up without re-running `teamclaude import`. Every other field on the entry (`priority`, `disabled`, `upstream`, `modelMap`, …) is kept as written. A file with no token skips the account with a message rather than sending an empty credential upstream. `teamclaude import` is the alternative: it copies the tokens into the config once.
+
+## API key
+
+For Anthropic API key accounts (billed via Console):
+
+```bash
+teamclaude login --api
+```
+
+## Multiple organizations
+
+One email can hold multiple accounts across different organizations (e.g. corp + personal). Dedup is keyed on account + org, and names disambiguate as `email (Org)`.
+
+Pass `--org <name|uuid>` to resolve a bare email when it is ambiguous:
+
+```bash
+teamclaude remove user@example.com --org Acme
+```
+
+## Managing accounts
+
+```bash
+teamclaude accounts             # list accounts with tier and token status
+teamclaude accounts -v          # also show token expiry times
+teamclaude remove <name>        # remove an account (by name or email)
+teamclaude disable <name>       # temporarily exclude it from rotation
+teamclaude enable <name>        # re-enable it (also clears a stuck error state)
+teamclaude priority <name> 1    # rotation preference, lower = preferred
+teamclaude priority <name> --first
+teamclaude priority <name> --last
+```
+
+`login`, `import`, `enable`, `disable` and `priority` notify a running server to reload, so credential, priority and enable/disable changes are picked up live; the same reload (POST `/teamclaude/reload`, or **R** in the TUI) also applies hand edits to an account's `upstream`/`modelMap`. Account **removals** still need a restart.
+
+Accounts can also be added and removed from the TUI settings screen: **`g`** → **Add account** / **Remove account**.
+
+## The `id` field
+
+Every account entry carries an `id`, added the first time the config is read and written back on the next save. It is what ties an entry to the running account built from it: entries without a usable credential are skipped at startup, so an entry's place in the file is not the account's place in the fleet, and a token refreshed for one account would otherwise be recorded against another.
+
+Hand edits are fine. Leave the `id` alone and it keeps working; delete it and a new one is issued on the next read. If you copy an account block to make a second entry, the duplicated `id` is spotted on the next read and the later of the two gets a fresh one.
+
+## Codex accounts (experimental)
+
+An OpenAI Codex subscription can be pooled alongside your Claude accounts.
+
+```bash
+teamclaude login --codex     # browser sign-in, repeat per account
+```
+
+Add `--no-browser` to print the URL instead of opening one, and `--name` to
+label the account yourself (it defaults to the email on the login).
+
+To pool a login you already have, or to add one without a browser, point an
+account at the Codex CLI's own credentials file instead — it defaults to
+`~/.codex/auth.json`:
+
+```json
+{ "name": "me@example.com", "type": "oauth", "provider": "codex" }
+```
+
+The Codex CLI honours `CODEX_HOME`, so several logins can be kept side by side
+and pooled with `importFrom`:
+
+```bash
+CODEX_HOME=~/.codex-second codex login
+```
+
+```json
+{ "name": "second", "type": "oauth", "provider": "codex",
+  "importFrom": "~/.codex-second/auth.json" }
+```
+
+Then tell Codex to reach TeamClaude instead of OpenAI, in `~/.codex/config.toml`:
+
+```toml
+model_provider = "teamclaude"
+
+[model_providers.teamclaude]
+name = "teamclaude"
+base_url = "http://127.0.0.1:3456/backend-api/codex"
+wire_api = "responses"
+```
+
+### Through the MITM proxy (no Codex config needed)
+
+MITM mode intercepts `chatgpt.com` as well as `api.anthropic.com`, so a Codex CLI
+launched behind the proxy is pooled with no `~/.codex/config.toml` change at all:
+
+```bash
+eval "$(teamclaude env)"   # HTTPS_PROXY + NODE_EXTRA_CA_CERTS
+codex
+```
+
+Two boundaries worth knowing:
+
+- `chatgpt.com` is intercepted **only when a Codex account is configured**. An
+  Anthropic-only fleet tunnels it untouched — intercepting a host nobody asked
+  the proxy to read is not a neutral default.
+- `ab.chatgpt.com` is never intercepted. It is OpenAI's telemetry endpoint,
+  carries no inference, and there is nothing there to rewrite.
+
+The base-URL route below still works and is the way to pool Codex without MITM.
+
+`OPENAI_BASE_URL` does **not** work for this — a ChatGPT-authenticated Codex
+ignores it. `model_providers` is the supported redirect.
+
+The `/backend-api/codex` suffix matters. A Codex subscription authenticates
+against the ChatGPT backend, not the OpenAI API platform — pointed at
+`api.openai.com` the same token is refused with `Missing scopes:
+api.responses.write`. Codex appends `/responses` and `/models` to `base_url`,
+so this suffix makes it emit exactly the paths the ChatGPT backend expects and
+TeamClaude forwards them verbatim.
+
+### How it shares the port with Claude
+
+One listener serves both CLIs, because the request path says which pool of
+accounts is eligible: Claude Code posts to `/v1/messages`, Codex posts to
+`/backend-api/codex/responses`. An Anthropic account is never offered a Codex
+request and vice versa, so the two rotate independently on one port, one config
+and one TUI.
+
+### What differs from a Claude account
+
+- The credential is injected as `Authorization: Bearer`, plus a
+  `ChatGPT-Account-Id` header. That header is OpenAI's counterpart to the
+  `account_uuid` TeamClaude patches into an Anthropic request body — so the
+  Codex path performs no body rewrite at all.
+- Tokens refresh against `auth.openai.com` using the Codex CLI's own client id.
+- The request body is forwarded untouched. This is a passthrough, not a
+  translation layer: TeamClaude never converts between the Anthropic and OpenAI
+  protocols.
+
+### Quota
+
+Codex reports its limits on every response, and TeamClaude normalises them into
+the same fields the Anthropic path fills — so the switch threshold, reset
+countdowns and the TUI's quota bars work for Codex accounts too, and rotation
+happens *before* upstream refuses rather than after a 429.
+
+Two details are worth knowing if you read the raw headers:
+
+- Limits arrive in families. The unnamed one is the account-wide limit; a family
+  carrying `-limit-name` is model-scoped, the counterpart of Anthropic's Fable
+  weekly bucket.
+- `primary` and `secondary` are positions, not durations — the account-wide
+  family can put its 7-day window in `primary` while a model-scoped family puts
+  a 5-hour window there. Windows are classified by their stated
+  `window-minutes`, never by position.
+
+## Third-party backend accounts
+
+Any Anthropic-compatible API can be added as an account alongside your Claude accounts. Give it a higher `priority` value (lower = preferred, so use e.g. `100`) and it will be used as a fallback when all Claude accounts are exhausted.
+
+```json
+{
+  "name": "deepseek",
+  "type": "oauth",
+  "accessToken": "sk-your-deepseek-api-key",
+  "upstream": "https://api.deepseek.com/anthropic",
+  "priority": 100,
+  "modelMap": {
+    "claude-haiku-4-5-20251001": "deepseek-v4-flash",
+    "claude-sonnet-4-6": "deepseek-v4-pro[1m]"
+  }
+}
+```
+
+- **`upstream`** — base URL of the target API. Requests are sent to `upstream + /v1/messages` (etc.) for this account only. One class of request is answered by the proxy instead of being forwarded — see [message threads](#message-threads) below.
+- **`modelMap`** — when a Claude model name arrives in the request body, it is rewritten to the mapped name before forwarding.
+- **`messageThreads`** — set to `true` when the backend keeps Anthropic message-thread state (a relay that reaches Anthropic does). Off by default for a third-party backend — see below.
+
+Where the provider publishes one, its own balance or quota is shown in `teamclaude status` — see [third-party backend quota](quota.md#third-party-backend-quota).
+
+Reserve the backend for sessions that explicitly ask for its models with a [route](routing.md#model-routes):
+
+```json
+{ "name": "deepseek", "match": ["deepseek-*"], "accounts": ["deepseek"] }
+```
+
+Then pick the model at launch, or with `/model` inside a session:
+
+```bash
+# This session routes to DeepSeek; all other sessions still use Claude accounts.
+claude --model 'deepseek-v4-pro[1m]'
+```
+
+Model names with brackets (e.g. `deepseek-v4-pro[1m]`) must be quoted in the shell.
+
+### Message threads
+
+Claude Code keeps the conversation on the server once a thread exists: the first `/v1/messages` body carries `thread: {"type": "create"}` with the whole messages array, and every later one carries `thread: {"type": "continue"}` with only the new delta. A backend that keeps no thread state ignores the unknown field and answers the delta on its own, so from the second turn onward the model no longer sees the conversation — and nothing anywhere reports an error.
+
+When a thread cannot be continued Anthropic answers `400`, and Claude Code resends the whole conversation rather than giving up (observed on 2.1.269). So the proxy answers a `continue` bound for an account with a per-account `upstream` with that same `400` rather than forwarding it. The body carries `details.error_code: "thread_unsupported_request"`, which the client reads as "this model keeps no thread state": it resends the turn in full and then drops the `thread` field entirely for the rest of the session, so the refusals are counted per agent and model rather than per turn, and cost no tokens. A session running subagents pays one refusal for the main agent and one for each subagent on that model. `count_tokens` is never refused: there is no conversation to resend for a token count.
+
+The flag the client sets is keyed on the model, not on the account serving it. If the same model name is served both by a third-party backend and by Anthropic accounts, a refusal turns threads off for that model everywhere until the session ends — the conversation still works, it just travels in full each turn.
+
+An `upstream` whose host is Anthropic's own is left alone without any flag — a region pin or a mirror reaches the real thread store, so there is nothing to repair. The host is what decides it: a third-party API serving the Anthropic shape does that under its own host.
+
+Only a per-account `upstream` arms this. A fleet pointed at a third-party host through the global `upstream` is not covered, and there is no setting to turn the refusal on for it.
+
+A relay that forwards to Anthropic does keep thread state, and for it the refusal is pure overhead — the client would re-send a full history each turn for nothing. Declare it with `"messageThreads": true` and continues are forwarded untouched.
+
+### `accounts[].models` is deprecated
+
+The older per-account `models` list still works, but use a [route](routing.md#model-routes) instead. Routes are more flexible (glob matching, multiple accounts, bucket override) and less surprising: a `models` list changes eligibility across the *whole fleet* — once any account claims a model, every account that doesn't claim it is skipped for that model. The server prints a deprecation notice at startup naming the route to replace it with, and the field may be removed in a future version.

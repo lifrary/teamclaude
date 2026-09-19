@@ -31,12 +31,80 @@ const FAMILY_WEEKLY_BUCKET = {
   sonnet: 'unified7dSonnet',
 };
 
+export const DEFAULT_SWITCH_THRESHOLD = 0.98;
+
+// Routing and remote status must use the same fallback for bucket tables.
+// A missing entry uses `default`; a malformed/non-finite value cannot silently
+// turn off a quota gate or produce a NaN percentage in the dashboard.
+/** @param {number | Record<string, number> | null | undefined} threshold @param {string} bucket */
+export function resolveSwitchThreshold(threshold, bucket) {
+  if (typeof threshold === 'number' && Number.isFinite(threshold)) return threshold;
+  if (threshold && typeof threshold === 'object') {
+    const value = threshold[bucket] ?? threshold.default;
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+  }
+  return DEFAULT_SWITCH_THRESHOLD;
+}
+
+// A per-account usage cap (accounts[].maxUsage) for one quota bucket, or null
+// when that bucket is uncapped. Shapes mirror switchThreshold: a bare number
+// caps every bucket, a table caps the buckets it lists, and `default` covers the
+// rest. Lives here, beside the bucket keys, so the status renderer can draw a
+// cap without importing the account manager (it renders remote JSON too).
+export function resolveMaxUsage(maxUsage, bucket) {
+  if (typeof maxUsage === 'number' && Number.isFinite(maxUsage)) return maxUsage;
+  if (maxUsage && typeof maxUsage === 'object') {
+    const v = maxUsage[bucket] ?? maxUsage.default;
+    if (typeof v === 'number' && Number.isFinite(v)) return v;
+  }
+  return null;
+}
+
 // The weekly quota bucket key that governs a model, e.g. a Fable request is
 // gated by 'unified7dFable' rather than the shared 'unified7d'. Used by account
 // selection so a spent family bucket only bars that family's requests.
 export function weeklyBucketForModel(model) {
   return FAMILY_WEEKLY_BUCKET[modelFamily(model)] || 'unified7d';
 }
+
+/**
+ * The weekly utilization that GATES a request whose governing bucket is
+ * `bucketKey`: the higher of that bucket and the shared `unified7d`, or null
+ * when neither is reported.
+ *
+ * WHY A MAXIMUM. Family spend meters twice, once in the family bucket and once
+ * in the shared one, so the two are not independent (issue #175 measured the
+ * coupling at [+1.14e-4, +5.21e-4] on the shared bucket per Fable request).
+ * Reading the family bucket alone let an account sitting at `unified7d` 1.00
+ * with `unified7dFable` 0.20 keep serving Fable, and each such request pushed
+ * the shared bucket further past its cap. Once the shared bucket is spent,
+ * family requests are the only ones still admitted, which makes it a one-way
+ * ratchet rather than a bounded overshoot.
+ *
+ * NULL IS UNREPORTED AND NEVER ZERO. `Math.max` coerces null to 0, and 0 reads
+ * as "empty" — the opposite of "unknown", and in the direction that keeps an
+ * account serving. Both absent cases are answered before the maximum rather
+ * than falling into it.
+ *
+ * ONE DEFINITION, because the gate and every display of it answer the SAME
+ * question: can this account serve this family right now. A second derivation
+ * of one question is a copy that drifts.
+ */
+export function gatingUtilization(quota, bucketKey) {
+  const own = quota?.[bucketKey] ?? null;
+  // Already the shared bucket: max(x, x) is x.
+  if (bucketKey === 'unified7d') return own;
+  const shared = quota?.unified7d ?? null;
+  if (own == null) return shared;
+  if (shared == null) return own;
+  return Math.max(own, shared);
+}
+
+// Every bucket weeklyBucketForModel can name: the family-specific ones plus the
+// shared bucket the rest fall back to. Exported so a caller that must cover all
+// of them at once does not keep a second copy of the list.
+export const WEEKLY_BUCKET_KEYS = Object.freeze(
+  [...new Set([...Object.values(FAMILY_WEEKLY_BUCKET), 'unified7d'])]);
 
 // Match a shell-style glob against a model id. Only `*` is special (matches any
 // run of characters, including none); every other character is literal. The
@@ -50,6 +118,40 @@ export function modelGlobMatches(glob, model) {
 
 function escapeRegExp(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// Do two model globs describe any model in common? Used to tell whether a route
+// is fully shadowed by the blocklist. Exact glob intersection is not decidable
+// in general, so this compares literal cores (the pattern with `*` removed) in
+// both directions: `claude-fable-5` overlaps `*fable*`, and a bare `*` (empty
+// core) overlaps everything. Display-only, and deliberately inclusive — the
+// authoritative per-request gate still matches the concrete model id.
+export function modelGlobOverlaps(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const core = s => s.replace(/\*/g, '').toLowerCase();
+  const ca = core(a);
+  const cb = core(b);
+  return ca.includes(cb) || cb.includes(ca);
+}
+
+// The `blockedModels` pattern that takes a model FAMILY out of service, or null.
+//
+// The blocklist is written against concrete model ids (`*fable*`,
+// `claude-fable-5`) but the status view reasons in families (`Fable`), so a
+// direct glob match is not enough: `claude-fable-5` never matches the literal
+// string `Fable`. Both spellings are checked so the two natural ways to block a
+// family light up the same row — the glob (via modelGlobMatches, which also
+// makes a bare `*` block everything) and a concrete id (via substring).
+//
+// Deliberately advisory: this drives display only. The authoritative gate is the
+// per-request check in server.js, which matches the real model id. A pattern
+// that names no family (say `claude-3-*`) simply lights up no row, and the
+// header list still shows it verbatim.
+export function findFamilyBlock(patterns, family) {
+  if (!Array.isArray(patterns) || !family) return null;
+  const key = String(family).toLowerCase();
+  return patterns.find(p => typeof p === 'string'
+    && (modelGlobMatches(p, key) || p.toLowerCase().includes(key))) || null;
 }
 
 // Streaming, byte-exact locator for a TOP-LEVEL string field of a JSON object,

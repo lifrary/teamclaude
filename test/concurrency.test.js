@@ -602,35 +602,70 @@ test('token-refresh callback is not emitted with a stale index for a removed acc
 
 // ── integration: proxy enforces the per-account cap end-to-end ─────────────
 
-test('proxy caps concurrent in-flight per account and still serves every request', async () => {
+test('proxy caps concurrent in-flight per account and still serves every request', { timeout: 15_000 }, async t => {
   const live = {};  // token -> current concurrent in flight at upstream
   const peak = {};  // token -> peak concurrent observed
-
-  const upstream = http.createServer(async (req, res) => {
+  const responses = [];
+  let allArrived;
+  const arrivals = new Promise(resolve => { allArrived = resolve; });
+  const controller = new AbortController();
+  let proxy;
+  let requests = Promise.resolve([]);
+  let barrierTimer;
+  const upstream = http.createServer((req, res) => {
     const tok = (req.headers['authorization'] || '').replace('Bearer ', '');
     live[tok] = (live[tok] || 0) + 1;
     peak[tok] = Math.max(peak[tok] || 0, live[tok]);
-    await new Promise(r => setTimeout(r, 60)); // hold open so concurrency overlaps
-    live[tok]--;
-    res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: true }));
+    responses.push({ tok, res });
+    if (responses.length === 6) allArrived();
+  });
+  t.after(async () => {
+    clearTimeout(barrierTimer);
+    controller.abort();
+    for (const { res } of responses) res.destroy();
+    proxy?.closeAllConnections();
+    upstream.closeAllConnections();
+    await Promise.all([
+      new Promise(resolve => proxy ? proxy.close(resolve) : resolve()),
+      new Promise(resolve => upstream.close(resolve)),
+      requests.catch(() => {}),
+    ]);
   });
   const upstreamPort = await listen(upstream);
 
   const am = new AccountManager(makeAccounts(3), 0.98, 0, 2); // cap 2/account → 6 total
   measureAll(am);
-  const proxy = createProxyServer(am, {
+  proxy = createProxyServer(am, {
     proxy: { apiKey: 'k' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
     overflowQueueTimeoutMs: 5000,
+    activeWarmup: false,
   });
   const port = await listen(proxy);
 
   // 6 concurrent client requests (localhost → proxy auth skipped)
-  const statuses = await Promise.all(Array.from({ length: 6 }, () =>
+  requests = Promise.all(Array.from({ length: 6 }, () =>
     fetch(`http://127.0.0.1:${port}/v1/messages`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ hi: 1 }),
-    }).then(r => r.status)));
+      signal: controller.signal,
+    }).then(async r => { await r.text(); return r.status; })));
+  requests.catch(() => {});
+  // No response can free a slot before the complete six-request wave arrives.
+  // This deadline detects a broken admission path; it does not create overlap.
+  await Promise.race([
+    arrivals,
+    new Promise((_, reject) => {
+      barrierTimer = setTimeout(() => reject(new Error(`Only ${responses.length}/6 requests reached the admission barrier`)), 10_000);
+    }),
+  ]);
+  clearTimeout(barrierTimer);
+  assert.equal(responses.length, 6, 'all six slots must be held simultaneously');
+  for (const { tok, res } of responses) {
+    live[tok]--;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+  }
+  const statuses = await requests;
 
   assert.equal(statuses.every(s => s === 200), true, 'every request should succeed');
   for (const [tok, p] of Object.entries(peak)) {
@@ -639,9 +674,6 @@ test('proxy caps concurrent in-flight per account and still serves every request
   assert.ok(Object.keys(peak).length >= 3, 'load should have spread across all 3 accounts');
   // slots fully released afterwards
   assert.equal(am.accounts.every(a => a.inflight === 0), true);
-
-  upstream.close();
-  proxy.close();
 });
 
 test('a keep-alive connection pins its sequential requests to one account (affinity end-to-end)', async () => {

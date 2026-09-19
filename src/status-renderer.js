@@ -1,3 +1,7 @@
+import { formatMoney } from './oauth.js';
+import { findFamilyBlock, modelGlobOverlaps, resolveMaxUsage, resolveSwitchThreshold } from './model.js';
+import { safeLine } from './safe-text.js';
+
 const ESC = '\x1b[';
 const RESET = `${ESC}0m`;
 
@@ -6,11 +10,38 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
   const lines = [];
   const probe = status.probe || { enabled: false, intervalSeconds: 0, accounts: [] };
   const warm = status.warm || { enabled: false, intervalSeconds: 0, accounts: [] };
-  const accounts = status.accounts || [];
+  // Listed in preference order, which is what an operator configured priority to
+  // mean: the account the fleet reaches for first is at the top, the last resort
+  // at the bottom. The payload arrives in config-file order, so an account moved
+  // to the back of the ladder still read as second in the list. Ties keep their
+  // configured order (the sort is stable), which is also the rotation cursor's.
+  const accounts = [...(status.accounts || [])].sort((a, b) => (a.priority ?? Infinity) - (b.priority ?? Infinity));
+  const blocked = (status.blockedModels || []).filter(p => typeof p === 'string' && p.length).map(p => safeLine(p, 64));
+  // This payload can come off the wire (`teamclaude status` against a running
+  // server), and account/route strings in it started life in an OAuth reply or
+  // a config file. Names are cut down once here and compared in that form, so a
+  // stripped account still matches a stripped current-account marker.
+  const currentAccount = status.currentAccount == null ? null : nameText(status.currentAccount);
+
+  // Only adaptive distribution swaps the Active row for a Serving row and lets
+  // the `>` marker follow the sessions; see formatActive for why the modes differ.
+  const adaptiveMode = status.sessions?.mode === 'adaptive';
 
   lines.push(paint.bold('TeamClaude status'));
-  lines.push(`${paint.dim('Active'.padEnd(12))} ${paint.cyan(status.currentAccount || 'none')}`);
-  lines.push(`${paint.dim('Switch at'.padEnd(12))} ${formatPercent(status.switchThreshold)}`);
+  lines.push(`${paint.dim(activeLabel(adaptiveMode).padEnd(12))} ${formatActive(status, currentAccount, adaptiveMode, paint)}`);
+  const thresholds = status.switchThreshold;
+  const thresholdText = thresholds && typeof thresholds === 'object'
+    ? Object.entries(thresholds).filter(([, v]) => Number.isFinite(v))
+      .map(([key, value]) => `${safeLine(key, 32)}:${formatPercent(value)}`).join(' ')
+    : formatPercent(resolveSwitchThreshold(thresholds, 'default'));
+  lines.push(`${paint.dim('Switch at'.padEnd(12))} ${thresholdText}`);
+  // Only when something is blocked: a always-visible "Blocked" row would be
+  // noise for the common case, but its ABSENCE is what made a blocked model
+  // read as available — the per-account Models row reports quota headroom and
+  // knows nothing about the blocklist.
+  if (blocked.length) {
+    lines.push(`${paint.dim('Blocked'.padEnd(12))} ${paint.red(blocked.join(', '))}`);
+  }
   if (status.sessions) {
     lines.push(`${paint.dim('Sessions'.padEnd(12))} ${formatSessions(status.sessions, paint)}`);
   }
@@ -23,21 +54,129 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
   }
   lines.push('');
 
-  for (const line of routingLines(status.routes, paint)) lines.push(line);
+  for (const line of routingLines(status.routes, blocked, paint)) lines.push(line);
 
   for (const account of accounts) {
-    lines.push(renderAccountHeader(account, status.currentAccount, paint, now));
+    lines.push(renderAccountHeader(account, currentAccount, paint, now, adaptiveMode));
     for (const quotaLine of quotaLines(account, now, paint)) {
       lines.push(`  ${quotaLine}`);
     }
-    const routing = modelRoutingLine(account, status.switchThreshold, now, paint);
+    const routing = modelRoutingLine(account, status.switchThreshold, blocked, now, paint);
     if (routing) lines.push(`  ${routing}`);
+    const why = unavailableLine(account, paint);
+    if (why) lines.push(`  ${why}`);
+    const spend = spendLine(account, paint);
+    if (spend) lines.push(`  ${spend}`);
     lines.push(`  ${paint.dim('Usage'.padEnd(8))} ${formatUsage(account.usage, now)}`);
-    lines.push(`  ${paint.dim('Probe'.padEnd(8))} ${formatAccountProbe(account.name, probe, now, paint)}`);
+    lines.push(`  ${paint.dim('Probe'.padEnd(8))} ${formatAccountProbe(nameText(account.name), probe, now, paint)}`);
+    const adaptive = adaptiveFor(status, nameText(account.name));
+    if (adaptive) lines.push(`  ${paint.dim('Adaptive'.padEnd(8))} ${formatAdaptive(adaptive, paint)}`);
+    lines.push('');
+  }
+
+  // Per-client usage (proxy.clientKeys) — only when something was attributed,
+  // so deployments without client keys see no empty section.
+  const clients = Object.entries(status.clients || {});
+  if (clients.length) {
+    lines.push(paint.bold('Clients'));
+    renderUsageEntries(lines, clients, paint, now);
+    lines.push('');
+  }
+
+  // One section per configured usage dimension (proxy.usageDimensions). The
+  // dimension list is operator config and each tracker is key-capped, so the
+  // size of this output is bounded by the config file, not by caller traffic.
+  for (const [dimension, entries] of Object.entries(status.usageDimensions || {})) {
+    const rows = Object.entries(entries || {});
+    if (!rows.length) continue;
+    lines.push(paint.bold(usageDimensionTitle(dimension)));
+    renderUsageEntries(lines, rows, paint, now);
     lines.push('');
   }
 
   return lines.join('\n').trimEnd();
+}
+
+// A name-sized field, fit to print: an account or route name, a glob, a pin.
+const nameText = value => safeLine(value, 64);
+
+function renderUsageEntries(lines, entries, paint, now) {
+  entries.sort(([, a], [, b]) => ((b.inputTokens || 0) + (b.outputTokens || 0)) - ((a.inputTokens || 0) + (a.outputTokens || 0)));
+  for (const [name, c] of entries) {
+    const tokens = `${formatNumber(c.inputTokens)} in / ${formatNumber(c.outputTokens)} out`;
+    const last = parseTs(c.lastUsed);
+    const lastText = last ? `, last ${formatAgo(last, now)}` : '';
+    // WebSocket channels (Remote Control) are counted apart from requests and
+    // shown only where a client has opened one, so the row reads as before
+    // everywhere else.
+    const conns = c.connections ? `, ${c.connections} ws` : '';
+    lines.push(`  ${paint.cyan(safeLine(name).padEnd(20))} ${c.requests || 0} req${conns}, ${tokens}${lastText}`);
+  }
+}
+
+function usageDimensionTitle(name) {
+  const safe = safeLine(name);
+  return `${safe.charAt(0).toUpperCase()}${safe.slice(1)} usage`;
+}
+
+// Why an account is out of rotation, in the operator's terms. Reading
+// `unifiedStatus: allowed` next to an account that refuses everything used to
+// leave no way to tell whether the refusal was upstream's or the proxy's own
+// threshold policy (#166); this says which.
+export const UNAVAILABLE_TEXT = {
+  disabled: 'disabled by operator',
+  throttled: 'upstream 429 hold',
+  exhausted: 'marked exhausted',
+  error: 'account error (see logs)',
+  'upstream-rejected': 'upstream reports quota rejected',
+  quota: 'local switch threshold reached',
+  capped: 'account usage cap reached (maxUsage)',
+  'advisor-capped': "advisor model's usage cap reached (maxUsage)",
+  entitlement: 'upstream refused this account for the organization (cooldown)',
+  route: 'no route allows this account',
+  'advisor-quota': "advisor model's weekly bucket spent",
+  'advisor-route': 'no route allows the advisor model',
+};
+
+/**
+ * The paid-overage warning line, or null when this account cannot bill and
+ * never has. Rendered separately from the quota bars on purpose: those all
+ * measure a plan allowance that simply runs out, while this one says that
+ * running out is billable here. An operator scanning the bars has no other way
+ * to see that rotation onto this account spends money rather than quota.
+ *
+ * Shown whenever billing is possible OR anything has already been billed — an
+ * account that spent this month and has since been switched off is still a
+ * fact about where the money went.
+ */
+export function spendLine(account, paint) {
+  const spend = account?.quota?.spend;
+  if (!spend) return null;
+  const spent = (spend.usedMinor || 0) > 0;
+  if (!spend.enabled && !spent) return null;
+
+  const amount = formatMoney(spend);
+  if (spend.enabled) {
+    // Already billing is the louder of the two: red, and named as money rather
+    // than as a percentage, so it cannot be mistaken for another quota bar.
+    const text = spent
+      ? `billing real money — ${amount} used this month`
+      : `can bill real money past its plan limits — ${amount} used`;
+    return `${paint.dim('Spend'.padEnd(8))} ${(spent ? paint.red : paint.yellow)(`\u26a0 ${text}`)}`;
+  }
+  // Not enabled, but money was spent this month. Say why it is off now, since
+  // "out_of_credits" and "the member turned it off" have different futures.
+  const why = spend.userDisabled ? 'now disabled by the account holder'
+    : spend.disabledReason ? `now off (${safeLine(spend.disabledReason, 64)})`
+    : 'now off';
+  return `${paint.dim('Spend'.padEnd(8))} ${paint.yellow(`${amount} spent this month, ${why}`)}`;
+}
+
+export function unavailableLine(account, paint) {
+  const reason = account?.unavailable;
+  if (!reason) return null;
+  const text = UNAVAILABLE_TEXT[reason] || safeLine(reason, 64);
+  return `${paint.dim('Blocked'.padEnd(8))} ${paint.yellow(text)}`;
 }
 
 function colors(enabled) {
@@ -67,15 +206,22 @@ function paintRoute(paint, color, value) {
 // listing the model globs it matches and the accounts it can use, each colored
 // by live eligibility. Auto-created routes (a family metered separately with no
 // configured route) are tagged (auto); a bucket override shows in [brackets].
-function routingLines(routes, paint) {
+function routingLines(routes, blocked, paint) {
   if (!Array.isArray(routes) || routes.length === 0) return [];
   const lines = [paint.bold('Routing')];
   for (const route of routes) {
-    const match = (route.match || []).join(', ');
-    const accounts = (route.accounts || [])
-      .map(a => (a.eligible ? paint.green(a.name) : paint.red(a.name))).join(' ') || paint.gray('(none)');
-    const tag = route.autocreated ? paint.dim(' (auto)') : route.bucket ? paint.dim(` [${route.bucket}]`) : '';
-    const pin = route.pinned ? paint.dim(` [pinned: ${route.pinned}]`) : '';
+    const globs = (route.match || []).map(nameText);
+    const match = globs.join(', ');
+    // A route every one of whose globs is blocked can carry no traffic at all —
+    // say so, rather than listing eligible accounts it will never reach.
+    const routeBlocked = globs.length > 0
+      && globs.every(g => blocked.some(p => modelGlobOverlaps(p, g)));
+    const accounts = routeBlocked
+      ? paint.red('blocked')
+      : (route.accounts || [])
+        .map(a => (a.eligible ? paint.green(nameText(a.name)) : paint.red(nameText(a.name)))).join(' ') || paint.gray('(none)');
+    const tag = route.autocreated ? paint.dim(' (auto)') : route.bucket ? paint.dim(` [${nameText(route.bucket)}]`) : '';
+    const pin = route.pinned ? paint.dim(` [pinned: ${nameText(route.pinned)}]`) : '';
     // padEnd on the raw text, color after, so ANSI codes don't throw off alignment.
     const label = paintRoute(paint, route.color, match.padEnd(16));
     lines.push(`  ${label} ${paint.dim('→')} ${accounts}${tag}${pin}`);
@@ -84,29 +230,155 @@ function routingLines(routes, paint) {
   return lines;
 }
 
-function renderAccountHeader(account, currentAccount, paint, now) {
-  const current = account.name === currentAccount;
-  const marker = current ? paint.cyan('>') : ' ';
-  const name = current ? paint.bold(account.name) : account.name;
-  const status = formatAccountStatus(account, now, paint);
-  const org = account.orgName ? ` ${paint.dim(account.orgName)}` : '';
-  const sess = account.sessions ? ` ${paint.dim(`${account.sessions} sess`)}` : '';
-  return `${marker} ${name} ${paint.dim(`(${account.type}, prio ${account.priority || 0})`)} ${status}${org}${sess}`;
+// `currentAccount` is the ROTATION CURSOR. Under ADAPTIVE distribution that is
+// not the account serving the traffic: the adaptive picker scores every
+// candidate per session and never moves the cursor, so it is just where a
+// SESSION-LESS request would go, and reporting it as "Active" points at one
+// account while several are serving. Observed live: the cursor sat on an
+// account holding a 34% share while the account beside it held 66%.
+//
+// So the label follows the mode. Off — and in plain even distribution, whose
+// picker still walks from the cursor — the cursor is the active account and
+// the row reads as it always has. Adapting, the cursor is named for what it is
+// and the accounts actually carrying sessions are listed instead.
+function activeLabel(adaptiveMode) {
+  return adaptiveMode ? 'Serving' : 'Active';
 }
 
-// "2 active / 3 known · distributing" — the running-sessions readout.
+// A session count off the wire: anything that is not a finite number is zero.
+function sessionCount(account) {
+  return Number.isFinite(account?.sessions) ? account.sessions : 0;
+}
+
+function formatActive(status, currentAccount, adaptiveMode, paint) {
+  if (!adaptiveMode) return paint.cyan(currentAccount || 'none');
+  const serving = (status.accounts || []).filter(a => sessionCount(a) > 0);
+  const cursor = paint.dim(`cursor ${currentAccount || 'none'}`);
+  if (!serving.length) {
+    // Nothing is running, so the cursor is the only answer there is — but say
+    // that it is the cursor, since the next request may not go there.
+    return `${paint.dim('idle')} ${cursor}`;
+  }
+  const named = serving
+    .sort((a, b) => sessionCount(b) - sessionCount(a))
+    .map(a => `${paint.cyan(nameText(a.name))} ${paint.dim(`${sessionCount(a)}`)}`)
+    .join(paint.dim(' · '));
+  return `${named}  ${cursor}`;
+}
+
+function renderAccountHeader(account, currentAccount, paint, now, followSessions = false) {
+  const acctName = nameText(account.name);
+  // Under adaptive distribution the marker follows the sessions rather than the
+  // cursor, so the accounts flagged here are the ones the fleet is running on.
+  const current = followSessions ? sessionCount(account) > 0 : acctName === currentAccount;
+  const marker = current ? paint.cyan('>') : ' ';
+  const shown = current ? paint.bold(acctName) : acctName;
+  const status = formatAccountStatus(account, now, paint);
+  const org = account.orgName ? ` ${paint.dim(nameText(account.orgName))}` : '';
+  const sessions = sessionCount(account);
+  const sess = sessions
+    ? ` ${paint.dim(`${sessions} sess${formatSessionBuckets(account.sessionsByBucket)}`)}`
+    : '';
+  return `${marker} ${shown} ${paint.dim(`(${safeLine(account.type, 16)}, prio ${account.priority ?? 'auto'})`)} ${status}${org}${sess}`;
+}
+
+// "2 active / 3 known · distributing" — the running-sessions readout. While a
+// distribution toggle drains, say so and how many sessions are left to finish,
+// so "single-account" is not claimed before it is actually true.
 function formatSessions(sessions, paint) {
   const active = sessions.active || 0;
   const known = sessions.known || 0;
-  const mode = sessions.distribute ? paint.green('distributing') : paint.dim('single-account');
+  const draining = sessions.draining || 0;
+  let mode;
+  // Name WHICH distribution is running: "distributing" and "adapting" pick
+  // different accounts for the same fleet, so an operator reading the line
+  // needs to know which rule produced what they are looking at.
+  if (sessions.mode === 'adaptive') mode = paint.green('adapting');
+  else if (sessions.distribute) mode = paint.green('distributing');
+  else if (draining) mode = paint.yellow(`draining ${draining}`);
+  else mode = paint.dim('single-account');
   return `${active} active / ${known} known ${paint.dim('·')} ${mode}`;
+}
+
+// Weekly buckets, named for the model family an operator thinks in rather than
+// for the quota field. 'unified7d' is deliberately "opus+": it is the SHARED
+// weekly bucket, so Opus, Haiku and anything unclassified all meter there
+// together — calling it "opus" would misreport the other two as absent.
+const BUCKET_LABELS = {
+  unified7d: 'opus+',
+  unified7dFable: 'fable',
+  unified7dSonnet: 'sonnet',
+};
+
+// " (opus+ 2, fable 1)" — which families an account's sessions are on. A session
+// holding two families on one account appears in both, so these can sum to more
+// than the total they follow; that is the same double-count the per-account
+// totals already carry against `active`, for the same reason.
+//
+// Suppressed when there is only one family in play: "3 sess (opus+ 3)" adds a
+// parenthesis and no information, and the breakdown exists to show a split.
+function formatSessionBuckets(byBucket) {
+  const entries = Object.entries(byBucket || {}).filter(([, n]) => Number.isFinite(n) && n > 0);
+  if (entries.length < 2) return '';
+  entries.sort((a, b) => b[1] - a[1]);
+  return ` (${entries.map(([b, n]) => `${bucketLabel(b)} ${n}`).join(', ')})`;
+}
+
+// A bucket key is a quota field name on our side, but it arrives in the status
+// payload like everything else, so an unknown one is printed stripped and short.
+function bucketLabel(key) {
+  return BUCKET_LABELS[key] || safeLine(key, 24);
+}
+
+// A number in the adaptive readout, or `?` when the payload did not carry one:
+// an older server omits fields, a hostile one sends strings, and neither may
+// throw inside `teamclaude status`.
+function pct(value, digits) {
+  return Number.isFinite(value) ? `${(value * 100).toFixed(digits)}%` : '?';
+}
+function num(value, digits = 0) {
+  return Number.isFinite(value) ? value.toFixed(digits) : '?';
+}
+
+// The adaptive row for one account, or null when the mode is off (getStatus
+// sends an empty list) or this account predates the snapshot.
+// Matched on the stripped name, the form the account header was rendered in.
+function adaptiveFor(status, name) {
+  const rows = Array.isArray(status.adaptive) ? status.adaptive : [];
+  return rows.find(r => r && typeof r === 'object' && nameText(r.name) === name) || null;
+}
+
+// "next · weight 62%  ·  3 sess / 1 inflight  ·  head 38.0% of 98%  ·  plan 20x
+//  ·  conc 6"
+//
+// `next` is the deterministic routing result. `weight` is the account's score
+// normalized across competitors, useful for explaining why it won without
+// misrepresenting the picker as a weighted random draw.
+function formatAdaptive(a, paint) {
+  const parts = [];
+  const family = bucketLabel(a.bucket);
+  const prefix = a.next ? `${paint.green('next')} ${paint.dim('·')} ` : '';
+  parts.push(a.weight == null
+    // Every candidate scored zero: the whole tier is inside its reserve, so
+    // there is no weight to report and saying "0%" everywhere would imply the
+    // router had stopped, which it has not.
+    ? `${prefix}${paint.yellow(`weight n/a (all reserved, ${family})`)}`
+    : `${prefix}${paint.bold(`weight ${pct(a.weight, 0)} of ${family}`)}`);
+  parts.push(`${num(a.sessions)} sess / ${num(a.inFlight)} inflight`);
+  parts.push(`head ${pct(a.headroom, 1)} of ${pct(a.threshold, 0)}`);
+  parts.push(a.planWeight == null
+    ? paint.dim('plan unknown')
+    : `plan ${Number.isFinite(a.planWeight) ? a.planWeight : '?'}x`);
+  parts.push(`conc ${num(a.concCap, 1)}`);
+  const line = parts.join(paint.dim('  ·  '));
+  return a.competing ? line : `${paint.dim('(not competing)')} ${line}`;
 }
 
 function formatAccountStatus(account, now, paint) {
   const parts = [];
   if (account.disabled) parts.push(paint.gray('disabled'));
 
-  const status = account.status || 'unknown';
+  const status = safeLine(account.status || 'unknown', 32) || 'unknown';
   const colored = status === 'active'
     ? paint.green(status)
     : status === 'throttled'
@@ -121,6 +393,11 @@ function formatAccountStatus(account, now, paint) {
     parts.push(`throttle ${formatDuration(throttleAt - now)}`);
   }
 
+  const entitlementAt = parseTs(account.entitlementDeniedUntil);
+  if (entitlementAt && entitlementAt > now) {
+    parts.push(paint.yellow(`entitlement cooldown ${formatDuration(entitlementAt - now)}`));
+  }
+
   return parts.join(' / ');
 }
 
@@ -128,91 +405,179 @@ function formatAccountStatus(account, now, paint) {
 // specific models" view. Only rendered for accounts that meter a family
 // separately (a Sonnet or Fable weekly bucket), since that is the only case
 // where a request's model changes where it can route. A family reads ✗ when the
-// account is benched from rotation at all (`available: false` — disabled, throttled,
-// parked, or over a shared bucket), when the shared 5h bucket is spent, or when its
-// own weekly bucket is over the switch threshold; the reset is shown when the family
-// bucket is the blocker so it's clear when that model becomes available again.
-function modelRoutingLine(account, threshold, now, paint) {
-  const q = account.quota || {};
-  if (q.unified7dSonnet == null && q.unified7dFable == null) return null;
-  const t = Number(threshold);
-  const fiveOver = q.unified5h != null && !Number.isNaN(t) && q.unified5h >= t;
-  // Quota is not the only reason a model cannot route here. `available` is the
-  // server's own rotation verdict (disabled / throttled / error / exhausted / over
-  // threshold), and without it this line rendered a green ✓ for an account the
-  // server refuses outright. Strict `=== false` on purpose: an older daemon's
-  // payload omits the field, and absent must mean "don't claim to know".
-  // `pausedUntil` has to be checked separately: a rate-limit 429 pauses an account
-  // WITHOUT marking it throttled, and pause lives in `_hasCapacity`, which the
-  // `available` verdict does not consult — so without this a paused account whose
-  // requests are all queueing still advertised every model as routable.
+// shared session or weekly bucket is spent, or its own weekly bucket is spent.
+// Each bucket uses its OWN threshold, matching AccountManager._isNearQuota:
+// a looser family limit never bypasses the shared weekly gate, and a stricter
+// family limit must not be applied to spend in the shared weekly bucket.
+function modelRoutingLine(account, threshold, blocked, now, paint) {
+  const q = displayQuota(account);
   const pausedTs = parseTs(account.pausedUntil);
-  const benched = account.available === false || (pausedTs != null && pausedTs > now);
+  const benched = account.available === false || account.disabled || account.enabled === false
+    || (pausedTs != null && pausedTs > now);
+  // A family is metered here when its own weekly bucket is known, or when only
+  // the learned one is: a spent reading is cleared for revalidation (see
+  // refreshExpiredQuotas) while `scopedWeekly` keeps its own until that bucket's
+  // reset passes. Reading the dedicated field alone, the whole row vanished from
+  // an account that still routes both families. The mark stays on the dedicated
+  // key regardless, which is what the router gates on.
+  const metered = family => q[`unified7d${family}`] != null || q.scopedWeekly?.[family.toLowerCase()] != null;
+  if (!metered('Sonnet') && !metered('Fable')) return null;
+  const overThreshold = (v, bucket) => v != null && v >= resolveSwitchThreshold(threshold, bucket);
+  // A per-account cap is the other ceiling a family can be over. Without it a
+  // capped family reads ✓ on the very line that exists to say where a model can
+  // still run, right beside the Blocked line saying it cannot.
+  const overCap = (v, bucket) => {
+    const cap = resolveMaxUsage(account.maxUsage, bucket);
+    return cap != null && v != null && v >= cap;
+  };
+  const sharedWeeklyOver = overThreshold(q.unified7d, 'unified7d');
+  // Shared session and weekly ceilings block every family.
+  const sharedOver = overThreshold(q.unified5h, 'unified5h') || overCap(q.unified5h, 'unified5h')
+    || sharedWeeklyOver || overCap(q.unified7d, 'unified7d');
 
-  const cell = (label, weekly, reset) => {
-    const weeklyOver = weekly != null && !Number.isNaN(t) && weekly >= t;
-    const mark = benched || fiveOver || weeklyOver ? paint.red('✗') : paint.green('✓');
-    const resetTs = parseTs(reset);
+  const cell = (label, bucketKey, reset) => {
+    // The blocklist outranks quota: a blocked family cannot be served however
+    // much headroom the account has, so it must not read ✓. Reporting quota
+    // alone is what made a fully-blocked model look available.
+    if (findFamilyBlock(blocked, label)) {
+      return `${label} ${paint.red('⊘')}${paint.dim(' blocked')}`;
+    }
+    // Family thresholds and caps judge that family's own spend; the shared
+    // weekly threshold and cap remain independent gates.
+    const weeklyOver = sharedWeeklyOver || overThreshold(q[bucketKey], bucketKey)
+      || overCap(q[bucketKey] ?? null, bucketKey);
+    const mark = benched || sharedOver || weeklyOver ? paint.red('✗') : paint.green('✓');
+    // The recovery time is the LATEST reset among the two WEEKLY buckets
+    // currently over their respective thresholds. The weekly half of the
+    // mark only clears once BOTH independent weekly blockers
+    // have rolled; showing the family reset beside a ✗ the shared weekly
+    // produced told an operator that a week-long block clears tomorrow. An
+    // unreported reset among the blockers means the recovery time is unknown,
+    // and a known-but-earlier one would understate it, so say nothing rather
+    // than name a time that is not when this clears.
+    //
+    // The shared 5h bucket is deliberately NOT in this set, and that is a known
+    // gap rather than an oversight. It can raise the mark through `fiveOver`
+    // while contributing no candidate reset, so an account blocked longer by 5h
+    // than by its weekly buckets still shows the weekly clearing time. Stock
+    // renders the identical line, so this is not a regression, and it is narrow:
+    // it needs the 5h reset to fall later than the blocking weekly reset, which
+    // only happens while the weekly window is within about five hours of
+    // rolling. Closing it means restructuring the cell rather than adding a
+    // third candidate, since the whole `when` clause is gated on `weeklyOver`
+    // and a 5h-only block suppresses the time entirely.
+    const over = [];
+    if (overThreshold(q[bucketKey], bucketKey)) over.push(parseTs(reset));
+    if (bucketKey !== 'unified7d' && sharedWeeklyOver) {
+      over.push(parseTs(q.unified7dReset));
+    }
+    const resetTs = over.length && over.every(Boolean) ? Math.max(...over) : null;
     const when = weeklyOver && resetTs && resetTs > now ? paint.dim(` ${formatDuration(resetTs - now)}`) : '';
     return `${label} ${mark}${when}`;
   };
 
-  const cells = [cell('Opus', q.unified7d, q.unified7dReset)];
-  if (q.unified7dSonnet != null) cells.push(cell('Sonnet', q.unified7dSonnet, q.unified7dSonnetReset));
-  if (q.unified7dFable != null) cells.push(cell('Fable', q.unified7dFable, q.unified7dFableReset));
-  // Name the cause when it is NOT the quota the bars above already show — three
-  // unexplained ✗ on an account whose quota reads healthy is its own puzzle.
-  // A pause has no `benchedReason` — the verdict does not cover capacity — so name it
-  // here rather than leaving three unexplained ✗ on an account that reads active.
-  const cause = account.benchedReason || (pausedTs != null && pausedTs > now ? 'paused' : null);
-  const why = benched && cause && cause !== 'quota' ? paint.dim(`  (${cause})`) : '';
+  const cells = [cell('Opus', 'unified7d', q.unified7dReset)];
+  if (metered('Sonnet')) cells.push(cell('Sonnet', 'unified7dSonnet', q.unified7dSonnetReset));
+  if (metered('Fable')) cells.push(cell('Fable', 'unified7dFable', q.unified7dFableReset));
+  const cause = account.benchedReason || account.unavailable
+    || (pausedTs != null && pausedTs > now ? 'paused' : null);
+  const why = benched && cause && cause !== 'quota' ? paint.dim(`  (${safeLine(cause, 64)})`) : '';
   return `${paint.dim('Models'.padEnd(8))} ${cells.join('   ')}${why}`;
 }
 
+function displayQuota(account) {
+  const q = account.quota || {};
+  const fable = q.modelWeekly?.['7d_oi'];
+  return fable && q.unified7dFable == null
+    ? { ...q, unified7dFable: fable.utilization, unified7dFableReset: fable.reset }
+    : q;
+}
+
 function quotaLines(account, now, paint) {
-  const quota = account.quota || {};
+  const quota = displayQuota(account);
   const lines = [];
 
+  // A configured cap (accounts[].maxUsage) is drawn on the bucket it caps, so the
+  // budget is visible before it binds rather than only as a Blocked line after.
+  const cap = bucket => resolveMaxUsage(account.maxUsage, bucket);
+
   if (quota.unified5h != null || quota.unified7d != null || quota.unified7dSonnet != null || quota.unified7dFable != null) {
-    lines.push(formatQuotaLine('Session', quota.unified5h, quota.unified5hReset, now, paint));
-    lines.push(formatQuotaLine('Weekly', quota.unified7d, quota.unified7dReset, now, paint));
+    lines.push(formatQuotaLine('Session', quota.unified5h, quota.unified5hReset, now, paint, cap('unified5h')));
+    lines.push(formatQuotaLine('Weekly', quota.unified7d, quota.unified7dReset, now, paint, cap('unified7d')));
     if (quota.unified7dSonnet != null) {
-      lines.push(formatQuotaLine('Sonnet', quota.unified7dSonnet, quota.unified7dSonnetReset, now, paint));
+      lines.push(formatQuotaLine('Sonnet', quota.unified7dSonnet, quota.unified7dSonnetReset, now, paint, cap('unified7dSonnet')));
     }
     if (quota.unified7dFable != null) {
-      lines.push(formatQuotaLine('Fable', quota.unified7dFable, quota.unified7dFableReset, now, paint));
+      lines.push(formatQuotaLine('Fable', quota.unified7dFable, quota.unified7dFableReset, now, paint, cap('unified7dFable')));
     }
     return lines;
   }
 
   if (quota.tokensLimit != null && quota.tokensRemaining != null) {
     const ratio = 1 - quota.tokensRemaining / quota.tokensLimit;
-    lines.push(formatQuotaLine('Tokens', ratio, quota.resetsAt, now, paint));
+    lines.push(formatQuotaLine('Tokens', ratio, quota.resetsAt, now, paint, cap('tokens')));
   }
   if (quota.requestsLimit != null && quota.requestsRemaining != null) {
     const ratio = 1 - quota.requestsRemaining / quota.requestsLimit;
-    lines.push(formatQuotaLine('Requests', ratio, quota.resetsAt, now, paint));
+    lines.push(formatQuotaLine('Requests', ratio, quota.resetsAt, now, paint, cap('requests')));
   }
+  // A third-party backend publishes its own figure (a balance, a percentage —
+  // backend-quota.js decides). Drawn from the normalized reading alone: a bar
+  // when the provider reports a fraction, its text when it does not.
+  const backend = quota.backend;
+  if (backend?.text) {
+    const label = String(backend.label || 'Quota').padEnd(8);
+    const bar = backend.utilization != null ? `${usageBar(backend.utilization, paint)} ` : '';
+    lines.push(`${paint.dim(label)} ${bar}${backend.text}`);
+  }
+
   if (lines.length === 0) lines.push(`${paint.dim('Quota'.padEnd(8))} ${paint.gray('unknown')}`);
   return lines;
 }
 
-function formatQuotaLine(label, ratio, resetAt, now, paint) {
+/**
+ * @param {string} label
+ * @param {number|string|null|undefined} ratio
+ * @param {unknown} resetAt
+ * @param {number} now
+ * @param {ReturnType<typeof colors>} paint
+ * @param {number|null} cap
+ */
+function formatQuotaLine(label, ratio, resetAt, now, paint, cap = null) {
   const resetTs = parseTs(resetAt);
   const reset = resetTs && resetTs > now ? ` reset ${formatDuration(resetTs - now)}` : '';
-  return `${paint.dim(label.padEnd(8))} ${usageBar(ratio, paint)} ${formatPercent(ratio)}${reset}`;
+  // Name the cap in words as well as marking it on the bar: one bar cell is ~6%,
+  // so the mark alone cannot say 60% rather than 61%.
+  const reached = cap != null && ratio != null && Number(ratio) >= cap;
+  const capText = cap == null ? ''
+    : ` ${(reached ? paint.red : paint.yellow)(`cap ${formatPercent(cap)}`)}`;
+  return `${paint.dim(label.padEnd(8))} ${usageBar(ratio, paint, cap)} ${formatPercent(ratio)}${capText}${reset}`;
 }
 
-function usageBar(ratio, paint) {
+const BAR_WIDTH = 18;
+
+/**
+ * @param {number|string|null|undefined} ratio
+ * @param {ReturnType<typeof colors>} paint
+ * @param {number|null} cap
+ */
+function usageBar(ratio, paint, cap = null) {
   if (ratio == null || Number.isNaN(Number(ratio))) return `[${paint.gray('??????????????????')}]`;
-  const width = 18;
+  const width = BAR_WIDTH;
   const safeRatio = Math.max(0, Math.min(1, Number(ratio)));
   const full = Math.round(safeRatio * width);
-  const fill = Array.from({ length: full }, (_, i) => {
+  const cells = Array.from({ length: width }, (_, i) => {
+    if (i >= full) return paint.gray('░');
     const [r, g, b] = gradientColor(i, width);
     return paint.rgb(r, g, b, '█');
-  }).join('');
-  return `[${fill}${paint.gray('░'.repeat(width - full))}]`;
+  });
+  // The cap sits where the bar may not pass. Drawn INSIDE the bar rather than
+  // inserted, so a capped row still lines up with an uncapped one.
+  if (cap != null && cap > 0 && cap < 1) {
+    const at = Math.min(width - 1, Math.round(cap * width));
+    cells[at] = (safeRatio >= cap ? paint.red : paint.yellow)('┃');
+  }
+  return `[${cells.join('')}]`;
 }
 
 function gradientColor(index, width) {
@@ -225,11 +590,18 @@ function gradientColor(index, width) {
 
 function formatProbeSummary(probe, now, paint) {
   if (!probe.enabled) return paint.gray('off (passive only)');
-  const bits = [`on every ${formatDuration((probe.intervalSeconds || 0) * 1000)}`];
+  let bits;
+  if (probe.mode === 'reset') {
+    bits = [`daily ${probe.warmupTime} ${probe.timezone} → reset ${probe.resetTime}`];
+  } else if (probe.mode === 'rolling') {
+    bits = [`rolling every ${formatDuration(probe.cadenceSeconds * 1000)}, reset anchor ${probe.resetTime} ${probe.timezone}`];
+  } else {
+    bits = [`on every ${formatDuration((probe.intervalSeconds || 0) * 1000)}`];
+  }
   if (probe.running) bits.push(paint.yellow('running'));
   const last = parseTs(probe.lastRunFinishedAt);
   if (last) bits.push(`last ${formatAgo(last, now)}`);
-  const next = parseTs(probe.nextRunAt);
+  const next = parseTs(probe.nextWarmupAt || probe.nextRunAt);
   if (next && next > now) bits.push(`next ${formatDuration(next - now)}`);
   return bits.join(', ');
 }
@@ -245,16 +617,12 @@ function formatAccountProbe(accountName, probe, now, paint) {
       ? paint.yellow('running')
       : row.status === 'never'
         ? paint.gray('never')
-        : paint.red(row.status || 'error');
+        : paint.red(safeLine(row.status, 32) || 'error');
   const last = parseTs(row.lastProbedAt || row.startedAt);
   const when = last ? ` ${formatAgo(last, now)}` : '';
   const duration = typeof row.durationMs === 'number' ? `, ${Math.round(row.durationMs)}ms` : '';
   const error = row.error ? `, ${safeLine(row.error)}` : '';
   return `${status}${when}${duration}${error}`;
-}
-
-function safeLine(value) {
-  return String(value).replace(/\x1b\[[0-?]*[ -/]*[@-~]|\p{C}/gu, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
 }
 
 function formatUsage(usage = {}, now) {
@@ -271,9 +639,12 @@ function formatServerSummary(server, now) {
   return started ? `up ${formatDuration(now - started)}` : 'unknown';
 }
 
-function formatPercent(value) {
+export function formatPercent(value) {
   if (value == null || Number.isNaN(Number(value))) return '-';
-  return `${Math.round(Number(value) * 100)}%`;
+  // The switch threshold can be set to a tenth of a percent, so rounding to a
+  // whole one would print a value that was never stored. Reported utilization
+  // arrives on a whole-percent grid, so bars are unaffected.
+  return `${Math.round(Number(value) * 1000) / 10}%`;
 }
 
 function formatNumber(value) {

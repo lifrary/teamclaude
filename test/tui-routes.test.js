@@ -36,10 +36,11 @@ const type = (tui, s) => { for (const ch of s) tui._key(ch); };
 const settle = () => new Promise(r => setTimeout(r, 5)); // let async save finish
 
 // Routing lives under the settings screen (g → "Manage routing"): open settings,
-// move the cursor to the routes row (threshold, probe, routes), press Enter.
+// move the cursor to the routes row by id (robust to added fields), press Enter.
 function openRoutes(tui) {
   tui._key('g');
-  tui._key('down'); tui._key('down');
+  const idx = tui._settingsFields().findIndex(f => f.id === 'routes');
+  for (let i = 0; i < idx; i++) tui._key('down');
   tui._key('enter');
 }
 
@@ -55,12 +56,20 @@ test('TUI routes editor: add walks name → glob → accounts → bucket and per
   type(tui, 'fable'); tui._key('enter');
   assert.match(tui.inputPrompt, /glob/);
   type(tui, '*fable*'); tui._key('enter');
-  assert.match(tui.inputPrompt, /Accounts/);
-  type(tui, 'b'); tui._key('enter');
-  assert.match(tui.inputPrompt, /bucket/i);
-  tui._key('enter'); // blank bucket → color prompt
-  assert.match(tui.inputPrompt, /color/i);
-  tui._key('enter'); // blank color → save
+
+  // accounts: a checklist now — highlight b (index 1), toggle it on, confirm
+  assert.equal(tui.mode, 'pick');
+  assert.equal(tui.pick.multi, true);
+  tui._key('down'); tui._key(' '); tui._key('enter');
+
+  // bucket: single-select, default "auto" (blank) → Enter keeps it
+  assert.equal(tui.mode, 'pick');
+  assert.equal(tui.pick.multi, false);
+  tui._key('enter');
+
+  // color: single-select, default → Enter keeps it, then saves
+  assert.equal(tui.mode, 'pick');
+  tui._key('enter');
   await settle();
 
   assert.deepEqual(config.routes, [{ name: 'fable', match: ['*fable*'], accounts: ['b'] }]);
@@ -78,7 +87,7 @@ test('TUI routes editor: a blank name cancels without creating a route', async (
   assert.equal(tui.mode, 'routes');
 });
 
-test('TUI routes editor: edit prefills, and backspace clears a field before retyping', async () => {
+test('TUI routes editor: edit prefills the pickers from the existing route', async () => {
   const { tui, config } = makeTUI();
   config.routes = [{ name: 'fable', match: ['*fable*'], accounts: ['b'] }];
 
@@ -87,10 +96,20 @@ test('TUI routes editor: edit prefills, and backspace clears a field before rety
   tui._key('enter');
   assert.equal(tui.inputBuf, '*fable*');         // glob prefilled
   tui._key('enter');
-  assert.equal(tui.inputBuf, 'b');               // accounts prefilled
-  tui._key('bs'); type(tui, 'a,b'); tui._key('enter');
-  type(tui, 'unified7dFable'); tui._key('enter');
-  type(tui, 'magenta'); tui._key('enter'); // color
+
+  // accounts picker preselects the current member (b); add a too
+  assert.equal(tui.mode, 'pick');
+  assert.deepEqual([...tui.pick.sel], ['b']);
+  tui._key(' ');                                 // toggle a (highlighted first) on
+  tui._key('enter');
+
+  // bucket picker → choose unified7dFable (index 2)
+  tui._key('down'); tui._key('down'); tui._key('enter');
+
+  // color picker → choose magenta
+  const ci = tui.pick.items.findIndex(it => it.value === 'magenta');
+  for (let i = 0; i < ci; i++) tui._key('down');
+  tui._key('enter');
   await settle();
 
   assert.deepEqual(config.routes, [
@@ -98,16 +117,16 @@ test('TUI routes editor: edit prefills, and backspace clears a field before rety
   ]);
 });
 
-test('TUI routes editor: an unknown color is dropped (route still saves)', async () => {
+test('TUI routes editor: defaults (all accounts, auto bucket, no color) omit those keys', async () => {
   const { tui, config } = makeTUI();
   openRoutes(tui); tui._key('a');
   type(tui, 'r'); tui._key('enter');           // name
   type(tui, '*opus*'); tui._key('enter');      // glob
-  tui._key('enter');                            // accounts (all)
-  tui._key('enter');                            // bucket (auto)
-  type(tui, 'chartreuse'); tui._key('enter');   // unknown color
+  tui._key('enter');                            // accounts: none selected → all
+  tui._key('enter');                            // bucket: auto
+  tui._key('enter');                            // color: default
   await settle();
-  assert.deepEqual(config.routes, [{ name: 'r', match: ['*opus*'] }]); // no color key
+  assert.deepEqual(config.routes, [{ name: 'r', match: ['*opus*'] }]); // no accounts/bucket/color keys
 });
 
 test('TUI switch mode: Tab targets a route and Enter pins the highlighted account', () => {
@@ -151,6 +170,37 @@ test('TUI switch mode: Tab is inert for remove/toggle actions', () => {
   assert.equal(tui.selRoute, null);    // unchanged — Tab only cycles in switch mode
 });
 
+test('TUI switch mode: ←→ cycle the pin target both ways and wrap', () => {
+  const mk = n => ({
+    name: n, match: [`*${n}*`], color: 'red', autocreated: true, pinned: null,
+    accounts: [{ name: 'a', eligible: true }, { name: 'b', eligible: true }],
+  });
+  const { tui } = makeTUI({ routes: [mk('fable'), mk('sonnet')] });
+
+  tui._key('s');
+  assert.equal(tui.selRoute, null);     // default
+  tui._key('right');
+  assert.equal(tui.selRoute?.name, 'fable');
+  tui._key('right');
+  assert.equal(tui.selRoute?.name, 'sonnet');
+  tui._key('right');
+  assert.equal(tui.selRoute, null);     // wraps forward to the default
+  tui._key('left');
+  assert.equal(tui.selRoute?.name, 'sonnet'); // wraps backward to the last route
+  tui._key('left');
+  assert.equal(tui.selRoute?.name, 'fable');
+  tui._key('left');
+  assert.equal(tui.selRoute, null);
+});
+
+test('TUI switch mode: ←→ are inert for remove/toggle actions', () => {
+  const routes = [{ name: 'fable', match: ['*fable*'], accounts: [{ name: 'a', eligible: true }] }];
+  const { tui } = makeTUI({ routes });
+  tui._key('d');                       // toggle action
+  tui._key('right'); tui._key('left');
+  assert.equal(tui.selRoute, null);
+});
+
 test('TUI: the F7 (Fable) marker sits on exactly one account — the routing target', () => {
   const future = Date.now() + 7 * 24 * 3600_000;
   const oauth = n => ({ name: n, type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: future });
@@ -185,4 +235,61 @@ test('TUI routes editor: delete removes the selected route', async () => {
   await settle();
   assert.deepEqual(config.routes, [{ name: 'bulk', match: ['*opus*'] }]);
   assert.deepEqual(applied.routes, config.routes);
+});
+
+// Pressing → in switch mode targets the Fable route; the cursor should say so
+// where the eye is: in front of the F7 bar, where the pin's ► will land. The
+// row start keeps a dim `>` so the row is still easy to find.
+test('TUI: targeting a family route moves the cursor to its bar and dims the row-start one', () => {
+  const future = Date.now() + 7 * 24 * 3600_000;
+  const oauth = n => ({ name: n, type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: future });
+  const am = new AccountManager([oauth('a'), oauth('b')], 0.98);
+  for (const acc of am.accounts) {
+    acc.quota.unified5h = 0.1; acc.quota.unified5hReset = future;
+    acc.quota.unified7d = 0.1; acc.quota.unified7dReset = future;
+    acc.quota.unified7dFable = 0.2; acc.quota.unified7dFableReset = future;
+    acc.quota.unified7dSonnet = 0.2; acc.quota.unified7dSonnetReset = future;
+  }
+  const routes = am.getRoutes();
+  const fable = routes.find(r => r.name === 'fable');
+  const sonnet = routes.find(r => r.name === 'sonnet');
+  assert.ok(fable && sonnet, 'auto routes exist');
+
+  const tui = Object.create(TUI.prototype);
+  tui.am = am; tui.mode = 'select'; tui.selAction = 'switch'; tui.selIdx = 1;
+  const render = (i) => tui._renderAcct(i, 8, true, routes, [], { fable: null, sonnet: null });
+  const CYAN_CURSOR = '\x1b[36m>\x1b[0m';
+  const DIM_CURSOR = '\x1b[2m>\x1b[0m';
+
+  // Default target: the bright cursor at the row start, nothing at the bars.
+  tui.selRoute = null;
+  let row = render(1);
+  assert.ok(row.startsWith(` ${CYAN_CURSOR}`), 'bright cursor at the row start');
+  assert.doesNotMatch(stripAnsi(row), />\s*[►]?\s*F7/, 'no cursor at F7');
+  const width = stripAnsi(row).length;
+
+  // Fable target: dim at the start, bright in front of F7, same row width.
+  tui.selRoute = fable;
+  row = render(1);
+  assert.ok(row.startsWith(` ${DIM_CURSOR}`), 'the row-start cursor is dimmed');
+  assert.ok(row.includes(`${CYAN_CURSOR} F7`), `bright cursor in front of F7, got: ${JSON.stringify(stripAnsi(row))}`);
+  assert.equal(stripAnsi(row).length, width, 'the row does not grow');
+  assert.ok(!render(0).includes('>'), 'an unselected row draws no cursor anywhere');
+
+  // Sonnet target: the cursor sits at S7 instead, and F7 is clear again.
+  tui.selRoute = sonnet;
+  row = render(1);
+  assert.ok(row.includes(`${CYAN_CURSOR} S7`), 'bright cursor in front of S7');
+  assert.ok(!row.includes(`${CYAN_CURSOR} F7`), 'not at F7');
+
+  // The pin's own ► keeps its place: the cursor takes the separator column, not the marker's.
+  row = tui._renderAcct(1, 8, true, routes, [], { fable: 1, sonnet: null });
+  tui.selRoute = fable;
+  row = tui._renderAcct(1, 8, true, routes, [], { fable: 1, sonnet: null });
+  assert.match(stripAnsi(row), />►F7/, 'cursor, then the marker, then the label');
+
+  // A row without the F7 bar keeps the bright cursor at the start: nothing to point at.
+  am.accounts[1].quota.unified7dFable = null;
+  row = render(1);
+  assert.ok(row.startsWith(` ${CYAN_CURSOR}`), 'bright cursor stays at the start when the bar is absent');
 });

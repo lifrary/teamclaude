@@ -109,7 +109,7 @@ test('shipped config example parses and has unique priority fields', async () =>
   assert.equal(config.quotaProbeSeconds, 0);
   assert.equal(config.accounts[1].priority, 2);
   assert.equal(config.accounts[1].maxConcurrent, 5);
-  assert.equal(config.accounts[2].disabled, false);
+  assert.equal(config.accounts.find(account => account.name === 'api-fallback').disabled, false);
   assert.deepEqual(config.routes[0].accounts, ['primary-max']);
   assert.equal(config.sx.mode, '429');
 
@@ -149,10 +149,10 @@ test('sx config accepts only canonical modes and normalizes the legacy mode key'
   process.env.TEAMCLAUDE_CONFIG = cfgPath;
   try {
     await writeFile(cfgPath, JSON.stringify({ sxMode: 'off' }));
-    assert.deepEqual(await loadConfig(), { sx: { mode: 'off' } });
+    assert.deepEqual(await loadConfig(), { sx: { mode: 'off' }, accounts: [] });
 
     let fsCalled = false;
-    assert.throws(
+    await assert.rejects(
       () => saveConfig({ sx: { mode: 'invalid' } }, {
         path: cfgPath,
         fs: {
@@ -178,7 +178,7 @@ test('saveConfig persists canonical sx.mode and never the legacy key', async () 
   const path = join(dir, 'teamclaude.json');
   try {
     await saveConfig({ sxMode: 'off' }, { path });
-    assert.deepEqual(JSON.parse(await readFile(path, 'utf8')), { sx: { mode: 'off' } });
+    assert.deepEqual(JSON.parse(await readFile(path, 'utf8')), { sx: { mode: 'off' }, accounts: [] });
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

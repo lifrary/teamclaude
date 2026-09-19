@@ -1,0 +1,245 @@
+# Usage
+
+Running the server, running Claude Code through it, and the full command reference.
+
+## Start the proxy server
+
+```bash
+teamclaude server
+```
+
+From a TTY this shows the interactive TUI: an account table with session/weekly quota bars and reset countdowns, a real-time activity log, and keyboard controls.
+
+It falls back to plain log output when stdout is not a TTY (e.g. running as a service). Pass `--headless` (or `--no-tui`) to force plain-log mode from a terminal — useful for backgrounding the proxy.
+
+### Running in a container
+
+A container image is published to GHCR on every version bump (`ghcr.io/karpeleslab/teamclaude`, tagged `latest`, `1`, `1.1` and the full version). It runs `server --headless` bound to `0.0.0.0` inside the container, so publish the port and bind-mount the config file:
+
+```bash
+docker run -d --name teamclaude -p 3456:3456 \
+  -v ~/.config/teamclaude.json:/data/teamclaude.json \
+  ghcr.io/karpeleslab/teamclaude:latest
+
+docker exec -it teamclaude teamclaude login --token   # add accounts from inside
+docker exec -it teamclaude teamclaude status
+```
+
+The entrypoint starts as root only long enough to match the runtime user to the owner of the mounted config (or of `/data` when the file does not exist yet), then drops privileges — so a file owned by your user stays writable without a `chown`. `TEAMCLAUDE_UID` (and optional `TEAMCLAUDE_GID`) override the detected owner. stderr is folded into stdout so `docker logs` shows one stream; set `TEAMCLAUDE_SPLIT_STDERR=1` to keep them apart. Auto-update is disabled in the image; pull a new tag to upgrade.
+
+The config is created on first start with a random `proxy.apiKey`. Anything reaching the proxy from outside the container is a non-loopback client and must present that key (see [proxy.host](configuration.md#fields)); only `teamclaude` commands run via `docker exec` are exempt.
+
+Build it yourself with `docker build -t teamclaude .` from a checkout.
+
+### Session titles in the activity log
+
+Claude Code sends `x-claude-code-session-id` with each request, so every activity row belongs to a known
+session. With `sessionTitles.enabled` set, the row is labelled with that session's name:
+
+```
+ ⠋ 17:42:57  adv-review-rewrite POST /v1/messages (claude-opus-5) → claude@rikbrown.co.uk (1.9s...)
+ ⠋ 17:42:57  emmy-merge         POST /v1/messages (claude-opus-5) → claude@rikbrown.co.uk (0.4s...)
+ ⠋ 17:42:57                     POST /v1/messages?beta=true (claude-opus-5) → claude@rikbrown.co.uk (1.1s...)
+```
+
+The name comes from Claude Code's own files under `~/.claude/projects`, in this order:
+
+1. `<session-id>/custom-title.json`, written by `/rename`.
+2. A `custom-title` record in the session transcript, which is the only copy for a session renamed before
+   that file existed.
+3. An `ai-title` record, the title Claude Code generates. Most sessions have one without a rename.
+
+A session with none of these keeps the first six hex characters of its id. So does a request that carries no
+session header: a bare SDK or API client reaches the proxy anonymously, and no file names it.
+
+Each label is read once and re-read at most every 30 seconds, off the render path, so a `/rename` reaches the
+log without a restart and no frame waits on the disk. Only a session id shaped like a UUID is looked up, and a
+title is printed with its control characters removed, since both arrive from outside the proxy.
+
+This is off by default: it reads the tail of every visible session's transcript, which is further than the
+proxy reaches for anything else unless asked. Press **g** → **Session titles** to turn the labels on and off
+while the proxy runs. Set `sessionTitles.width` to change the columns the label gets. See
+[configuration](configuration.md).
+
+Headless, you can re-sync accounts from the config without a restart by POSTing to the local control endpoint (the equivalent of pressing **R** in the TUI):
+
+```bash
+curl -X POST http://localhost:3456/teamclaude/reload
+```
+
+You usually don't need to call it directly. `login`, `import`, `enable`, `disable`, `priority`, `route`, `threshold`, `distribute`, `probe` and `warmup` notify a running server themselves.
+
+Control-plane **writes** (`reload`, `switch`) are refused when the request carries a browser `Origin` or a cross-site `Sec-Fetch-Site`. Loopback is exempt from the proxy API key so the CLI needs no configuration, but that exemption also covers any web page you happen to visit: a page can POST to `127.0.0.1` cross-origin without a preflight, and while it cannot read the reply, the write would still land. `curl` and the CLI send neither header and are unaffected. Reads (`status`) are not restricted — the same-origin policy already stops a page from seeing the response.
+
+`GET /teamclaude/quota` is the compact read endpoint for status-line integrations. It returns tier-weighted fleet aggregates and the underlying per-account limits; see [Fleet quota endpoint](quota.md#fleet-quota-endpoint).
+
+Switching the account by hand has the same headless path — the equivalent of pressing **s** in the TUI and confirming with the default target selected:
+
+```bash
+teamclaude switch                 # list accounts, marking the current one
+teamclaude switch me@example.com  # make that account the preferred one
+```
+
+Both forms need a running server: the choice is runtime state and is never written to the config, so there is nothing to apply on a later restart. The command wraps `POST /teamclaude/switch` with a `{"account": "<name>"}` body, and the account can be given as its display name, its bare email, its `accountUuid`, its `orgUuid`, or the fully qualified `accountUuid/orgUuid` — the last being the only form that tells apart one email that holds accounts in several orgs. The rotation index is deliberately not accepted — it is array position, so a script pinned to `1` would silently follow a different account after a removal.
+
+As in the TUI, the choice is a weak preference rather than a lock, and it is worth knowing both ways it gets dropped. Rotation abandons it once the account becomes unusable (disabled, spent, throttled), and also whenever any available account carries a strictly lower `priority` value, since a higher-priority account preempts a healthy current one. A switch onto an account that cannot take traffic at all is still recorded, exactly as in the TUI, but the command says so instead of reporting a clean success:
+
+```text
+Switched to "me@example.com"
+Warning: "me@example.com" is disabled, so requests will not route to it until that changes.
+```
+
+### TUI keyboard shortcuts
+
+| Key | Action |
+| --- | --- |
+| `s` | Switch active account (`←`/`→` picks the default account or a specific [route](routing.md#model-routes)) |
+| `↑` / `↓` | Select an account in the main view |
+| `e` | Enable/disable the selected account |
+| `d` | Delete an account after confirmation |
+| `o` | Reorder the selected account; arrows move it, `a` resets all ranks, `c` clears its rank |
+| `p` | Refresh quota on all accounts (one-shot probe of the zero-spend usage endpoint) |
+| `R` | Reload accounts from config and request quota refresh |
+| `g` | Settings (threshold, quota probe, routing, add/remove accounts, sx.org) |
+| `q` | Quit |
+
+In selection mode, use `j`/`k` or the arrow keys to navigate, `Enter` to confirm, `Esc` to cancel.
+
+The settings screen is a list, not a set of letter shortcuts: `↑`/`↓` move between rows, `←`/`→` change the value in place (threshold by 1%, probe by 30s, modes cycle), `Enter` opens a row that needs typing or a sub-screen, `Esc` goes back.
+
+## Run Claude Code through the proxy
+
+```bash
+teamclaude run
+```
+
+`run` probes the proxy first. If it's up, Claude Code is routed through it; if it's **not** running, `run` errors out rather than silently bypassing the proxy — which would spend your own quota with no rotation. Pass `--auto-fallback` to launch `claude` directly instead when the proxy is down:
+
+```bash
+teamclaude run --auto-fallback
+```
+
+Since **1.1.0**, `run` defaults to [MITM forward-proxy mode](proxy-modes.md#mitm-proxy-mode-default) so even hardcoded `api.anthropic.com` endpoints are intercepted. For the previous base-URL-only behavior, pass `--no-mitm` — or set `defaultClientMode: "base-url"` in the config (the **Client mode** row on the TUI settings screen) to make that the default for `run` and `env` alike, with `--mitm` opting back in per launch:
+
+```bash
+teamclaude run --no-mitm
+```
+
+Arguments after `--` go to `claude`:
+
+```bash
+teamclaude run -- --model opus
+```
+
+### Setting the environment yourself
+
+`teamclaude env` prints the same export lines `run` uses:
+
+```bash
+eval "$(teamclaude env)"           # MITM: HTTPS_PROXY + NODE_EXTRA_CA_CERTS
+eval "$(teamclaude env --no-mitm)" # base-URL: ANTHROPIC_BASE_URL only
+eval "$(teamclaude env --mitm)"    # MITM regardless of defaultClientMode
+claude
+```
+
+Only the export lines go to stdout (so `eval` is safe); a short summary and any hints go to stderr. No `ANTHROPIC_API_KEY` is emitted — loopback clients are exempt from the proxy key gate, and setting it would drop Claude Code out of subscription mode. A remote (non-loopback) client must add the proxy key itself.
+
+**The proxy variables are shell-wide.** In MITM mode the eval exports `HTTPS_PROXY` and friends, and every other tool in that shell — `gh`, `git`, a package manager — follows them to a listener that only speaks to the providers' hosts; in a sandboxed shell that can surface as a synthetic 403 from an unrelated command. If that is your shell, set `defaultClientMode: "base-url"` (the **Client mode** row on the TUI settings screen): `env` then emits `ANTHROPIC_BASE_URL` only and, re-evaluated, unsets the proxy variables an earlier MITM eval left pointing at this proxy, leaving a real corporate proxy alone. `teamclaude run` scopes the variables to the `claude` process either way.
+
+**Your own `NO_PROXY` is kept.** `run` and `env` both set `NO_PROXY=localhost,127.0.0.1,::1` and append whatever the launching shell already had. That matters for local development: a dev server on a name like `app.test` resolves to 127.0.0.1 through a local resolver, and a forward to loopback is refused, so a client that proxied it would get a 403 on every retry. `export NO_PROXY=.test` before the eval (or before `run`) and the launched client gets `localhost,127.0.0.1,::1,.test`. The one entry that is dropped is `*` — it would send `api.anthropic.com` around the proxy as well, silently ending rotation; use `--no-mitm` for a direct launch.
+
+**Using an agent multiplexer or a tool that spawns `claude` itself?** Export this environment in the process that launches those `claude` instances — e.g. `eval "$(teamclaude env)"` in the shell you start the multiplexer from. Every spawned `claude` then gets the same routing (and MITM interception of hardcoded endpoints) without going through `teamclaude run`. The trade-off: `run`'s proxy-up/down guard only applies when you launch via `run`, so start the server before the multiplexer.
+
+### Routing plain `claude` automatically
+
+So you don't have to type `teamclaude run` every time, add a shell alias that sends plain `claude` through the proxy:
+
+```bash
+teamclaude alias              # print the alias for your shell
+teamclaude alias --install    # or write it to your shell rc (--uninstall to remove)
+```
+
+This is an interactive-shell alias — it affects `claude` typed at a prompt, not `claude` spawned by editors or scripts. It's a thin passthrough to `teamclaude run`, which holds the proxy-up/down logic (so it errors when the proxy is down; add `--auto-fallback` to launch claude directly instead).
+
+## Command reference
+
+```bash
+teamclaude login             # Add an account via OAuth (--api for an API key)
+teamclaude import            # Import credentials from Claude Code
+teamclaude server            # Start the proxy (--headless for plain logs)
+teamclaude run               # Run Claude Code through the proxy
+teamclaude env               # Print export lines for routing claude yourself
+teamclaude alias             # Print/install a `claude` alias that routes via the proxy
+teamclaude accounts          # List accounts with subscription tier and token status
+teamclaude status            # Show live proxy status (requires running server)
+teamclaude attach            # Open the live dashboard against a running server
+teamclaude dashboard         # Open the web dashboard in the browser (needs server)
+teamclaude service install   # Run the proxy as a login service (uninstall/status/print)
+teamclaude switch [name]     # Prefer an account; no name lists them (needs server)
+teamclaude remove <name>     # Remove an account (by name or email)
+teamclaude disable <name>    # Temporarily exclude an account from rotation
+teamclaude enable <name>     # Re-enable it (also clears a stuck error state)
+teamclaude priority <name> 1 # Set rotation priority (lower = preferred)
+teamclaude route list        # Manage per-model routes (add/rm)
+teamclaude threshold 90      # Utilization at which rotation leaves an account
+teamclaude distribute on     # Spread new sessions across equal-priority accounts
+teamclaude probe 300         # Enable background quota refresh (off by default)
+teamclaude warmup 600        # Enable keep-warm (off by default, spends quota)
+teamclaude warmup reset 15:30 --timezone Europe/Moscow
+                             # Schedule warm-up for a daily target reset
+teamclaude warmup rolling 15:30 --timezone Europe/Moscow
+                             # Anchor resets at 15:30, then continue every 5h
+teamclaude api <path>        # Call an API endpoint with account credentials
+teamclaude update            # Check npm for a newer teamclaude and install it
+teamclaude version           # Print the installed version
+teamclaude help              # Show all commands
+```
+
+`teamclaude status` prints the same picture as the TUI, once, as text. Handy over SSH or in a script; `--json` for machine-readable output. The JSON's `server.version` is the version of the process answering — read once at startup, so right after `teamclaude update` it still names the old code until the restart, where the installed CLI's `teamclaude version` already names the new one.
+
+`teamclaude attach` opens the terminal dashboard itself against a server that is already running, which is how you get interactive control back when the proxy runs as a background service. It polls the same status endpoint every second and can do the two things the remote control exposes: `s` switches account, `R` reloads config. The browser dashboard adds the matching **Reload config** action plus a zero-spend **Probe quotas** action; settings editing and the request activity stream still stay in the server's own TUI because they need state that only that process has. When contact with the server drops, the header marker turns from `▲` to `▼` and what is on screen is the last snapshot, not the current state.
+
+`teamclaude service install` registers the proxy as a user service that starts at login and restarts on its own — a LaunchAgent on macOS, a `systemd --user` unit on Linux (`uninstall`, `status` and `print` round it out; `print` writes the unit to stdout without touching anything). On macOS the LaunchAgent runs with `ProcessType` `Standard`: the `Background` class it used before carried a QoS clamp that starved the proxy under host contention (status timeouts, seconds of event-loop lag). The unit is only written at install time, so an existing install keeps whatever it was installed with until you re-run `teamclaude service install`.
+
+![teamclaude status output](assets/status-redacted.png)
+
+## Status dashboard (browser)
+
+`GET /teamclaude/dashboard` serves a self-contained HTML page rendering the same data as `teamclaude status`: per-account quota bars (session and weekly, plus one bar per model-scoped weekly bucket upstream reports), rotation state, and active sessions — refreshed every few seconds.
+
+`teamclaude dashboard` opens this page in the system browser against a running server (it starts none; use `teamclaude server` or `teamclaude service install` for that). The page's **Reload config** and **Probe quotas** buttons mirror the corresponding TUI actions without spending message quota.
+
+With `proxy.usageDimensions` configured, each dimension gets its own sortable table. With `proxy.sessionDetail` on, a per-session table shows each session's client, project, serving accounts, and what it actually spent per weekly bucket — cache reads and cache creation included — filterable by project or client. That table is off by default; see [Configuration](configuration.md#usage-dimensions).
+
+A **warning banner** sits at the top of the page and is empty unless something is wrong. It reports a session that has had several client requests in a row come back with nothing usable — the case that reads as zero tokens exactly like an idle session, and is otherwise invisible — plus an account that needs a person (a broken token or a disabled entry). A spent quota bucket on **one** account, a rate-limit back-off and an upstream refusal are **not** reported: those clear themselves, and a banner that is always on is one nobody reads. When *every* account is over its threshold or in a hold, sessions do start starving — and the banner says which of the two it is, rather than blaming the session. Overage spend is not reported either: it is a month-to-date figure, so it would be lit for most of the month; the account card and `teamclaude status` carry it with the amount. With `proxy.sessionDetail` off the banner still fires, but cannot name the session.
+
+A **Routing** table above the accounts shows, for Fable, Sonnet, and any configured route, which account rotation would pick for a new request of that family and how many accounts could serve it — the ones that cannot are struck through, which is the reason the family is elsewhere. A pinned route names its pin, and says so when the pin is not eligible right now. The last rows are everything without a route of its own, one per provider in the fleet ("Claude default", "Codex default"): each names the server's default target for that provider, which is that provider's current account unless it is blocked or outranked, in which case the row says why. A Claude and a Codex pool keep independent cursors, so the summary line and the `current` badge on each card are per provider too. Targets are the server's own answers (`routes[].target`, `defaultTargets` and `currentAccounts` in `/teamclaude/status`; the older single-valued `defaultTarget` and `currentAccount` are still emitted), not something the page derives from the quota bars; they describe a fresh request, not one a running session has already pinned elsewhere.
+
+Each account card has a **switch** button that makes that account the current one (the same `POST /teamclaude/switch` the CLI uses). It is a nudge, not a pin: normal rotation resumes from there. What happens to sessions already running depends on `distributeSessions` — with it on, a session pinned to another account keeps it until it goes idle, so the badge moves before the traffic does; with it off (the default), every session follows the switch on its next request. The page reports whether rotation will actually use the target: a disabled, errored, rate-limited, or over-threshold account — or one outranked by a higher-priority account — is still switched to, but the page says so and why rather than reporting a bare "done".
+
+
+```
+http://localhost:3456/teamclaude/dashboard
+```
+
+The page is a static asset and loads without a key; the data does not — its script fetches `/teamclaude/status` first, and asks for the proxy key only if the server refuses the request without one. Loopback browsers are key-exempt as everywhere else, so on the proxy's own machine there is no prompt. A key that is entered is kept in the browser's localStorage, and a 401 after a key rotation brings the prompt back. On deployments that put the proxy behind TLS this works remotely too: `https://your-proxy.example.com/teamclaude/dashboard`.
+
+## Auto-update
+
+When TeamClaude is installed globally via npm, it self-updates in the background: it checks the npm registry at most once a day, and when a newer version is published it runs `npm install -g @karpeleslab/teamclaude@latest` and applies it on the next launch. The check runs after a `teamclaude run` session ends and when a headless server starts. In a headless server the install runs as a background child process, so the proxy keeps serving requests while npm works (a synchronous install used to stall it for the duration). A git checkout is never touched — update that with `git pull`. Run `teamclaude update` to update on demand.
+
+Disable it with `TEAMCLAUDE_DISABLE_AUTOUPDATE=1` or `"autoUpdate": false` in the config.
+
+## Request logging
+
+Log request/response details to a directory, one file per logged request:
+
+```bash
+teamclaude server --log-to /tmp/requests
+```
+
+Bodies are truncated past a size cap, and files older than the retention window are deleted — see [`logLevel`, `logMaxBodyBytes` and `logRetentionHours`](configuration.md#fields) to widen or disable them. The first start after upgrading sweeps whatever in that directory is already older than the window.
+
+`--activity-log FILE` appends the TUI activity lines to a file instead, and works in headless mode too.
+
+Claude Code's telemetry (`/api/event_logging/*`) is high-volume activity-log noise and is hidden from the log by default; see [`eventLogging`](configuration.md#fields) to block or show it instead.

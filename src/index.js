@@ -5,24 +5,96 @@ import { createWriteStream, unlinkSync } from 'node:fs';
 import { rm } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
 import net from 'node:net';
-import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getServerStatePath, getCrashLogPath, getRekeyPath, writeServerState, readServerState, clearServerState, loadCanonicalState, saveCanonicalState, createCanonicalState, createRekeyRecord, reconcilePendingRekey, rekeyCanonicalState, saveRekeyRecord, formatServerStateFailure } from './config.js';
+import { readFile } from 'node:fs/promises';
+import { loadOrCreateConfig, loadConfig, atomicConfigUpdate, getConfigPath, getServerStatePath, getCrashLogPath, getRekeyPath, writeServerState, readServerState, clearServerState, loadCanonicalState, saveCanonicalState, createCanonicalState, createRekeyRecord, reconcilePendingRekey, rekeyCanonicalState, saveRekeyRecord, formatServerStateFailure } from './config.js';
 import { installCrashHandlers } from './crash-log.js';
-import { AccountManager, QUEUE_DEPTH_CEILING } from './account-manager.js';
+import { AccountManager, QUEUE_DEPTH_CEILING, DEFAULT_SWITCH_THRESHOLD, distributionMode } from './account-manager.js';
+import { validateAdaptiveConfig } from './adaptive-distribution.js';
 import { createProxyServer } from './server.js';
-import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
+import { importCredentials, loginOAuth, loginOAuthWithPastedCode, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import { resolveAccounts } from './resolve-accounts.js';
-import { accountIdKey, createIdentityRegistry, sameIdentity, orgKey, matchAccounts } from './identity.js';
+import { accountIdKey, sameIdentity, orgKey, matchAccounts, findUpsertTarget, updateAccountEntry, canUpsertOAuthAccount, oauthIdentityFields } from './identity.js';
+import { loginCodex } from './codex-auth.js';
+import { syncAccountsFromDisk } from './sync-accounts.js';
+import { mergeAccountsForSave, syncRefreshedTokens, removedAccountIds, clearRemovedAccountIds } from './account-pairing.js';
+
 import * as alias from './alias.js';
-import { ensureCerts } from './mitm.js';
+import { ensureCerts, mitmHosts } from './mitm.js';
 import { Prober } from './prober.js';
 import { Warmer } from './warmer.js';
 import { MaintenanceCoordinator } from './maintenance-coordinator.js';
+import { createRollingWarmupSchedule, formatWarmupScheduleConfirmation, resolveWarmupConfig, resolveWarmupSchedule } from './warmup-schedule.js';
 import { TUI } from './tui.js';
+import { SessionTitles } from './session-titles.js';
+import { RemoteControl, createAttachSession } from './tui-remote.js';
 import { SxManager } from './sx.js';
-import { autoUpdate, checkForUpdate, currentVersion, runUpdate, installKind, PKG_NAME } from './updater.js';
-import { renderStatus } from './status-renderer.js';
-import { buildClaudeEnvLines } from './claude-env.js';
+import { autoUpdate, checkForUpdate, currentVersion, resolveVersionLabel, runUpdate, installKind, updateAvailableFromCache, PKG_NAME } from './updater.js';
+import { renderStatus, formatPercent } from './status-renderer.js';
+import { sanitizeText } from './safe-text.js';
+import { ClientUsageTracker, UsageDimensionTracker } from './client-usage.js';
+import { buildClaudeEnvLines, bypassesAllHosts, clearSelfProxyEnvLines, encodePinComponent, mergeNoProxy, resolveClientMode } from './claude-env.js';
+import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
+import { getUpstreamProxy, describeProxy, describeSelfProxy } from './upstream-proxy.js';
+import { startEventLoopMonitor } from './event-loop-monitor.js';
+/** @typedef {import('./types.js').CodedError} CodedError */
+
+// These constants are referenced by routeCommand, which the dispatch below
+// reaches through a top-level `await`. The await suspends module evaluation at
+// the switch, so a const declared under the switch is still in the temporal
+// dead zone when the command body runs — keep them above the dispatch.
+// Ceiling for `teamclaude probe <seconds>`: setInterval takes a 32-bit signed
+// millisecond delay, so anything past ~2,147,483 s overflows to 1 ms.
+const MAX_PROBE_SECONDS = 7 * 24 * 3600;
+const ROUTE_USAGE = [
+  'Usage: teamclaude route [list]',
+  '       teamclaude route add <name> --match "<glob>[,<glob>]" [--accounts "<name-or-index>[,...]"] [--bucket <quota-bucket>] [--color <name>]',
+  '       teamclaude route rm <name>',
+  '',
+  'A route pins model ids matching its globs to an exclusive set of accounts.',
+  'Omit --accounts to route to all accounts (e.g. just to override --bucket).',
+  '--color (red/green/yellow/blue/magenta/cyan) tints the route\'s inline marker in the TUI.',
+  'First matching route wins. Changes apply to a running server immediately.',
+].join('\n');
+
+const ROUTE_COLORS = ['red', 'green', 'yellow', 'blue', 'magenta', 'cyan'];
+
+const THRESHOLD_USAGE = [
+  'Usage: teamclaude threshold                 (show the current thresholds)',
+  '       teamclaude threshold <1-100>         (one number for every bucket)',
+  '       teamclaude threshold <bucket>=<1-100> [...]',
+  '       teamclaude threshold <bucket>=default (drop that bucket)',
+  '',
+  'The utilization at which rotation stops sending work to an account. Tenths of',
+  'a percent are kept, as on the TUI settings screen. Changes apply to a running',
+  'server immediately.',
+].join('\n');
+
+// The buckets a threshold can be keyed by: the quota windows the manager asks
+// thresholdFor() about. An unknown key would be accepted by the config and then
+// never consulted, so the CLI refuses it rather than storing a typo.
+const QUOTA_BUCKETS = ['unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable', 'tokens', 'requests'];
+
+const DISTRIBUTE_USAGE = 'Usage: teamclaude distribute <on|off|adaptive>';
+
+// What each mode writes to the config, and what to say once it is set. Keyed by
+// the mode `distributionMode` resolves to, so the command and the router cannot
+// disagree about what a setting means.
+/** @type {Record<'off'|'even'|'adaptive', {value: boolean|'adaptive', said: string}>} */
+const DISTRIBUTE_MODES = {
+  off: {
+    value: false,
+    said: 'Session distribution off — sessions already running keep their accounts and drain; new ones rotate by quota.',
+  },
+  even: {
+    value: true,
+    said: 'Session distribution on — new sessions spread across equal-priority accounts, each pinned to its own for cache reuse.',
+  },
+  adaptive: {
+    value: 'adaptive',
+    said: 'Session distribution adaptive — new sessions concentrate on the account with the least remaining weekly credit, tapering off as it nears the switch threshold and backing off when it is busy.',
+  },
+};
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -57,8 +129,20 @@ switch (command) {
     await statusCommand();
     process.exit(0);
     break;
+  case 'attach':
+    await attachCommand();
+    process.exit(0);
+    break;
+  case 'dashboard':
+    await dashboardCommand();
+    process.exit(0);
+    break;
   case 'accounts':
     await accountsCommand();
+    process.exit(0);
+    break;
+  case 'switch':
+    await switchCommand();
     process.exit(0);
     break;
   case 'remove':
@@ -85,12 +169,24 @@ switch (command) {
     aliasCommand();
     process.exit(0);
     break;
+  case 'service':
+    await serviceCommand();
+    process.exit(0);
+    break;
   case 'probe':
     await probeCommand();
     process.exit(0);
     break;
   case 'warmup':
     await warmupCommand();
+    process.exit(0);
+    break;
+  case 'threshold':
+    await thresholdCommand();
+    process.exit(0);
+    break;
+  case 'distribute':
+    await distributeCommand();
     process.exit(0);
     break;
   case 'route':
@@ -127,13 +223,21 @@ switch (command) {
 // ── server ──────────────────────────────────────────────────
 
 async function serverCommand() {
-  // First thing in the process that matters: this is the long-lived command, it
-  // runs under a TUI that repaints over anything Node prints on the way out, and
-  // a crash here takes every routed session with it. Installed before the config
-  // load so a failure in that load is recorded too.
-  installCrashHandlers(getCrashLogPath());
+  // Installed first: the server is the long-lived process, it runs under a TUI
+  // that repaints over anything Node prints on the way out, and a crash here
+  // takes every routed session with it. Without this, a proxy that vanished
+  // overnight leaves nothing behind to explain why.
+  const crashLog = getCrashLogPath();
+  installCrashHandlers(crashLog);
+  // Same motive as the crash log: when the process is wedged, the status
+  // endpoint cannot say so. The monitor leaves the evidence (one bounded warning
+  // per stall in the service log, lag figures under `server.eventLoop`).
+  const eventLoopMonitor = startEventLoopMonitor();
 
   const config = await loadOrCreateConfig();
+  // Token writes below pair rows by entry id against a re-read of the file, so
+  // the ids have to be on disk before the first refresh, not just in memory.
+  await persistMintedAccountIds(config);
 
   // --log-to <dir>
   const logTo = argValue('--log-to');
@@ -153,7 +257,7 @@ async function serverCommand() {
 
   let startupState = await loadCanonicalState();
   if (startupState) {
-    startupState = await reconcilePendingRekey({ state: startupState, authoritativeAccounts: config.accounts });
+    startupState = await reconcilePendingRekey({ state: startupState, authoritativeAccounts: config.accounts }) ?? null;
   }
 
   const accounts = await resolveAccounts(config);
@@ -162,27 +266,33 @@ async function serverCommand() {
     process.exit(1);
   }
 
+  // `accounts[].models` (#74) is superseded by the `routes` table (#86). Routes
+  // do the same job with glob matching, several accounts per rule and a bucket
+  // override — and, unlike `models`, they don't silently change eligibility
+  // fleet-wide the moment one account declares a list (see _accountOwnsModel).
+  // Behaviour is unchanged; this only tells pre-#86 configs what to migrate to
+  // before the field goes away. Reported against config.accounts so the notice
+  // names what is actually written on disk, whatever resolution does with it.
+  for (const acct of config.accounts) {
+    if (!acct.models?.length) continue;
+    const route = { name: acct.name, match: acct.models, accounts: [acct.name] };
+    console.error(`[TeamClaude] Deprecated: account "${acct.name}" uses "models" — replace it with a routes entry: ${JSON.stringify(route)}`);
+  }
+
   const threshold = config.switchThreshold || 0.98;
-  const reevalIntervalMs = Number.isFinite(config.reevalIntervalMs)
-    ? config.reevalIntervalMs
-    : 5 * 60 * 1000;
-  const maxConcurrentDefault = Number.isFinite(config.maxConcurrentPerAccount) && config.maxConcurrentPerAccount >= 1
-    ? config.maxConcurrentPerAccount
-    : 3;
-  // Fall back to the ceiling, not past it: a 256 here was dead code, since the
-  // AccountManager clamps to QUEUE_DEPTH_CEILING regardless.
-  const overflowQueueMaxDepth = Number.isFinite(config.overflowQueueMaxDepth) && config.overflowQueueMaxDepth >= 0
-    ? config.overflowQueueMaxDepth
-    : QUEUE_DEPTH_CEILING;
+  const adaptive = validateAdaptiveConfig(config.adaptiveDistribution);
+  const sessionTitles = new SessionTitles(config.sessionTitles);
   const accountManager = new AccountManager(accounts, threshold, {
-    reevalIntervalMs,
-    maxConcurrent: maxConcurrentDefault,
-    maxQueueDepth: overflowQueueMaxDepth,
-    queueTimeoutMs: Number.isFinite(config.overflowQueueTimeoutMs)
-      ? Math.max(0, config.overflowQueueTimeoutMs) : 15_000,
+    reevalIntervalMs: Number.isFinite(config.reevalIntervalMs) ? config.reevalIntervalMs : 300_000,
+    maxConcurrent: Number.isFinite(config.maxConcurrentPerAccount) && config.maxConcurrentPerAccount >= 1 ? config.maxConcurrentPerAccount : 3,
+    maxQueueDepth: Number.isFinite(config.overflowQueueMaxDepth) && config.overflowQueueMaxDepth >= 0 ? config.overflowQueueMaxDepth : QUEUE_DEPTH_CEILING,
+    queueTimeoutMs: config.overflowQueueTimeoutMs === null ? null : Number.isFinite(config.overflowQueueTimeoutMs) ? Math.max(0, config.overflowQueueTimeoutMs) : 15_000,
     routes: config.routes,
     stormRamp: config.stormRamp,
+    ramp: config.stormRamp,
     distributeSessions: config.distributeSessions,
+    expiryRouting: config.expiryRouting,
+    adaptive,
   });
   const maintenance = new MaintenanceCoordinator(accountManager);
 
@@ -201,39 +311,53 @@ async function serverCommand() {
     }
   }
   const stateMigration = startupState?.migration || { completed: true, sourceDigests: {} };
+  const clientUsage = new ClientUsageTracker();
+  if (startupState?.clients) clientUsage.restore(startupState.clients);
+  const dimensionUsage = new UsageDimensionTracker();
+  if (startupState?.usageDimensions) dimensionUsage.restore(startupState.usageDimensions);
+  /** @type {ReturnType<typeof setInterval> | null} */
   let quotaSaveInterval = null;
+  /** @type {ReturnType<typeof setInterval> | null} */
   let tokenSweepInterval = null;
+  /** @type {Promise<unknown> | null} */
+  let tokenSweepPromise = null;
+  const tokenWrites = new Set();
+  const sweepTokens = () => {
+    if (shuttingDown || tokenSweepPromise) return;
+    tokenSweepPromise = accountManager.refreshLapsedTokens()
+      .catch(err => console.error(`[TeamClaude] Token sweep failed: ${err.message}`))
+      .finally(() => { tokenSweepPromise = null; });
+  };
   const persistQuotaState = async () => {
     const exported = accountManager.exportCanonicalState(server?.exportProbeTemplate?.() ?? null);
-    await saveCanonicalState(createCanonicalState({ ...exported, migration: stateMigration }));
+    await saveCanonicalState(createCanonicalState({
+      ...exported, migration: stateMigration,
+      clients: clientUsage.export(), usageDimensions: dimensionUsage.export(),
+    }));
   };
 
   // Persist refreshed tokens back to config (re-read from disk to avoid clobbering
   // accounts added externally, e.g. by `teamclaude import` while server is running)
-  accountManager.onTokenRefresh((idx, newTokens) => {
+  accountManager.onTokenRefresh((idx, newTokens, lineage) => {
     const account = accountManager.accounts[idx];
     if (!account) return;
-    // Keep the in-memory config.accounts in sync so a TUI saveConfig doesn't
-    // clobber fresh tokens. Match by IDENTITY (UUID first, then name) — not by the
-    // AccountManager index `idx`, which can point at a different config entry when
-    // a tokenless config account was skipped at load.
-    const memIdx = findConfigAccount(config, account);
-    if (memIdx >= 0) {
-      config.accounts[memIdx].accessToken = newTokens.accessToken;
-      config.accounts[memIdx].refreshToken = newTokens.refreshToken;
-      config.accounts[memIdx].expiresAt = newTokens.expiresAt;
-    }
-    atomicConfigUpdate(diskConfig => {
-      // Persist only the refreshed identity. Pulling disk-only entries into the
-      // live set here can resurrect an account the TUI deliberately deleted.
-      // Newly imported accounts are reconciled via reload/restart.
+    syncRefreshedTokens(config.accounts, accountManager.accounts, idx, newTokens);
+    const write = atomicConfigUpdate(diskConfig => {
+      // Refresh only this stable entry; reload owns additions and removals.
+      if (accountManager.accounts[account.index] !== account || account.credential !== newTokens.accessToken) return;
       const cfgIdx = findConfigAccount(diskConfig, account);
       if (cfgIdx >= 0) {
+        const disk = diskConfig.accounts[cfgIdx];
+        if (!sameIdentity(disk, account)) return;
+        if (lineage && disk.refreshToken !== lineage.previousRefreshToken &&
+            disk.refreshToken !== newTokens.refreshToken) return;
         diskConfig.accounts[cfgIdx].accessToken = newTokens.accessToken;
         diskConfig.accounts[cfgIdx].refreshToken = newTokens.refreshToken;
         diskConfig.accounts[cfgIdx].expiresAt = newTokens.expiresAt;
       }
     }).catch(err => console.error(`[TeamClaude] Failed to save refreshed token: ${err.message}`));
+    tokenWrites.add(write);
+    write.finally(() => tokenWrites.delete(write));
   });
   const port = config.proxy.port;
   // Bind loopback by default so the proxy isn't reachable off-box (it injects
@@ -245,10 +369,21 @@ async function serverCommand() {
   const useTUI = !headless && process.stdout.isTTY && process.stdin.isTTY;
 
   // Opt-in background quota probe (config.quotaProbeSeconds, default 0 = off).
+  /** @type {Prober | null} */
   let prober = null;
-  // Opt-in keep-warm scheduler (config.warmupSeconds, default 0 = off).
+  // Opt-in keep-warm scheduler (interval or persisted reset-target schedule).
+  /** @type {Warmer | null} */
   let warmer = null;
   const serverStartedAt = Date.now();
+  // Read once here, not per request: `teamclaude update` swaps package.json on
+  // disk while this process keeps running the old code, and status must report
+  // what is running, not what is installed.
+  const serverVersion = currentVersion();
+  // What the header names this build, and whether the last recorded check saw
+  // something newer. A checkout gets no update marker: autoUpdate refuses to
+  // npm-install over one, so offering it would advertise a declined action.
+  const { label: versionLabel, git: fromGit } = await resolveVersionLabel();
+  const updateAvailable = !fromGit && await updateAvailableFromCache({ current: serverVersion });
 
   // sx.org proxy (IP-based-429 workaround). Dormant unless an API key is set in
   // config.sx.apiKey; when set we provision a proxy and route upstream through it.
@@ -267,13 +402,48 @@ async function serverCommand() {
   const reloadAccounts = async () => {
     const diskConfig = await loadConfig();
     if (!diskConfig) return 0;
+    await persistMintedAccountIds(diskConfig);
     const added = await syncAccountsFromDisk(diskConfig, config, accountManager, {
       migration: stateMigration,
       template: server?.exportProbeTemplate?.() ?? null,
+      rekey: options => durableRuntimeRekey({
+        ...options, clients: clientUsage.export(), usageDimensions: dimensionUsage.export(),
+      }),
     });
+    if (config.proxy && diskConfig.proxy) {
+      config.proxy.clientKeys = diskConfig.proxy.clientKeys;
+      config.proxy.usageDimensions = diskConfig.proxy.usageDimensions;
+      config.proxy.sessionDetail = diskConfig.proxy.sessionDetail;
+      config.proxy.apiKey = diskConfig.proxy.apiKey;
+    }
     // Pick up route table edits (teamclaude route …, TUI editor, or a hand edit).
     config.routes = diskConfig.routes || [];
     accountManager.setRoutes(config.routes);
+    // Pick up a distributeSessions change (hand edit or another writer) the same
+    // way routes, sx, probe and warmup are picked up below.
+    // Not coerced to a boolean: 'adaptive' is a third mode, and !! would flatten
+    // it to plain even distribution on every config reload.
+    config.distributeSessions = diskConfig.distributeSessions ?? false;
+    accountManager.setDistributeSessions(config.distributeSessions);
+    // Pick up a switchThreshold change the same way (teamclaude threshold, the
+    // TUI settings screen, or a hand edit). thresholdFor() reads it off the
+    // manager on every decision, so assigning it is the whole application —
+    // and without this a change from outside the TUI waited for a restart.
+    if (diskConfig.switchThreshold != null) {
+      config.switchThreshold = diskConfig.switchThreshold;
+      accountManager.switchThreshold = diskConfig.switchThreshold;
+    }
+    // Pick up expiry-routing edits the same way, so the knob hot-applies.
+    config.expiryRouting = diskConfig.expiryRouting;
+    accountManager.setExpiryRouting(config.expiryRouting);
+    config.sessionTitles = diskConfig.sessionTitles;
+    sessionTitles.configure(config.sessionTitles);
+    // Both are read per request off this object (server.js) and the TUI already
+    // persists them; without this a hand edit or another writer waited for a restart.
+    config.eventLogging = diskConfig.eventLogging || 'hide';
+    // Read by `run`/`env` from disk, but the TUI settings screen shows it live.
+    config.defaultClientMode = diskConfig.defaultClientMode === 'base-url' ? 'base-url' : 'mitm';
+    config.blockedModels = Array.isArray(diskConfig.blockedModels) ? diskConfig.blockedModels : [];
     // Apply an sx.org key/mode change made on disk (e.g. via POST /teamclaude/reload).
     const diskSxKey = diskConfig.sx?.apiKey || null;
     const diskSxMode = diskConfig.sx?.mode || 'off';
@@ -282,64 +452,72 @@ async function serverCommand() {
       if (diskSxKey) await sx.configure(diskSxKey, diskSxMode);
       else { sx.disable(); await sx.setMode(diskSxMode); }
     }
-    const probeMs = (diskConfig.quotaProbeSeconds || 0) * 1000;
-    const warmMs = (diskConfig.warmupSeconds || 0) * 1000;
-    if (prober && warmer && (probeMs !== prober.intervalMs || warmMs !== warmer.intervalMs)) {
-      // Cancel both schedules before installing either replacement so reload
-      // cannot interleave an old probe/warmer timer with the new configuration.
-      prober.stop();
-      warmer.stop();
-      config.quotaProbeSeconds = diskConfig.quotaProbeSeconds || 0;
-      config.warmupSeconds = diskConfig.warmupSeconds || 0;
-      prober.reschedule(probeMs);
-      warmer.reschedule(warmMs);
+    if (prober) {
+      const ms = (diskConfig.quotaProbeSeconds || 0) * 1000;
+      if (ms !== prober.intervalMs) {
+        config.quotaProbeSeconds = diskConfig.quotaProbeSeconds || 0;
+        prober.reschedule(ms);
+      }
+    }
+    if (warmer) {
+      const diskSchedule = diskConfig.warmupSchedule || null;
+      const ms = (diskConfig.warmupSeconds || 0) * 1000;
+      if (diskSchedule) {
+        // Validate and arm before publishing the disk value to live readers. A
+        // bad hand edit leaves the prior schedule intact and makes reload fail.
+        warmer.rescheduleSchedule(diskSchedule);
+        config.warmupSchedule = diskSchedule;
+        config.warmupSeconds = 0;
+      } else if (config.warmupSchedule || ms !== warmer.intervalMs) {
+        warmer.reschedule(ms);
+        delete config.warmupSchedule;
+        config.warmupSeconds = diskConfig.warmupSeconds || 0;
+      }
     }
     return added;
   };
 
+  /** @type {TUI | null} */
   let tui = null;
+  /** @type {import('./server.js').ProxyHooks} */
   let hooks = {};
 
   if (useTUI) {
     tui = new TUI({
-      accountManager, config, sx, activityLogPath,
+      accountManager, config, sx, activityLogPath, sessionTitles, versionLabel, updateAvailable,
       saveConfig: () => atomicConfigUpdate(async diskConfig => {
-        // Write in-memory accounts as the authoritative state, preserving
-        // extra disk-only fields (e.g. importFrom) where the account still exists.
-        // Use live tokens from AccountManager (not the stale config.accounts copy).
-        const configRegistry = createIdentityRegistry(config.accounts);
-        const liveRegistry = createIdentityRegistry(accountManager.accounts);
-        const diskRegistry = createIdentityRegistry(diskConfig.accounts);
-        const mapped = configRegistry.entries().map(([, account]) => {
-          const liveAccount = liveRegistry.get(account);
-          const live = liveAccount ? {
-            ...account,
-            accessToken: liveAccount.credential,
-            refreshToken: liveAccount.refreshToken,
-            expiresAt: liveAccount.expiresAt,
-          } : account;
-          const diskAccount = diskRegistry.get(account);
-          return diskAccount ? { ...diskAccount, ...live } : live;
-        });
-        // The TUI owns its account set: do not resurrect a locally deleted entry
-        // from the atomic update's fresh disk snapshot.
-        diskConfig.accounts = mapped;
+        diskConfig.accounts = mergeAccountsForSave(
+          config.accounts, accountManager.accounts, diskConfig.accounts, removedAccountIds(config),
+        );
+        // The written list omits them, so they are gone from disk too and there
+        // is nothing left to re-adopt. Holding the ids any longer would only
+        // refuse an account the operator re-adds later.
+        clearRemovedAccountIds(config);
+        // Persist sx.org settings (set/cleared from the TUI settings screen).
         if (config.sx) diskConfig.sx = config.sx; else delete diskConfig.sx;
         if (config.switchThreshold != null) diskConfig.switchThreshold = config.switchThreshold;
         if (config.quotaProbeSeconds != null) diskConfig.quotaProbeSeconds = config.quotaProbeSeconds;
         if (config.warmupSeconds != null) diskConfig.warmupSeconds = config.warmupSeconds;
+        // The telemetry mode and the model blocklist are edited from the settings
+        // screen too; the server reads them live from `config`, but without this
+        // the edit never reached disk and was silently undone by the next start.
+        if (config.eventLogging != null) diskConfig.eventLogging = config.eventLogging;
+        if (config.defaultClientMode != null) diskConfig.defaultClientMode = config.defaultClientMode;
+        if (config.blockedModels != null) diskConfig.blockedModels = config.blockedModels;
+        if (config.sessionTitles != null) diskConfig.sessionTitles = config.sessionTitles;
+        // Persist the route table (edited from the TUI routes screen).
         if (config.routes != null) diskConfig.routes = config.routes;
       }),
       syncAccounts: reloadAccounts,
       refreshQuota: () => server.refreshQuotaAll?.(),
-      probeQuota: () => prober?.probeAll(),
+      probeQuota: async () => { await prober?.probeAll(); },
       onQuit: () => shutdown(),
     });
     hooks = {
-      onRequestStart: (id, info) => tui.onRequestStart(id, info),
-      onRequestModel: (id, info) => tui.onRequestModel(id, info),
-      onRequestRouted: (id, info) => tui.onRequestRouted(id, info),
-      onRequestEnd: (id, info) => tui.onRequestEnd(id, info),
+      onRequestStart: (id, info) => tui?.onRequestStart(id, info),
+      onRequestModel: (id, info) => tui?.onRequestModel(id, info),
+      onRequestRouted: (id, info) => tui?.onRequestRouted(id, info),
+      onRequestEnd: (id, info) => tui?.onRequestEnd(id, info),
     };
   }
 
@@ -363,12 +541,16 @@ async function serverCommand() {
 
   // In headless mode, wire activity-log writes directly via hooks + console.
   if (!tui && activityLogPath) {
-    const aStream = createWriteStream(activityLogPath, { flags: 'a' });
+    // 0600, matching the request log and the config (see tui.js for why).
+    const aStream = createWriteStream(activityLogPath, { flags: 'a', mode: 0o600 });
     aStream.on('error', err => process.stderr.write(`[TeamClaude] activity log error: ${err.message}\n`));
     const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
-    const writeActivity = msg => {
-      // Strip [TeamClaude] prefix to match TUI behaviour
-      aStream.write(`${ts()}  ${msg.replace(/^\[TeamClaude\]\s*/, '')}\n`);
+    const writeActivity = (/** @type {string} */ msg) => {
+      // Strip [TeamClaude] prefix to match TUI behaviour. Sanitized because a
+      // log line is one line: a value carrying a newline would otherwise write
+      // a second entry that reads as genuine, and this file is what deployments
+      // join against to attribute traffic to a person.
+      aStream.write(`${ts()}  ${sanitizeText(msg.replace(/^\[TeamClaude\]\s*/, ''))}\n`);
     };
     // Capture request completions via the hook
     const inFlight = new Map();
@@ -388,7 +570,9 @@ async function serverCommand() {
       const acct = info.account || r?.account || '?';
       const model = info.model ? ` (${info.model})` : '';
       const sid = info.sessionId ? `${info.sessionId.slice(0, 6)} ` : '';
-      writeActivity(`${sid}${info.method} ${info.path}${model} → ${acct} (${info.status}, ${dur}s)`);
+      const client = (info.client || r?.client) ? `[${info.client || r?.client}] ` : '';
+      const pin = (info.pinned || r?.pinned) ? ' [pin]' : '';
+      writeActivity(`${client}${sid}${info.method} ${info.path}${model} → ${acct}${pin} (${info.status}, ${dur}s)`);
     };
     // Tee console output to the activity log as well
     const origLog = console.log;
@@ -402,11 +586,23 @@ async function serverCommand() {
   hooks.reload = reloadAccounts;
   hooks.maintenanceCoordinator = maintenance;
   hooks.getStatusExtra = () => ({
+    // Read live from the shared config (not a startup snapshot) so the TUI's
+    // blocklist editor shows up in `status` immediately, the same way the
+    // per-request gate in server.js picks it up.
+    blockedModels: [...(config.blockedModels || [])],
+    // Per-client usage (proxy.clientKeys) — empty object when unconfigured.
+    clients: clientUsage.export(),
+    // Per-dimension usage (proxy.usageDimensions) — empty when unconfigured.
+    usageDimensions: dimensionUsage.export(),
     server: {
+      version: serverVersion,
+      versionLabel,
+      updateAvailable,
       startedAt: new Date(serverStartedAt).toISOString(),
       uptimeSeconds: Math.round((Date.now() - serverStartedAt) / 1000),
       port,
       upstream: config.upstream || 'https://api.anthropic.com',
+      eventLoop: eventLoopMonitor.status(),
     },
     probe: prober?.getStatus() || {
       enabled: false,
@@ -414,7 +610,9 @@ async function serverCommand() {
       running: false,
       accounts: accountManager.accounts.map(account => ({
         name: account.name,
-        status: account.type === 'oauth' ? 'never' : 'not-applicable',
+        // Same rule as Prober._isProbeTarget: a third-party backend has no
+        // Anthropic usage to read, so it is not-applicable rather than pending.
+        status: (account.type === 'oauth' && !account.upstream) ? 'never' : 'not-applicable',
         lastProbedAt: null,
         startedAt: null,
         durationMs: null,
@@ -435,8 +633,9 @@ async function serverCommand() {
       })),
     },
   });
+  hooks.getQuotaExtra = () => ({ warmup: resolveWarmupConfig(config) });
 
-  const server = createProxyServer(accountManager, config, hooks, sx);
+  const server = createProxyServer(accountManager, config, hooks, sx, clientUsage, dimensionUsage);
   // Catch bind-time errors (e.g. EADDRINUSE) only. Once the socket is bound we
   // remove this handler so a later runtime 'error' isn't misreported as a
   // listen failure and exit the whole proxy.
@@ -474,9 +673,21 @@ async function serverCommand() {
       ? Math.max(0, config.tokenRefreshIntervalMs)
       : 300_000;
     if (tokenRefreshIntervalMs > 0) {
-      setImmediate(() => accountManager.refreshLapsedTokens());
-      tokenSweepInterval = setInterval(() => accountManager.refreshLapsedTokens(), tokenRefreshIntervalMs);
+      setImmediate(sweepTokens);
+      tokenSweepInterval = setInterval(sweepTokens, tokenRefreshIntervalMs);
       tokenSweepInterval.unref?.();
+    }
+    // Announce an egress proxy, especially one inherited from the environment:
+    // it changes where every upstream byte goes, and a value nobody typed here
+    // should never be in force silently.
+    const egressProxy = getUpstreamProxy();
+    if (egressProxy.proxy) {
+      const via = egressProxy.source.startsWith('env:') ? ` (from ${egressProxy.source.slice(4)})` : '';
+      console.log(`[TeamClaude] Upstream proxy: ${describeProxy(egressProxy.proxy)}${via}`);
+    } else if (egressProxy.source === 'self') {
+      // Almost always a shell that ran `eval "$(teamclaude env)"` before starting
+      // the server. Silently going direct is right; saying nothing is not.
+      console.log(`[TeamClaude] Upstream proxy: direct — ${describeSelfProxy(egressProxy)}`);
     }
     if (tui) {
       tui.start();
@@ -513,16 +724,16 @@ async function serverCommand() {
   }, 60_000);
   quotaSaveInterval.unref?.();
 
-  // The process coordinator owns all maintenance schedules and capacity
-  // admission; adapters only describe their individual jobs.
   prober = new Prober(accountManager, {
     intervalMs: (config.quotaProbeSeconds || 0) * 1000,
     coordinator: maintenance,
+    profileFn: fetchProfile,
   });
+  hooks.probeQuota = async () => { await prober?.probeAll(); };
   prober.start();
-
   warmer = new Warmer(accountManager, {
     intervalMs: (config.warmupSeconds || 0) * 1000,
+    schedule: config.warmupSchedule || null,
     port,
     apiKey: config.proxy?.apiKey,
     coordinator: maintenance,
@@ -532,6 +743,9 @@ async function serverCommand() {
   // Background self-update for a backgrounded (headless) server. Skipped under
   // the TUI, where npm's install output would corrupt the display — interactive
   // users update via `teamclaude run` (post-session) or `teamclaude update`.
+  // Not awaited, and nothing inside it is synchronous: the npm probe and the
+  // install are child processes the loop runs beside (#353), so this never
+  // holds up a request.
   if (!tui) autoUpdate({ config }).catch(() => {});
 
   // One idempotent shutdown funnel for BOTH modes and BOTH triggers: POSIX
@@ -550,11 +764,14 @@ async function serverCommand() {
     prober?.stop();
     warmer?.stop();
     await maintenance.shutdown();
+    eventLoopMonitor.stop();
     if (quotaSaveInterval) clearInterval(quotaSaveInterval);
     // Stop the token sweep before the final persist: a sweep firing during
     // teardown could rotate a refresh token upstream and lose the new one to
     // the un-awaited config write racing process.exit.
     if (tokenSweepInterval) clearInterval(tokenSweepInterval);
+    await tokenSweepPromise;
+    await Promise.all([...tokenWrites]);
     await persistQuotaState();
     // Don't linger waiting on keep-alive / streaming connections: actively
     // destroy them so server.close() can complete promptly, and hard-exit after a
@@ -747,7 +964,10 @@ async function restartCommand() {
 // ── import ──────────────────────────────────────────────────
 
 async function importCommand() {
-  const config = await loadOrCreateConfig();
+  // First-run entry point: the file has to exist (and the egress proxy be
+  // applied) before anything reaches the network. The list is not written back
+  // from this copy — upsertOAuthAccount re-reads the file when it saves.
+  await loadOrCreateConfig();
 
   let name = argValue('--name');
   const jsonStr = argValue('--json');
@@ -782,18 +1002,90 @@ async function importCommand() {
     }
   }
 
-  await upsertOAuthAccount(config, name, creds, 'import');
+  await upsertOAuthAccount(name, creds, 'import');
 }
 
 // ── login ───────────────────────────────────────────────────
+
+/**
+ * `teamclaude login --codex` — browser OAuth against OpenAI, then store the
+ * account.
+ *
+ * Deliberately simpler than the Anthropic path: that one calls the profile
+ * endpoint to discover identity, whereas a Codex id_token already carries the
+ * email and the ChatGPT account id, so there is nothing further to fetch.
+ */
+async function loginCodexCommand() {
+  // loadOrCreateConfig, not loadConfig: `login` is a first-run entry point and
+  // must work before any config file exists. This copy is not what gets
+  // written — see the atomicConfigUpdate below.
+  await loadOrCreateConfig();
+  let creds;
+  try {
+    creds = await loginCodex({ noBrowser: args.includes('--no-browser') });
+  } catch (err) {
+    console.error(`Codex login failed: ${err.message}`);
+    console.error('');
+    console.error('Alternative: sign in with the Codex CLI and import that login instead —');
+    console.error('  CODEX_HOME=~/.codex-second codex login');
+    console.error('  then add: { "name": "...", "type": "oauth", "provider": "codex", "importFrom": "~/.codex-second/auth.json" }');
+    process.exit(1);
+  }
+
+  // The browser flow above can take minutes, and a running server may have
+  // rotated another account's refresh token on disk in the meantime. Writing
+  // the copy loaded before the flow would put the dead token back, and that
+  // account would fail on its next restart. So the upsert runs against a fresh
+  // read of the file, and only this account's row is touched.
+  await atomicConfigUpdate(config => {
+    const name = argValue('--name') || creds.email
+      || `codex-${config.accounts.filter(a => a.provider === 'codex').length + 1}`;
+
+    const account = {
+      name,
+      type: 'oauth',
+      provider: 'codex',
+      source: 'login',
+      accountId: creds.accountId,
+      accessToken: creds.accessToken,
+      refreshToken: creds.refreshToken,
+      expiresAt: creds.expiresAt,
+    };
+
+    // Identity for a Codex account is its ChatGPT account id; fall back to the
+    // display name when upstream did not supply one.
+    const idx = config.accounts.findIndex(a => (
+      a.provider === 'codex' && (
+        (account.accountId && a.accountId === account.accountId) || a.name === account.name
+      )
+    ));
+    if (idx >= 0) {
+      const prev = config.accounts[idx];
+      config.accounts[idx] = { ...prev, ...account, name: prev.name };
+      console.log(`Updated account "${prev.name}"`);
+    } else {
+      config.accounts.push(account);
+      console.log(`Added account "${account.name}"${creds.planType ? ` (${creds.planType})` : ''}`);
+    }
+  });
+  console.log(`Saved to ${getConfigPath()}`);
+}
 
 async function loginCommand() {
   if (args.includes('--api')) {
     await loginApiCommand();
     return;
   }
+  if (args.includes('--token')) {
+    await loginOAuthCommand({ pasteOnly: true });
+    return;
+  }
   if (args.includes('--oauth')) {
     await loginOAuthCommand();
+    return;
+  }
+  if (args.includes('--codex')) {
+    await loginCodexCommand();
     return;
   }
 
@@ -808,11 +1100,13 @@ async function loginCommand() {
   console.log('Select login method:\n');
   console.log('  1. Claude subscription  (Pro, Max, Team, Enterprise)');
   console.log('  2. Anthropic API key    (Console API billing)');
+  console.log('  3. Codex subscription   (ChatGPT Plus, Pro, Team)');
   console.log('');
   const choice = await new Promise(resolve => rl.question('Choice [1]: ', resolve));
   rl.close();
 
   switch (choice.trim() || '1') {
+    case '3': await loginCodexCommand(); break;
     case '1': await loginOAuthCommand(); break;
     case '2': await loginApiCommand(); break;
     default:
@@ -822,7 +1116,7 @@ async function loginCommand() {
 }
 
 async function loginApiCommand() {
-  const config = await loadOrCreateConfig();
+  await loadOrCreateConfig(); // first run: create the file; the save re-reads it
   let name = argValue('--name');
 
   const rl = createInterface({ input: process.stdin, output: process.stderr });
@@ -834,27 +1128,26 @@ async function loginApiCommand() {
     process.exit(1);
   }
 
-  if (!name) {
-    // First FREE api-N (not `count + 1`, which collides after a delete) — a unique
-    // name is the identity key for credential-less API-key accounts.
-    let n = 1;
-    do { name = `api-${n++}`; } while (config.accounts.some(a => a.name === name));
-  }
-
-  config.accounts.push({ name, type: 'apikey', apiKey: apiKey.trim() });
-  await saveConfig(config);
+  const config = await atomicConfigUpdate(disk => {
+    if (!name) {
+      let n = 1;
+      do { name = `api-${n++}`; } while (disk.accounts.some(a => a.name === name));
+    }
+    disk.accounts.push({ name, type: 'apikey', apiKey: apiKey.trim() });
+  });
   console.log(`Added API key account "${name}"`);
   console.log(`Saved to ${getConfigPath()}`);
+  await notifyRunningServer(config);
 }
 
-async function loginOAuthCommand() {
-  const config = await loadOrCreateConfig();
+async function loginOAuthCommand({ pasteOnly = false } = {}) {
+  await loadOrCreateConfig(); // first run: create the file; the save re-reads it
   let name = argValue('--name');
 
   console.log('Starting OAuth login...');
   let creds;
   try {
-    creds = await loginOAuth();
+    creds = pasteOnly ? await loginOAuthWithPastedCode() : await loginOAuth();
   } catch (err) {
     console.error(`OAuth login failed: ${err.message}`);
     console.error('');
@@ -864,7 +1157,7 @@ async function loginOAuthCommand() {
     process.exit(1);
   }
 
-  await upsertOAuthAccount(config, name, creds, 'login');
+  await upsertOAuthAccount(name, creds, 'login');
 }
 
 // ── env ─────────────────────────────────────────────────────
@@ -885,17 +1178,53 @@ async function envCommand() {
     process.exit(1);
   }
   const port = config.proxy.port;
-  const useMitm = !args.slice(1).includes('--no-mitm');
+  let useMitm;
+  try {
+    useMitm = resolveClientMode(config, args.slice(1)) === 'mitm';
+  } catch (/** @type {any} */ err) {
+    process.stderr.write(`teamclaude env: ${err.message}\n`);
+    process.exit(1);
+  }
 
   let caPath = null;
-  if (useMitm) ({ caPath } = await ensureCerts(upstreamHost(config)));
+  // The leaf has to name every host MITM will intercept, or the CONNECT for
+  // a second provider fails the handshake instead of being served.
+  if (useMitm) ({ caPath } = await ensureCerts(mitmHosts(config)));
 
-  const lines = buildClaudeEnvLines({ port, useMitm, caPath, holdSeconds: config.holdSeconds });
+  // Same pin as `teamclaude run`, so `eval "$(teamclaude env)"` and `run` agree.
+  const account = (process.env.TC_ACCT || '').trim();
+  let lines;
+  try {
+    lines = buildClaudeEnvLines({
+      port, useMitm, caPath, holdSeconds: config.holdSeconds,
+      account, proxyApiKey: config.proxy?.apiKey || '',
+      // The shell doing the eval keeps its own NO_PROXY entries; re-running is
+      // idempotent, since the merged value is what it will have next time.
+      inheritedNoProxy: [process.env.NO_PROXY, process.env.no_proxy].filter(Boolean).join(','),
+    });
+    // Base-URL mode takes the proxy back OUT of a shell an earlier MITM eval
+    // put it into; only this proxy's own loopback address is unset.
+    if (!useMitm) lines.push(...clearSelfProxyEnvLines(port));
+  } catch (err) {
+    // A bad proxy.port. Nothing reaches stdout: the shell is eval'ing it.
+    process.stderr.write(`teamclaude env: ${err.message} (in ${getConfigPath()})\n`);
+    process.exit(1);
+  }
   process.stdout.write(`${lines.join('\n')}\n`);
 
   const mode = useMitm ? 'MITM forward-proxy' : 'base-URL';
   process.stderr.write(`# TeamClaude env: ${mode} mode, localhost:${port}\n`);
-  process.stderr.write(`# apply to this shell:  eval "$(teamclaude env${useMitm ? '' : ' --no-mitm'})"\n`);
+  if (account) {
+    process.stderr.write(`# pinned to account "${account}" (TC_ACCT)\n`);
+    // Warn, don't fail: the account list can change before the shell is used,
+    // and this command must stay eval-safe.
+    if (!(config.accounts || []).some((a, i) => a.name === account || String(i) === account)) {
+      process.stderr.write(`# warning: no account named "${account}" in the config — the proxy will refuse this pin\n`);
+    }
+  }
+  // The flag that reproduces this mode whatever the config's default says.
+  process.stderr.write(`# apply to this shell:  eval "$(teamclaude env${useMitm ? ' --mitm' : ' --no-mitm'})"\n`);
+  process.stderr.write(`# default mode is ${config.defaultClientMode === 'base-url' ? 'base-URL' : 'MITM'} (config defaultClientMode; the TUI settings screen toggles it)\n`);
   if (!(await isProxyUp(port))) {
     process.stderr.write(`# note: proxy not running on port ${port} — start it with: teamclaude server\n`);
   }
@@ -912,12 +1241,18 @@ async function runCommand() {
   // Args after 'run'. teamclaude flags (e.g. --no-mitm) are recognized only
   // before an optional `--` separator; everything after `--` goes verbatim to
   // claude. MITM forward-proxy mode is the default so hardcoded api.anthropic.com
-  // endpoints are intercepted too; --no-mitm opts back into base-URL-only routing.
-  // --mitm is still accepted (now a no-op) for backward compatibility.
+  // endpoints are intercepted too; the config's `defaultClientMode` can make
+  // base-URL the default instead, and --mitm / --no-mitm decide per launch.
   const rest = args.slice(1);
   const sep = rest.indexOf('--');
   const tcFlags = sep >= 0 ? rest.slice(0, sep) : rest;
-  const useMitm = !tcFlags.includes('--no-mitm');
+  let useMitm;
+  try {
+    useMitm = resolveClientMode(config, tcFlags) === 'mitm';
+  } catch (/** @type {any} */ err) {
+    console.error(`[TeamClaude] ${err.message}`);
+    process.exit(1);
+  }
   const autoFallback = tcFlags.includes('--auto-fallback');
   const claudeArgs = sep >= 0
     ? rest.slice(sep + 1)
@@ -929,23 +1264,59 @@ async function runCommand() {
   // opt back into the transparent direct launch (e.g. for a dumb shell alias).
   const port = config.proxy.port;
   const env = { ...process.env };
+  // TC_ACCT pins this session to one account, in either mode. It is teamclaude's
+  // own knob, so it never reaches the child: claude has no use for it, and an
+  // account name is not something to leak into a subprocess environment that
+  // gets inherited by every tool and MCP server claude spawns.
+  const tcAcct = (process.env.TC_ACCT || '').trim();
+  delete env.TC_ACCT;
+  // Legacy: a caller-supplied ANTHROPIC_BASE_URL of http://<this proxy>/tc-acct/…
+  // also pins (shipped in 1.1.10). TC_ACCT is the supported way now — it works in
+  // MITM mode too, and keeps the pin out of the API path.
+  const pinnedBase = isLocalAccountPin(process.env.ANTHROPIC_BASE_URL, port);
   if (await isProxyUp(port)) {
     if (useMitm) {
       // Route ALL of claude's traffic through us as an HTTPS forward proxy, so
       // even hardcoded api.anthropic.com endpoints (e.g. the design MCP) get the
       // real token injected. claude trusts our MITM leaf via NODE_EXTRA_CA_CERTS.
-      const host = upstreamHost(config);
-      const { caPath } = await ensureCerts(host);
-      const proxyUrl = `http://127.0.0.1:${port}`;
+      const { caPath } = await ensureCerts(mitmHosts(config));
+      // The pin rides in the proxy URL's userinfo, which the client forwards as
+      // `Proxy-Authorization: Basic <acct>:<key>` on each CONNECT — the only pin
+      // channel an HTTPS_PROXY env var can express. The password slot keeps the
+      // proxy apiKey, matching the existing `--proxy http://<key>@host:port`
+      // form, so auth and pinning coexist in one URL.
+      const userinfo = tcAcct
+        ? `${encodePinComponent(tcAcct)}:${encodePinComponent(config.proxy?.apiKey || '')}@`
+        : '';
+      const proxyUrl = `http://${userinfo}127.0.0.1:${port}`;
       env.HTTPS_PROXY = env.HTTP_PROXY = env.https_proxy = env.http_proxy = proxyUrl;
-      env.NO_PROXY = env.no_proxy = 'localhost,127.0.0.1,::1';
+      // Keep the operator's own NO_PROXY and add ours — see mergeNoProxy. Both
+      // spellings are read: a tool that set only one still meant it.
+      const inheritedNoProxy = [process.env.NO_PROXY, process.env.no_proxy];
+      env.NO_PROXY = env.no_proxy = mergeNoProxy(...inheritedNoProxy);
+      if (inheritedNoProxy.some(bypassesAllHosts)) {
+        console.error('[TeamClaude] NO_PROXY=* ignored: it would send api.anthropic.com around the proxy (no rotation). Use --no-mitm for a direct launch.');
+      }
       env.NODE_EXTRA_CA_CERTS = caPath;
+      if (tcAcct) console.error(`[TeamClaude] Pinned to account "${tcAcct}" (TC_ACCT)`);
+      else if (pinnedBase) {
+        console.error('[TeamClaude] Account pin in ANTHROPIC_BASE_URL ignored: MITM mode does not use a base URL.');
+        console.error('[TeamClaude] Use TC_ACCT=<account> instead — it pins in both modes.');
+      }
       delete env.ANTHROPIC_BASE_URL;
     } else {
       // Only set ANTHROPIC_BASE_URL — Claude Code keeps its own OAuth token
       // which the proxy accepts from localhost. Not setting ANTHROPIC_API_KEY
       // lets Claude Code stay in subscription mode (full model access).
-      env.ANTHROPIC_BASE_URL = `http://localhost:${port}`;
+      // TC_ACCT wins; teamclaude builds the pinned URL itself rather than making
+      // the caller hand-write one. Otherwise an existing /tc-acct/ base URL
+      // pointing at this proxy is preserved for configs written against 1.1.10.
+      if (tcAcct) {
+        env.ANTHROPIC_BASE_URL = `http://localhost:${port}/tc-acct/${encodePinComponent(tcAcct)}`;
+        console.error(`[TeamClaude] Pinned to account "${tcAcct}" (TC_ACCT)`);
+      } else if (!pinnedBase) {
+        env.ANTHROPIC_BASE_URL = `http://localhost:${port}`;
+      }
     }
   } else if (autoFallback) {
     console.error(`[TeamClaude] Proxy not running on port ${port} — launching claude directly (--auto-fallback; start it with: teamclaude server)`);
@@ -977,7 +1348,7 @@ async function runCommand() {
   });
 
   if (result.error) {
-    if (result.error.code === 'ENOENT') {
+    if (/** @type {CodedError} */ (result.error).code === 'ENOENT') {
       console.error('Claude Code not found in PATH. Install it first.');
     } else {
       console.error(`Failed to start claude: ${result.error.message}`);
@@ -995,30 +1366,197 @@ async function runCommand() {
 
 // ── status ──────────────────────────────────────────────────
 
+// process.stdout.write is asynchronous when stdout is a pipe, so a write that
+// is followed by process.exit loses whatever has not reached the pipe yet: on
+// macOS a 15 KB status came out as its first 512 bytes through `| jq`. This
+// resolves once the bytes are handed off. A reader that quits early (`| head`)
+// raises EPIPE, which console.log swallows; the listener keeps that behaviour.
+/** @param {string} text @returns {Promise<void>} */
+function writeStdout(text) {
+  return new Promise(resolve => {
+    process.stdout.write(text, err => {
+      if (err) process.stdout.once('error', () => {});
+      resolve();
+    });
+  });
+}
+
 async function statusCommand() {
   const config = await loadOrCreateConfig();
-  // Locate the actual bound proxy rather than blindly trusting a changed config.
-  const running = await findRunningServer(config);
-  if (!running) {
-    console.log(`Server:         not running (no proxy on port ${config.proxy.port})`);
-    console.log('Start it with:  teamclaude server');
-    process.exit(1);
-  }
+  // Status is itself the authenticated liveness request. Do not issue a
+  // separate anonymous probe that hides stalled-server timeout diagnostics.
+  const state = await readServerState();
+  const running = { port: state?.port || config.proxy.port };
   const url = `http://127.0.0.1:${running.port}/teamclaude/status`;
   const json = args.includes('--json');
   const colorArg = argValue('--color') || args.find(arg => arg.startsWith('--color='))?.slice('--color='.length);
   const color = colorArg === 'always' || (colorArg !== 'never' && process.stdout.isTTY);
 
+  // A connection that is accepted and then never answered is a different
+  // failure from a refused one — a stalled or overloaded server rather than a
+  // stopped one — and without a deadline this command would just hang on it.
+  const configuredTimeout = Number(process.env.TEAMCLAUDE_STATUS_TIMEOUT_MS);
+  const timeoutMs = configuredTimeout > 0 ? configuredTimeout : 5_000;
+
   try {
-    const res = await fetch(url, { headers: { 'x-api-key': config.proxy.apiKey } });
+    const res = await fetch(url, {
+      headers: { 'x-api-key': config.proxy.apiKey },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
     const data = await res.json();
     if (json) {
-      console.log(JSON.stringify(data, null, 2));
+      await writeStdout(`${JSON.stringify(data, null, 2)}\n`);
       return;
     }
-    console.log(renderStatus(data, { color }));
+    await writeStdout(`${renderStatus(data, { color })}\n`);
   } catch (err) {
+    if (err instanceof Error && err.name === 'TimeoutError') {
+      console.error(`Proxy at localhost:${running.port} did not answer status within ${timeoutMs}ms.`);
+      console.error('The process may be overloaded or its event loop may be stalled.');
+      console.error(`Check the service log: ${logPath()}`);
+      process.exit(1);
+    }
     console.error(`Cannot connect to proxy at localhost:${running.port}`);
+    console.error('Is the server running? Start with: teamclaude server');
+    if (err instanceof Error) console.error(`Details: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+// ── attach ──────────────────────────────────────────────────
+
+// The interactive dashboard against a server that is ALREADY running. A proxy
+// installed as a background service has no foreground TUI, so this is the only
+// way to watch and steer it live; it renders from polled status and can only do
+// what the control plane exposes (switch, reload).
+async function attachCommand() {
+  const config = await loadOrCreateConfig();
+  const port = config.proxy.port;
+  // Reach the server where it actually binds (see serverCommand): a host set in
+  // the config or the environment is not reachable as localhost, and reporting
+  // "not running" for a server that is plainly up is the worst of the answers.
+  // A wildcard bind is not an address to dial, so dial this machine instead.
+  const bound = process.env.TEAMCLAUDE_HOST || config.proxy.host || '127.0.0.1';
+  const host = (bound === '0.0.0.0' || bound === '::') ? '127.0.0.1' : bound;
+
+  // Checked before connecting: the dashboard needs raw-mode input, and failing
+  // on that after a successful poll would be a confusing order to report it in.
+  if (!process.stdin.isTTY) {
+    console.error('teamclaude attach needs a terminal. For a one-shot readout use: teamclaude status');
+    process.exit(1);
+  }
+
+  const control = new RemoteControl({ port, host, apiKey: config.proxy.apiKey });
+  let first;
+  try {
+    first = await control.status(); // fail here, with a usable message, not inside the TUI
+  } catch (err) {
+    console.error(`Cannot connect to proxy at ${host}:${port}`);
+    console.error('Is the server running? Start with: teamclaude server');
+    if (err?.message) console.error(`Details: ${err.message}`);
+    process.exit(1);
+  }
+
+  await new Promise(resolve => {
+    const session = createAttachSession({ control, config, onQuit: resolve });
+    // The status just fetched is the first frame: without it the alt-screen opens
+    // on a disconnected, empty dashboard until the first poll lands.
+    session.am.applyStatus(first);
+    session.start();
+  });
+}
+
+// Open the browser dashboard against a running server. The page is served by
+// the proxy itself, so this is `attach` for the browser: it does not start a
+// server. A background daemon started from here would run with no log and no
+// supervisor, which is what `teamclaude service install` exists to avoid.
+async function dashboardCommand() {
+  const config = await loadOrCreateConfig();
+  const port = config.proxy.port;
+  const bound = process.env.TEAMCLAUDE_HOST || config.proxy.host || '127.0.0.1';
+  const host = (bound === '0.0.0.0' || bound === '::') ? '127.0.0.1' : bound;
+  const dashboardUrl = `http://${host}:${port}/teamclaude/dashboard`;
+  if (!(await isProxyUp(port))) {
+    console.error(`[TeamClaude] Proxy not running on port ${port}.`);
+    console.error('Start it with: teamclaude server   (or: teamclaude service install)');
+    process.exit(1);
+  }
+
+  console.log(`Dashboard: ${dashboardUrl}`);
+  const opener = process.platform === 'darwin' ? 'open'
+    : process.platform === 'win32' ? 'start'
+    : 'xdg-open';
+  const opened = spawnSync(opener, process.platform === 'win32' ? ['', dashboardUrl] : [dashboardUrl], { stdio: 'ignore', shell: process.platform === 'win32' });
+  if (opened.error || opened.status !== 0) console.error('Could not open a browser; open the URL above by hand.');
+}
+
+// ── switch ──────────────────────────────────────────────────
+
+// Manual account switch against a RUNNING server — the headless equivalent of
+// pressing 's' in the TUI, which is unreachable when the proxy runs as a
+// background service. Nothing is written to the config: like the TUI's switch
+// this is a runtime preference that dies with the process, so the server is the
+// only place that can answer or apply it.
+async function switchCommand() {
+  const config = await loadOrCreateConfig();
+  const port = config.proxy.port;
+  const headers = { 'x-api-key': config.proxy.apiKey };
+  const name = args[1] && !args[1].startsWith('-') ? args[1] : null;
+
+  try {
+    if (!name) {
+      const res = await fetch(`http://localhost:${port}/teamclaude/status`, { headers });
+      // Something answered on the port. Whether it is our proxy is a separate
+      // question, and getting it wrong would blame a down server for a reply we
+      // simply could not read — or report an unreadable reply as an empty fleet.
+      const data = res.ok ? await res.json().catch(() => null) : null;
+      if (!data || !Array.isArray(data.accounts)) {
+        console.error(`Unexpected reply from localhost:${port} (HTTP ${res.status}) — no account list in it.`);
+        console.error('Something is listening there, but it does not answer like this teamclaude version.');
+        process.exit(1);
+      }
+      if (!data.accounts.length) {
+        console.log('No accounts configured.');
+        return;
+      }
+      for (const a of data.accounts) {
+        // Flag what would stop traffic reaching an account. The TUI shows this in
+        // its table, so leaving it out here would make the headless half of the
+        // feature the only place a disabled account looks switchable.
+        const state = a.disabled ? 'disabled' : (a.status && a.status !== 'active' ? a.status : null);
+        console.log(`${a.name === data.currentAccount ? '*' : ' '} ${a.name}${state ? `  (${state})` : ''}`);
+      }
+      console.log('\nSwitch with: teamclaude switch <name>');
+      return;
+    }
+
+    const res = await fetch(`http://localhost:${port}/teamclaude/switch`, {
+      method: 'POST',
+      headers: { ...headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ account: name }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      // Our own errors are strings. A server too old to know this endpoint
+      // forwards the request upstream instead, and Anthropic's error is an
+      // object — printing that raw gives the user "[object Object]".
+      const detail = typeof data.error === 'string' ? data.error : null;
+      console.error(detail || `Switch failed: unexpected reply from localhost:${port} (HTTP ${res.status}).`);
+      if (!detail) console.error('An older server without this endpoint answers this way; restart it to pick up the new version.');
+      if (data.accounts?.length) {
+        console.error('Known accounts:');
+        for (const n of data.accounts) console.error(`  ${n}`);
+      }
+      process.exit(1);
+    }
+    console.log(`Switched to "${data.account}"`);
+    // Recorded is not the same as in effect: rotation skips an account it cannot
+    // use on the very next request, so saying nothing here would be a quiet lie.
+    if (data.eligible === false) {
+      console.error(`Warning: "${data.account}" is ${data.reason || 'not currently eligible'}, so requests will not route to it until that changes.`);
+    }
+  } catch (err) {
+    console.error('Cannot connect to proxy at localhost:' + port);
     console.error('Is the server running? Start with: teamclaude server');
     if (err?.message) console.error(`Details: ${err.message}`);
     process.exit(1);
@@ -1037,8 +1575,12 @@ async function accountsCommand() {
     return;
   }
 
+  // Both writes below pair rows by entry id against a fresh read of the file,
+  // so a file written before ids existed needs its ids on disk first.
+  await persistMintedAccountIds(config);
+
   // Refresh expired tokens before fetching profiles
-  let configDirty = false;
+  const refreshed = [];
   await Promise.all(config.accounts.map(async (a) => {
     if (a.type !== 'oauth' || !a.refreshToken) return;
     if (!isTokenExpiringSoon(a.expiresAt)) return;
@@ -1047,12 +1589,26 @@ async function accountsCommand() {
       a.accessToken = newTokens.accessToken;
       a.refreshToken = newTokens.refreshToken;
       a.expiresAt = newTokens.expiresAt;
-      configDirty = true;
+      refreshed.push(a);
     } catch {
       // refresh failed — fetchProfile will report the specific error
     }
   }));
-  if (configDirty) await saveConfig(config);
+  // Only the refreshed rows are written, each onto the on-disk row with its id.
+  // Saving the whole in-memory list here would put back whatever a running
+  // server rotated on disk since the load — a refresh token that is now dead,
+  // and an account lost on its next restart.
+  if (refreshed.length > 0) {
+    await atomicConfigUpdate(disk => {
+      for (const a of refreshed) {
+        const i = findConfigAccount(disk, a);
+        if (i < 0) continue; // no row of its own; any other row would be another account's
+        disk.accounts[i].accessToken = a.accessToken;
+        disk.accounts[i].refreshToken = a.refreshToken;
+        disk.accounts[i].expiresAt = a.expiresAt;
+      }
+    });
+  }
 
   // Fetch profiles in parallel for all OAuth accounts
   const profiles = await Promise.all(
@@ -1066,14 +1622,19 @@ async function accountsCommand() {
   // account, not a duplicate. Keep the last (most recently added) entry.
   const seen = new Map();
   let removed = 0;
-  let touched = false;
+  // Which entries changed, by id, so the write below touches only those rows.
+  const touchedIds = new Set();
+  const removedIds = new Set();
   for (let i = config.accounts.length - 1; i >= 0; i--) {
     const a = config.accounts[i];
     const p = profiles[i];
     if (p && !p.error) {
-      if (p.accountUuid && a.accountUuid !== p.accountUuid) { a.accountUuid = p.accountUuid; touched = true; }
-      if (p.orgUuid && a.orgUuid !== p.orgUuid) { a.orgUuid = p.orgUuid; touched = true; }
-      if (p.orgName && a.orgName !== p.orgName) { a.orgName = p.orgName; touched = true; }
+      if (p.accountUuid && a.accountUuid !== p.accountUuid) { a.accountUuid = p.accountUuid; touchedIds.add(a.id); }
+      if (p.orgUuid && a.orgUuid !== p.orgUuid) { a.orgUuid = p.orgUuid; touchedIds.add(a.id); }
+      if (p.orgName && a.orgName !== p.orgName) { a.orgName = p.orgName; touchedIds.add(a.id); }
+      for (const field of ['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro']) {
+        if (p[field] != null && a[field] !== p[field]) { a[field] = p[field]; touchedIds.add(a.id); }
+      }
     }
     const uuid = a.accountUuid;
     if (!uuid) continue;
@@ -1082,7 +1643,7 @@ async function accountsCommand() {
       config.accounts.splice(i, 1);
       profiles.splice(i, 1);
       removed++;
-      touched = true;
+      removedIds.add(a.id);
     } else {
       seen.set(key, i);
     }
@@ -1100,10 +1661,24 @@ async function accountsCommand() {
     const email = (p && !p.error && p.email) ? p.email : null;
     if (!email) continue;
     const newName = orgCount.get(a.accountUuid) > 1 ? `${email} (${orgLabel(a)})` : email;
-    if (a.name !== newName) { a.name = newName; touched = true; }
+    if (a.name !== newName) { a.name = newName; touchedIds.add(a.id); }
   }
 
-  if (touched) await saveConfig(config);
+  // Same discipline as the token write: drop the duplicates by id and copy the
+  // profile fields onto the touched rows only, leaving every other row — and
+  // every other field of these rows — as it is on disk.
+  if (touchedIds.size > 0 || removedIds.size > 0) {
+    const fields = ['name', 'accountUuid', 'orgUuid', 'orgName', 'organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro'];
+    await atomicConfigUpdate(disk => {
+      disk.accounts = disk.accounts.filter(d => !removedIds.has(d?.id));
+      for (const a of config.accounts) {
+        if (!touchedIds.has(a.id)) continue;
+        const i = findConfigAccount(disk, a);
+        if (i < 0) continue;
+        for (const f of fields) if (a[f] !== undefined) disk.accounts[i][f] = a[f];
+      }
+    });
+  }
   if (removed > 0) console.log(`Removed ${removed} duplicate account(s)\n`);
 
   for (const [i, a] of config.accounts.entries()) {
@@ -1122,6 +1697,8 @@ async function accountsCommand() {
     console.log(`  [${i + 1}] ${a.name} (${status}${src})`);
     if (hasProfile && p.email && p.email !== a.name) console.log(`       Email: ${p.email}`);
     if (hasProfile && p.orgName) console.log(`       Org:   ${p.orgName}`);
+    // The stable pin identity (TC_ACCT), unlike the display name above.
+    if (a.accountUuid) console.log(`       ID:    ${a.accountUuid}`);
     if (verbose && a.expiresAt) {
       const remaining = a.expiresAt - Date.now();
       if (remaining <= 0) {
@@ -1168,10 +1745,12 @@ async function apiCommand() {
   const upstream = config.upstream || 'https://api.anthropic.com';
   const url = path.startsWith('http') ? path : `${upstream}${path}`;
 
+  /** @type {Record<string, string>} */
   const headers = isOAuth
     ? { 'Authorization': `Bearer ${credential}` }
-    : { 'x-api-key': credential };
+    : { 'x-api-key': credential || '' };
 
+  /** @type {RequestInit} */
   const fetchOpts = { method, headers };
   if (data) {
     headers['Content-Type'] = 'application/json';
@@ -1209,6 +1788,50 @@ function aliasCommand() {
   }
 }
 
+// ── service ─────────────────────────────────────────────────
+
+async function serviceCommand() {
+  const sub = args[1] || 'status';
+  const kind = serviceKind();
+  if (!kind) {
+    console.error(`teamclaude service: no service integration for ${process.platform}`);
+    console.error('Run the proxy yourself with: teamclaude server --headless');
+    process.exit(1);
+  }
+  // Carry an explicit config path into the unit: a service started by launchd or
+  // systemd does not inherit the shell's TEAMCLAUDE_CONFIG, so a non-default
+  // config would silently be ignored and the service would serve a different
+  // (or empty) account list than the CLI does.
+  const configPath = process.env.TEAMCLAUDE_CONFIG || null;
+
+  switch (sub) {
+    case 'install': {
+      const res = await installService({ configPath });
+      if (!res.ok) { console.error(`teamclaude service install failed: ${res.error}`); process.exit(1); }
+      break;
+    }
+    case 'uninstall': {
+      const res = await uninstallService();
+      if (!res.ok) { console.error(`teamclaude service uninstall failed: ${res.error}`); process.exit(1); }
+      break;
+    }
+    case 'print':
+      process.stdout.write(renderService({ configPath }));
+      break;
+    case 'status': {
+      const s = await serviceStatus();
+      console.log(`Service:   ${s.installed ? s.file : 'not installed'}`);
+      console.log(`State:     ${s.running ? `running${s.pid ? ` (pid ${s.pid})` : ''}` : s.detail}`);
+      if (kind === 'launchd') console.log(`Logs:      ${logPath()}`);
+      else console.log('Logs:      journalctl --user --unit teamclaude.service');
+      break;
+    }
+    default:
+      console.error('Usage: teamclaude service <install|uninstall|status|print>');
+      process.exit(1);
+  }
+}
+
 // ── probe ───────────────────────────────────────────────────
 
 async function probeCommand() {
@@ -1235,14 +1858,18 @@ async function probeCommand() {
       console.error('Minimum probe interval is 30s (to avoid hammering the usage endpoint).');
       process.exit(1);
     }
+    // Past the ceiling the interval would overflow into a 1 ms probe storm.
+    if (seconds > MAX_PROBE_SECONDS) {
+      console.error(`Maximum probe interval is ${MAX_PROBE_SECONDS}s (7 days).`);
+      process.exit(1);
+    }
   }
 
-  config.quotaProbeSeconds = seconds;
-  await saveConfig(config);
+  const updated = await atomicConfigUpdate(disk => { disk.quotaProbeSeconds = seconds; });
   console.log(seconds > 0
     ? `Quota probe set to every ${seconds}s (reads /api/oauth/usage; does not spend quota).`
     : 'Quota probe disabled (passive only).');
-  await notifyRunningServer(config);
+  await notifyRunningServer(updated);
 }
 
 // ── warmup ──────────────────────────────────────────────────
@@ -1252,11 +1879,49 @@ async function warmupCommand() {
   const arg = args[1];
 
   if (arg === undefined) {
+    if (config.warmupSchedule) {
+      console.log(formatWarmupScheduleConfirmation(config.warmupSchedule));
+      return;
+    }
     const cur = config.warmupSeconds || 0;
     console.log(cur > 0 ? `Keep-warm: every ${cur}s` : 'Keep-warm: off');
-    console.log('Set with: teamclaude warmup <off|seconds>   e.g. teamclaude warmup 600');
+    console.log('Set with: teamclaude warmup <off|seconds>');
+    console.log('          teamclaude warmup reset HH:MM --timezone Area/City');
+    console.log('          teamclaude warmup rolling HH:MM --timezone Area/City');
     console.log('Note: warming spawns a minimal `claude` per idle account and DOES spend a little quota');
     console.log('(unlike the passive quota probe). It only warms accounts whose 5h window is idle.');
+    return;
+  }
+
+  if (arg === 'reset' || arg === 'rolling') {
+    const resetTime = args[2];
+    const timezoneFlag = args.indexOf('--timezone', 3);
+    const timezone = timezoneFlag >= 0 ? args[timezoneFlag + 1] : null;
+    if (!resetTime || !timezone || args.length !== 5 || timezoneFlag !== 3) {
+      console.error(`Usage: teamclaude warmup ${arg} HH:MM --timezone Area/City`);
+      process.exit(1);
+    }
+    const schedule = { resetTime, timezone };
+    try {
+      if (arg === 'rolling') {
+        config.warmupSchedule = createRollingWarmupSchedule(schedule);
+      } else {
+        const resolved = resolveWarmupSchedule(schedule);
+        config.warmupSchedule = {
+          resetTime: resolved.resetTime,
+          timezone: resolved.timezone,
+        };
+      }
+    } catch (err) {
+      console.error(err.message);
+      process.exit(1);
+    }
+    const updated = await atomicConfigUpdate(disk => {
+      disk.warmupSchedule = config.warmupSchedule;
+      disk.warmupSeconds = 0;
+    });
+    console.log(formatWarmupScheduleConfirmation(config.warmupSchedule));
+    await notifyRunningServer(updated);
     return;
   }
 
@@ -1275,12 +1940,173 @@ async function warmupCommand() {
     }
   }
 
-  config.warmupSeconds = seconds;
-  await saveConfig(config);
+  const updated = await atomicConfigUpdate(disk => {
+    disk.warmupSeconds = seconds;
+    delete disk.warmupSchedule;
+  });
   console.log(seconds > 0
     ? `Keep-warm set to every ${seconds}s (spawns a minimal \`claude\` per idle account; spends a little quota).`
     : 'Keep-warm disabled.');
-  await notifyRunningServer(config);
+  await notifyRunningServer(updated);
+}
+
+// ── threshold ───────────────────────────────────────────────
+
+/** The stored form of a percentage: a 0–1 ratio quantised to tenths of a
+ *  percent, so a value set here reads back identically on the settings screen
+ *  (tui.js quantises the same way). Returns null when the input is not a
+ *  percentage this setting accepts. */
+/** @param {string} text */
+function thresholdRatio(text) {
+  const pct = Number(text);
+  if (!Number.isFinite(pct) || pct < 1 || pct > 100) return null;
+  return Math.round(pct * 10) / 1000;
+}
+
+/** The threshold table as `{ default, ...buckets }`, whatever shape it is
+ *  stored in — a bare number is the default with no bucket overrides. */
+/** @param {number | Record<string, number> | null | undefined} value @returns {Record<string, number>} */
+function thresholdTable(value) {
+  if (value && typeof value === 'object') {
+    return { default: DEFAULT_SWITCH_THRESHOLD, ...value };
+  }
+  return { default: typeof value === 'number' ? value : DEFAULT_SWITCH_THRESHOLD };
+}
+
+/** @param {number | Record<string, number> | null | undefined} value */
+function printThresholds(value) {
+  const table = thresholdTable(value);
+  console.log(`Switch threshold: ${formatPercent(table.default)}`);
+  for (const [bucket, ratio] of Object.entries(table)) {
+    if (bucket !== 'default' && typeof ratio === 'number') {
+      console.log(`  ${bucket}: ${formatPercent(ratio)}`);
+    }
+  }
+}
+
+async function thresholdCommand() {
+  const config = await loadOrCreateConfig();
+  const rest = args.slice(1);
+
+  if (!rest.length) {
+    printThresholds(config.switchThreshold);
+    console.log('Set with: teamclaude threshold <1-100>   e.g. teamclaude threshold 90');
+    console.log('Per bucket: teamclaude threshold unified7d=90   (=default drops it again)');
+    return;
+  }
+
+  const keyed = rest.filter(arg => arg.includes('='));
+  if (keyed.length && keyed.length !== rest.length) {
+    console.error(THRESHOLD_USAGE);
+    process.exit(1);
+  }
+
+  // One number: the plain form the setting has always had, and it replaces any
+  // per-bucket table rather than hiding one behind the number now in effect.
+  if (!keyed.length) {
+    if (rest.length > 1) {
+      console.error(THRESHOLD_USAGE);
+      process.exit(1);
+    }
+    const ratio = thresholdRatio(rest[0]);
+    if (ratio === null) {
+      console.error(THRESHOLD_USAGE);
+      process.exit(1);
+    }
+    /** @type {string[]} */
+    let dropped = [];
+    const updated = await atomicConfigUpdate(disk => {
+      dropped = Object.keys(thresholdTable(disk.switchThreshold)).filter(b => b !== 'default');
+      disk.switchThreshold = ratio;
+    });
+    if (dropped.length) {
+      console.log(`Dropped the per-bucket thresholds (${dropped.join(', ')}) — one number governs every bucket.`);
+    }
+    console.log(`Switch threshold set to ${formatPercent(ratio)}.`);
+    await notifyRunningServer(updated);
+    return;
+  }
+
+  const changes = new Map();
+  for (const pair of keyed) {
+    const at = pair.indexOf('=');
+    const bucket = pair.slice(0, at);
+    const value = pair.slice(at + 1);
+    if (bucket !== 'default' && !QUOTA_BUCKETS.includes(bucket)) {
+      console.error(`Unknown quota bucket "${bucket}" — expected one of: default, ${QUOTA_BUCKETS.join(', ')}`);
+      process.exit(1);
+    }
+    if (value === 'default') {
+      if (bucket === 'default') {
+        console.error('The default threshold is the fallback — set it to a number instead of dropping it.');
+        process.exit(1);
+      }
+      changes.set(bucket, null);
+      continue;
+    }
+    const ratio = thresholdRatio(value);
+    if (ratio === null) {
+      console.error(THRESHOLD_USAGE);
+      process.exit(1);
+    }
+    changes.set(bucket, ratio);
+  }
+
+  // Back to the plain form once the last override is gone: an object holding
+  // only `default` is the same setting written the long way.
+  const updated = await atomicConfigUpdate(disk => {
+    const table = thresholdTable(disk.switchThreshold);
+    for (const [bucket, ratio] of changes) {
+      if (ratio === null) delete table[bucket];
+      else table[bucket] = ratio;
+    }
+    const overrides = Object.keys(table).filter(b => b !== 'default');
+    disk.switchThreshold = overrides.length ? table : table.default;
+  });
+  printThresholds(updated.switchThreshold);
+  await notifyRunningServer(updated);
+}
+
+// ── distribute ──────────────────────────────────────────────
+
+
+async function distributeCommand() {
+  const config = await loadOrCreateConfig();
+  const arg = args[1];
+  // The mode, not a boolean: `!!` would report "adaptive" as a plain "on" and,
+  // worse, write `true` back over it on the next set.
+  const current = distributionMode(config.distributeSessions);
+
+  if (arg === undefined) {
+    console.log(`Session distribution: ${current}`);
+    console.log('Set with: teamclaude distribute <on|off|adaptive>');
+    console.log('On: each session stays on its account for cache reuse, and new sessions spread');
+    console.log('across equal-priority accounts by load. Off: quota-driven rotation only.');
+    console.log('Adaptive: spread by remaining weekly credit and load rather than evenly, so the');
+    console.log('most-spent account is finished off first without being run into its threshold.');
+    return;
+  }
+
+  /** @type {'even' | 'off' | 'adaptive' | null} */
+  let next = null;
+  if (['on', 'true', 'yes', '1'].includes(arg)) next = 'even';
+  else if (['off', 'false', 'no', '0'].includes(arg)) next = 'off';
+  else if (arg === 'adaptive') next = 'adaptive';
+  if (!next) {
+    console.error(DISTRIBUTE_USAGE);
+    process.exit(1);
+  }
+
+  if (current === next) {
+    console.log(DISTRIBUTE_MODES[next].said);
+    await notifyRunningServer(config);
+    return;
+  }
+  const updated = await atomicConfigUpdate(disk => {
+    disk.distributeSessions = DISTRIBUTE_MODES[next].value;
+  });
+  console.log(DISTRIBUTE_MODES[next].said);
+  await notifyRunningServer(updated);
 }
 
 // ── update ──────────────────────────────────────────────────
@@ -1289,7 +2115,7 @@ async function updateCommand() {
   const cur = currentVersion();
   console.log(`Current version: ${cur || 'unknown'}`);
 
-  const kind = installKind();
+  const kind = await installKind();
   if (kind === 'git') {
     console.log('This is a git checkout — update it with `git pull`, not npm.');
     return;
@@ -1307,7 +2133,7 @@ async function updateCommand() {
   }
 
   console.log(`Updating ${info.current} → ${info.latest} …`);
-  const ok = runUpdate(info.latest);
+  const ok = await runUpdate(info.latest);
   if (ok) {
     console.log(`Updated to ${info.latest}. Restart teamclaude to use the new version.`);
   } else {
@@ -1326,6 +2152,13 @@ async function updateCommand() {
  * orgs, print the candidates and exit so the caller can disambiguate with --org.
  * Returns the matched account, or null if nothing matched.
  */
+/**
+ * @template {import('./identity.js').IdentityAccount} T
+ * @param {T[]} accounts
+ * @param {string} query
+ * @param {string | null} orgFilter
+ * @returns {T | null}
+ */
 function resolveAccount(accounts, query, orgFilter) {
   const matches = matchAccounts(accounts, query, orgFilter);
   if (matches.length === 1) return matches[0];
@@ -1338,7 +2171,9 @@ function resolveAccount(accounts, query, orgFilter) {
 }
 
 async function removeCommand() {
+  /** @type {import('./config.js').ConfigMutation} */
   const config = await loadOrCreateConfig();
+  await persistMintedAccountIds(config);
   const name = args[1];
 
   if (!name) {
@@ -1352,25 +2187,16 @@ async function removeCommand() {
     process.exit(1);
   }
 
-  config.accounts.splice(config.accounts.indexOf(account), 1);
-  await saveConfig(config);
+  const updated = await atomicConfigUpdate(disk => {
+    const index = disk.accounts.findIndex(entry => entry.id === account.id && sameIdentity(entry, account));
+    if (index < 0) throw new Error('Account changed before removal');
+    disk.accounts.splice(index, 1);
+  });
   console.log(`Removed account "${account.name}"`);
+  await notifyRunningServer(updated);
 }
 
 // ── route ───────────────────────────────────────────────────
-
-const ROUTE_USAGE = [
-  'Usage: teamclaude route [list]',
-  '       teamclaude route add <name> --match "<glob>[,<glob>]" [--accounts "<name-or-index>[,...]"] [--bucket <quota-bucket>] [--color <name>]',
-  '       teamclaude route rm <name>',
-  '',
-  'A route pins model ids matching its globs to an exclusive set of accounts.',
-  'Omit --accounts to route to all accounts (e.g. just to override --bucket).',
-  '--color (red/green/yellow/blue/magenta/cyan) tints the route\'s inline marker in the TUI.',
-  'First matching route wins. Changes apply to a running server immediately.',
-].join('\n');
-
-const ROUTE_COLORS = ['red', 'green', 'yellow', 'blue', 'magenta', 'cyan'];
 
 function splitList(value) {
   return (value || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -1411,25 +2237,32 @@ async function routeCommand() {
     for (const a of accounts) {
       if (!known.has(a) && !/^\d+$/.test(a)) console.error(`Warning: no account named "${a}" (yet)`);
     }
+    /** @type {NonNullable<import('./config.js').ConfigMutation['routes']>[number]} */
     const route = { name, match };
     if (accounts.length) route.accounts = accounts;
     if (bucket) route.bucket = bucket;
     if (color) route.color = color.toLowerCase();
-    const at = config.routes.findIndex(r => r.name === name);
-    if (at >= 0) { config.routes[at] = route; console.log(`Updated route "${name}"`); }
-    else { config.routes.push(route); console.log(`Added route "${name}"`); }
-    await saveConfig(config);
-    await notifyRunningServer(config);
+    let replaced = false;
+    const updated = await atomicConfigUpdate(disk => {
+      if (!Array.isArray(disk.routes)) disk.routes = [];
+      const at = disk.routes.findIndex(r => r.name === name);
+      if (at >= 0) { disk.routes[at] = route; replaced = true; }
+      else disk.routes.push(route);
+    });
+    console.log(`${replaced ? 'Updated' : 'Added'} route "${name}"`);
+    await notifyRunningServer(updated);
     return;
   }
 
   if (sub === 'rm' || sub === 'remove' || sub === 'delete') {
     const name = args[2];
-    const before = config.routes.length;
-    config.routes = config.routes.filter(r => r.name !== name);
-    if (config.routes.length === before) { console.error(`Route "${name}" not found`); process.exit(1); }
-    await saveConfig(config);
-    await notifyRunningServer(config);
+    const updated = await atomicConfigUpdate(disk => {
+      const routes = Array.isArray(disk.routes) ? disk.routes : [];
+      const remaining = routes.filter(r => r.name !== name);
+      if (remaining.length === routes.length) throw new Error(`Route "${name}" not found`);
+      disk.routes = remaining;
+    });
+    await notifyRunningServer(updated);
     console.log(`Removed route "${name}"`);
     return;
   }
@@ -1462,6 +2295,7 @@ async function priorityCommand() {
     .filter(Number.isFinite);
   const raw = args[2];
   const clearing = ['auto', 'clear', 'none', 'null'].includes(raw);
+  /** @type {number | null} */
   let priority;
   if (clearing) {
     priority = null;
@@ -1479,9 +2313,17 @@ async function priorityCommand() {
     }
   }
 
-  if (priority == null) delete account.priority;
-  else account.priority = priority;
-  await saveConfig(config);
+  await atomicConfigUpdate(disk => {
+    const current = disk.accounts.find(entry => sameIdentity(entry, account));
+    if (!current) throw new Error('Account changed before priority update');
+    if (args.includes('--first') || args.includes('--last')) {
+      const values = disk.accounts.map(entry => entry.priority)
+        .filter(/** @returns {value is number} */ value => typeof value === 'number' && Number.isFinite(value));
+      priority = args.includes('--first') ? Math.min(0, ...values) - 1 : Math.max(0, ...values) + 1;
+    }
+    if (priority == null) delete current.priority;
+    else current.priority = priority;
+  });
   console.log(priority == null
     ? `Set "${account.name}" to auto (use-or-lose ordering)`
     : `Set priority of "${account.name}" to ${priority} (lower = preferred)`);
@@ -1506,12 +2348,13 @@ async function setDisabledCommand(disabled) {
     process.exit(1);
   }
 
-  if (disabled) {
-    account.disabled = true;
-  } else {
-    delete account.disabled;
-  }
-  await saveConfig(config);
+  await atomicConfigUpdate(disk => {
+    const current = disk.accounts.find(entry => sameIdentity(entry, account));
+    if (!current) throw new Error('Account changed before enable/disable update');
+    if (disabled) current.disabled = true;
+    else delete current.disabled;
+    delete current.enabled;
+  });
   console.log(`${disabled ? 'Disabled' : 'Enabled'} account "${account.name}"`);
   await notifyRunningServer(config);
 }
@@ -1530,33 +2373,55 @@ Commands:
   restart             Stop the running server (if any) and start a fresh one
   import              Import credentials from Claude Code
   login               OAuth login via browser
+  login --token       OAuth login via copy/paste (no local callback; for headless/remote)
   login --api         Add an API key account
-  env [--no-mitm]     Print export lines to point Claude Code at the proxy, for
-                      'eval "$(teamclaude env)"' (MITM forward-proxy by default;
-                      --no-mitm for base-URL only). Handy for agent multiplexers
-                      that spawn claude themselves instead of via 'teamclaude run'
+  env [--mitm|--no-mitm]
+                      Print export lines to point Claude Code at the proxy, for
+                      'eval "$(teamclaude env)"'. MITM forward-proxy unless the
+                      config's defaultClientMode is "base-url"; a flag decides
+                      per call. Handy for agent multiplexers that spawn claude
+                      themselves instead of via 'teamclaude run'
   run [--no-mitm] [--auto-fallback] [-- args...]
                       Run Claude Code through the proxy (errors if it's down,
                       unless --auto-fallback launches claude directly instead).
                       Routes via an HTTPS forward proxy + local CA by default, so
                       even hardcoded api.anthropic.com endpoints are intercepted;
-                      --no-mitm uses base-URL routing only
+                      --no-mitm uses base-URL routing only. Set TC_ACCT to pin
+                      the session to one account (see Environment below)
   alias               Print a shell alias so plain 'claude' routes via the proxy
                       (--install to write it to your shell rc; --uninstall to remove)
+  service <sub>       Run the proxy as a user service that starts at login and
+                      restarts on its own: install | uninstall | status | print
+                      (LaunchAgent on macOS, systemd --user unit on Linux;
+                      'print' writes the unit to stdout without touching anything)
   status [--json]     Show rich proxy/account/probe status (live)
                       Use --color=always|never to control ANSI colors
+  attach              Open the live dashboard against a running server; s
+                      switches account, R reloads config, q leaves it running
+  dashboard           Open the web dashboard of a running server in the browser
   accounts            List configured accounts
+  switch [NAME]       Make the running server prefer one account (as 's' in the
+                      TUI does); with no NAME, list accounts and mark the current
   remove <name>       Remove an account (by name or email; --org to disambiguate)
   disable <name>      Temporarily exclude an account from rotation
   enable <name>       Re-enable a disabled account (also clears a stuck error)
   priority <name> <n> Set rotation priority (lower = preferred; --first/--last)
   route [list|add|rm] Per-model routing: pin model globs to specific accounts
                       (add <name> --match "<glob>" [--accounts "<name>"] [--bucket <b>])
+  threshold [pct]     Utilization at which rotation leaves an account (1-100);
+                      per bucket with 'unified7d=90', and '=default' drops one
+  distribute [on|off|adaptive]
+                      Spread new sessions across equal-priority accounts, each
+                      pinned to its own for cache reuse (off by default);
+                      'adaptive' spreads by remaining weekly credit and load
   probe [off|secs]    Opt-in background quota refresh for idle accounts
                       (off by default; reads usage endpoint, spends no quota)
   warmup [off|secs]   Opt-in: keep idle accounts' 5h timers running by sending
-                      a minimal claude request to each (off by default; spends
-                      a little quota, unlike probe)
+                      a minimal claude request to each (spends a little quota)
+  warmup reset HH:MM --timezone Area/City
+                      Schedule daily warm-up for a target reset in an IANA zone
+  warmup rolling HH:MM --timezone Area/City
+                      Anchor a continuous five-hour reset cadence in an IANA zone
   api <path>          Call an API endpoint with account credentials
   update              Check npm for a newer teamclaude and install it
   version             Print the installed version
@@ -1565,21 +2430,55 @@ Commands:
 Options:
   --name NAME         Set account name (import/login)
   --org NAME|UUID     Disambiguate when an email spans multiple orgs (remove/priority/api)
-  --from PATH         Credentials path (import, default: ~/.claude/.credentials.json)
+  --from PATH         Credentials path (import, default: ~/.claude/.credentials.json;
+                      on macOS the default falls back to the Keychain)
   --json JSON         Import from inline JSON (import), e.g.:
                       --json '{"accessToken":"...","refreshToken":"...","expiresAt":1234}'
-  --log-to DIR        Log full requests/responses to DIR (server, one file per request)
+  --log-to DIR        Log requests/responses to DIR (server, one file per request)
   --activity-log FILE Append TUI activity lines to FILE (server; works in headless mode too)
   --headless          Run the server without the interactive TUI (for backgrounding)
   --no-mitm           (run) skip the forward proxy; route via ANTHROPIC_BASE_URL only
   --auto-fallback     (run) if the proxy is down, launch claude directly instead
                       of erroring out (bypasses the proxy: no rotation)
 
+Environment:
+  TC_ACCT             Pin a session to ONE account, bypassing rotation. Works in
+                      both modes. Accepts accountUuid, orgUuid,
+                      accountUuid/orgUuid, or a display name/email:
+                        TC_ACCT=me@example.com teamclaude run
+                      Prefer a UUID for anything scripted: display names are
+                      rewritten when an email gains a second org. Read by 'run'
+                      and 'env', then removed from the environment so it never
+                      reaches claude or the tools it spawns. An unknown account
+                      is refused rather than silently rotated.
+  TEAMCLAUDE_CONFIG   Path to the config file (default below)
+  TEAMCLAUDE_DISABLE_AUTOUPDATE=1
+                      Skip the background self-update check
+
 The server always accepts both base-URL and proxy/CONNECT clients, so instances
 launched with and without --no-mitm can share one server.
 
 A running server re-syncs accounts from config on POST /teamclaude/reload
 (local only). add/login/enable/disable/priority trigger it automatically.
+POST /teamclaude/switch {"account": "<name>"} makes one account the preferred
+one, which is what 'teamclaude switch' calls.
+
+Upstream proxy. On a host with no direct route to the internet, set
+"upstreamProxy": "http://user:pass@host:3128" (or just "host:3128") and every
+outbound connection — request forwarding, OAuth login, token refresh, profile
+and usage — is CONNECT-tunneled through it, TLS end to end. HTTPS_PROXY /
+ALL_PROXY are honored when the config says nothing, NO_PROXY exempts hosts, and
+"upstreamProxy": false ignores the environment entirely. Settable live in the
+TUI settings screen. Distinct from "proxy" (the local port Claude Code talks to)
+and from sx.org (a specific residential-egress provider with its own policy).
+
+Egress pin (opt-in, off unless configured). Set "egress": { "pin": "auto" } to
+hold requests whenever the exit IP is not the pinned one — a VPN that dropped
+mid-session otherwise sends the request from an unexpected region, and upstream
+answers 403, which Claude Code reports as a dead session and demands a re-login.
+"auto" pins whatever address the server sees first; an explicit IP (or a list of
+them) pins those. Held requests wait up to holdSeconds (default 120), then get a
+503. See config.example.json.
 
 A global npm install self-updates in the background (checked once/day, applied
 on the next launch). Disable with TEAMCLAUDE_DISABLE_AUTOUPDATE=1 or
@@ -1593,73 +2492,83 @@ Crash log: ${getCrashLogPath()} (server only; written when the process dies unex
 // ── shared account upsert ────────────────────────────────────
 
 /** Short human label for an account's organization, for disambiguating names. */
+/** @param {{orgName?: string | null, orgUuid?: string | null}} a */
 function orgLabel(a) {
   return a.orgName || (a.orgUuid ? a.orgUuid.slice(0, 8) : 'org');
 }
 
-async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
+async function upsertOAuthAccount(name, creds, source = 'unknown') {
   // Fetch profile to auto-name and deduplicate by account+org identity.
   const userNamed = !!name;
-  const profile = await fetchProfile(creds.accessToken);
-  const profileOk = profile && !profile.error;
+  const profileResult = await fetchProfile(creds.accessToken);
+  const profileError = 'error' in profileResult ? profileResult.error : null;
+  const profile = 'error' in profileResult ? null : profileResult;
+  const profileOk = profile !== null;
+
+  if (!canUpsertOAuthAccount(profile, userNamed)) {
+    console.error(`Could not identify OAuth account — ${profileError || 'profile unavailable'}`);
+    console.error('Retry with valid credentials, or pass --name to add the account without profile detection.');
+    process.exit(1);
+  }
 
   if (!profileOk) {
-    console.error(`Warning: could not fetch account profile — ${profile?.error || 'no token'}`);
+    console.error(`Warning: importing named account without profile detection — ${profileError || 'profile unavailable'}`);
   }
   if (!name && profile?.email) {
     name = profile.email;
     const tier = profile.hasClaudeMax ? 'Max' : profile.hasClaudePro ? 'Pro' : null;
     if (tier) console.log(`Detected Claude ${tier} account: ${profile.email}`);
   }
-  if (!name) {
-    // First FREE account-N (not `count + 1`, which collides after a delete) so the
-    // generated name stays a unique identity key.
-    let n = 1;
-    do { name = `account-${n++}`; } while (config.accounts.some(a => a.name === name));
-  }
-
-  const account = {
-    name,
-    type: 'oauth',
-    source,
-    accountUuid: profile?.accountUuid || null,
-    orgUuid: profile?.orgUuid || null,
-    orgName: profile?.orgName || null,
-    accessToken: creds.accessToken,
-    refreshToken: creds.refreshToken,
-    expiresAt: creds.expiresAt,
-  };
-
-  // Deduplicate by account+org identity (same email in a different org is a
-  // distinct account), then by name.
-  let idx = config.accounts.findIndex(a => sameIdentity(a, account));
-  if (idx < 0) idx = config.accounts.findIndex(a => a.name === name);
-
-  if (idx >= 0) {
-    // Credentials refresh must retain user routing/settings and preserve the
-    // existing display name used by CLI and route references.
-    const prev = config.accounts[idx];
-    config.accounts[idx] = { ...prev, ...account, name: prev.name };
-    console.log(`Updated account "${prev.name}"`);
-  } else {
-    // New org for this person: if another entry shares the accountUuid, the bare
-    // email name would collide — disambiguate both with " (org)".
-    if (!userNamed && account.accountUuid) {
-      const collisions = config.accounts.filter(
-        a => a.accountUuid === account.accountUuid && !sameIdentity(a, account)
-      );
-      if (collisions.length > 0) {
-        for (const c of collisions) {
-          if (!c.name.includes(' (')) c.name = `${c.name} (${orgLabel(c)})`;
-        }
-        account.name = `${name} (${orgLabel(account)})`;
-      }
+  const config = await atomicConfigUpdate(config => {
+    if (!name) {
+      let n = 1;
+      do { name = `account-${n++}`; } while (config.accounts.some(a => a.name === name));
     }
-    config.accounts.push(account);
-    console.log(`Added account "${account.name}"`);
-  }
 
-  await saveConfig(config);
+    const account = {
+      name,
+      type: 'oauth',
+      source,
+      ...oauthIdentityFields(profile),
+      organizationType: profile?.organizationType || null,
+      rateLimitTier: profile?.rateLimitTier || creds.rateLimitTier || null,
+      seatTier: profile?.seatTier || null,
+      hasClaudeMax: profile?.hasClaudeMax ?? null,
+      hasClaudePro: profile?.hasClaudePro ?? null,
+      accessToken: creds.accessToken,
+      refreshToken: creds.refreshToken,
+      expiresAt: creds.expiresAt,
+    };
+
+    // Deduplicate by account+org identity (same email in a different org is a
+    // distinct account), then by name — but only where the name is not standing in
+    // for a different account+org, which is exactly the multi-org case below.
+    const idx = findUpsertTarget(config.accounts, account);
+
+    if (idx >= 0) {
+      // Same account+org: refresh credentials and org info, but keep the existing
+      // display name, entry id, and any disk-only fields (e.g. importFrom).
+      const prev = config.accounts[idx];
+      config.accounts[idx] = updateAccountEntry(prev, account);
+      console.log(`Updated account "${prev.name}"`);
+    } else {
+      // New org for this person: if another entry shares the accountUuid, the bare
+      // email name would collide — disambiguate both with " (org)".
+      if (!userNamed && account.accountUuid) {
+        const collisions = config.accounts.filter(
+          a => a.accountUuid === account.accountUuid && !sameIdentity(a, account)
+        );
+        if (collisions.length > 0) {
+          for (const c of collisions) {
+            if (!c.name.includes(' (')) c.name = `${c.name} (${orgLabel(c)})`;
+          }
+          account.name = `${name} (${orgLabel(account)})`;
+        }
+      }
+      config.accounts.push(account);
+      console.log(`Added account "${account.name}"`);
+    }
+  });
   console.log(`Saved to ${getConfigPath()}`);
   await notifyRunningServer(config);
 }
@@ -1672,6 +2581,13 @@ async function clearRekeyPhase() {
 }
 let runtimeRekeyChain = Promise.resolve();
 
+/**
+ * @typedef {import('./sync-accounts.js').RekeyOptions & {
+ * clients?: import('./config.js').CanonicalState['clients'],
+ * usageDimensions?: import('./config.js').CanonicalState['usageDimensions']
+ * }} RuntimeRekeyOptions
+ */
+/** @param {RuntimeRekeyOptions} args */
 function durableRuntimeRekey(args) {
   const result = runtimeRekeyChain.then(
     () => durableRuntimeRekeyNow(args),
@@ -1681,10 +2597,15 @@ function durableRuntimeRekey(args) {
   return result;
 }
 
-async function durableRuntimeRekeyNow({ accountManager, previous, target, authoritativeConfig, migration, template }) {
+/** @param {RuntimeRekeyOptions} options */
+async function durableRuntimeRekeyNow({ accountManager, previous, target, authoritativeConfig, migration, template, clients, usageDimensions }) {
+  const previousCredential = previous.credential;
+  const previousRefreshToken = previous.refreshToken;
   const before = createCanonicalState({
     ...accountManager.exportCanonicalState(template),
     migration,
+    clients,
+    usageDimensions,
   });
   const fromKey = previous.accountIdKey;
   const toKey = accountIdKey(target);
@@ -1698,7 +2619,28 @@ async function durableRuntimeRekeyNow({ accountManager, previous, target, author
   });
 
   await saveRekeyRecord(record);
-  await saveConfig(authoritativeConfig);
+  await atomicConfigUpdate(disk => {
+    const authoritative = authoritativeConfig.accounts.find(entry => entry.id === target.id);
+    const current = disk.accounts.find(entry => entry.id === target.id);
+    if (!authoritative || !current || !sameIdentity(current, authoritative) ||
+        current.name !== authoritative.name ||
+        current.accessToken !== authoritative.accessToken ||
+        current.refreshToken !== authoritative.refreshToken ||
+        current.apiKey !== authoritative.apiKey ||
+        !accountManager.accounts.includes(previous) ||
+        previous.credential !== previousCredential || previous.refreshToken !== previousRefreshToken) {
+      throw new Error('canonical rekey authority changed');
+    }
+    // Importers may discover a provider account ID absent from the config.
+    // Commit only that entry's identity and resolved credentials, retaining
+    // unrelated routing edits from the fresh locked read.
+    for (const field of ['name', 'type', 'provider', 'accountId', 'accountUuid', 'orgUuid', 'orgName',
+      'accessToken', 'refreshToken', 'expiresAt', 'apiKey']) {
+      if (Object.hasOwn(target, field)) current[field] = target[field];
+      else delete current[field];
+    }
+    target = { ...current };
+  });
   await saveRekeyRecord({ ...record, phase: 'config-committed' });
   await saveCanonicalState(after);
   await saveRekeyRecord({ ...record, phase: 'state-committed' });
@@ -1709,130 +2651,76 @@ async function durableRuntimeRekeyNow({ accountManager, previous, target, author
 }
 
 /**
- * Find a config account entry matching an in-memory account by account+org identity.
+ * Find the config entry a running account came from, by entry id only; -1 when
+ * no row carries its id.
+ *
+ * There is deliberately no identity fallback (mirroring syncRefreshedTokens).
+ * sameIdentity is not one-to-one: it compares organization only when BOTH
+ * records carry one and falls back to the name otherwise, so for one person
+ * holding accounts in two organizations — the case the identity module exists
+ * for — both rows match and the first one wins. Resolving a token write that way
+ * records one account's refresh-token family against another account's row
+ * (#203), and on a fleet holding other people's accounts that is a credential
+ * crossing. A -1 means the write is skipped: an account the file no longer
+ * describes has no row of its own, and any row picked for it would be another
+ * account's.
+ *
+ * The id is exact and survives the refresh that rewrites the credential. A file
+ * written before the field existed gets its ids persisted at startup
+ * (persistMintedAccountIds), so the in-memory ids are the on-disk ids.
  */
+/** @param {{ accounts: { id?: string | null }[] }} diskConfig @param {{ id?: string | null } | null} account */
 function findConfigAccount(diskConfig, account) {
-  return diskConfig.accounts.findIndex(a => sameIdentity(a, account));
+  if (!account?.id) return -1;
+  return diskConfig.accounts.findIndex(a => a?.id === account.id);
 }
 
 /**
- * Sync accounts from disk config: add new accounts and refresh credentials
- * for existing ones (handles re-imported OAuth tokens, rotated API keys, etc.).
- * Returns the number of new accounts added.
+ * Persist the entry ids loadConfig just minted, if the file did not carry them.
+ *
+ * Every later token write pairs its row by id and re-reads the file to do it. A
+ * config written before the field existed has ids in memory only, and the
+ * re-read would mint a second, different set — nothing would pair until the
+ * next start, and refreshed tokens would never reach disk. One save up front
+ * makes the in-memory ids the on-disk ids. A file that already carries a
+ * complete, unique set is left alone.
  */
-async function syncAccountsFromDisk(diskConfig, memConfig, accountManager, { migration, template } = {}) {
-  let added = 0;
-  // Greedy 1:1 pairing of disk entries to in-memory accounts, account+org aware.
-  // Each disk entry claims at most one unclaimed manager account, so multiple
-  // same-person/different-org entries pair correctly instead of all matching the
-  // first one with that accountUuid.
-  const claimed = new Set();
-  const claim = (diskAcct) => {
-    const available = accountManager.accounts
-      .map((account, index) => ({ account, index }))
-      .filter(({ index }) => !claimed.has(index));
-    const exact = available.find(({ account }) => sameIdentity(account, diskAcct));
-    if (exact) {
-      claimed.add(exact.index);
-      return exact.index;
-    }
-    // An org/profile backfill changes the canonical key. Only pair it through a
-    // unique stable hint; guessing among same-person org entries would corrupt
-    // quota ownership.
-    const byUuid = diskAcct.accountUuid
-      ? available.filter(({ account }) => account.accountUuid === diskAcct.accountUuid) : [];
-    const byName = available.filter(({ account }) => account.name === diskAcct.name);
-    const candidate = byUuid.length === 1 ? byUuid[0] : byUuid.length === 0 && byName.length === 1 ? byName[0] : null;
-    if (!candidate) return -1;
-    claimed.add(candidate.index);
-    return candidate.index;
-  };
-
-  for (const diskAcct of diskConfig.accounts) {
-    const mgrIdx = claim(diskAcct);
-
-    if (mgrIdx < 0) {
-      // New account discovered on disk — add to running server
-      memConfig.accounts.push(diskAcct);
-      accountManager.addAccount(diskAcct);
-      claimed.add(accountManager.accounts.length - 1);
-      added++;
-      console.log(`[TeamClaude] Picked up new account "${diskAcct.name}" from config`);
-      continue;
-    }
-
-    let mgr = accountManager.accounts[mgrIdx];
-    if (mgr.accountIdKey !== accountIdKey(diskAcct)) {
-      mgr = await durableRuntimeRekey({
-        accountManager,
-        previous: mgr,
-        target: diskAcct,
-        authoritativeConfig: diskConfig,
-        migration,
-        template,
-      });
-      const memIdx = memConfig.accounts.findIndex(a => a.name === mgr.name || sameIdentity(a, mgr));
-      if (memIdx >= 0) memConfig.accounts[memIdx] = { ...diskAcct };
-    }
-    if (diskAcct.name && mgr.name !== diskAcct.name) mgr.name = diskAcct.name;
-    const priority = Number.isFinite(diskAcct.priority) ? Math.floor(diskAcct.priority) : null;
-    if (mgr.priority !== priority) accountManager.setPriority?.(mgr, priority);
-    const enabled = diskAcct.enabled !== false && !diskAcct.disabled;
-    if (mgr.enabled !== enabled) accountManager.setEnabled?.(mgr, enabled);
-    const memAcct = memConfig.accounts.find(a => sameIdentity(a, diskAcct));
-    if (memAcct) {
-      if (enabled) delete memAcct.enabled; else memAcct.enabled = false;
-      if (priority === null) delete memAcct.priority; else memAcct.priority = priority;
-    }
-
-    // Existing account — resolve fresh credentials from disk
-    let freshCred = null;
-    if (diskAcct.type === 'oauth' && diskAcct.importFrom) {
-      try {
-        const creds = await importCredentials(diskAcct.importFrom);
-        freshCred = { accessToken: creds.accessToken, refreshToken: creds.refreshToken, expiresAt: creds.expiresAt };
-      } catch (err) {
-        console.error(`[TeamClaude] Re-import failed for "${diskAcct.name}": ${err.message}`);
-      }
-    } else if (diskAcct.type === 'oauth' && diskAcct.accessToken) {
-      freshCred = { accessToken: diskAcct.accessToken, refreshToken: diskAcct.refreshToken, expiresAt: diskAcct.expiresAt };
-    } else if (diskAcct.type === 'apikey' && diskAcct.apiKey) {
-      freshCred = { apiKey: diskAcct.apiKey };
-    }
-
-    if (!freshCred || !mgr) continue;
-
-    if (freshCred.accessToken) {
-      const changed = mgr.credential !== freshCred.accessToken ||
-        mgr.refreshToken !== freshCred.refreshToken;
-      // Don't overwrite in-memory credentials with staler ones from disk
-      // (e.g. after a TUI import updated the AM before saveConfig wrote to disk)
-      const diskIsStaler = freshCred.expiresAt && mgr.expiresAt &&
-        freshCred.expiresAt < mgr.expiresAt;
-      if (changed && !diskIsStaler) {
-        accountManager.updateAccountTokens(mgr.index, freshCred);
-        console.log(`[TeamClaude] Refreshed credentials for "${mgr.name}"`);
-      }
-    } else if (freshCred.apiKey && mgr.credential !== freshCred.apiKey) {
-      mgr.credential = freshCred.apiKey;
-      if (mgr.status === 'error') { mgr.status = 'active'; delete mgr._errorFromRefresh; }
-      console.log(`[TeamClaude] Updated API key for "${mgr.name}"`);
-    }
+async function persistMintedAccountIds(config) {
+  let raw;
+  try {
+    raw = JSON.parse(await readFile(getConfigPath(), 'utf-8'));
+  } catch {
+    return; // nothing on disk to reconcile with (or unreadable — the next save will tell)
   }
-  return added;
+  const ids = (Array.isArray(raw?.accounts) ? raw.accounts : []).map(a => a?.id);
+  const complete = ids.every(id => typeof id === 'string' && id !== '') && new Set(ids).size === ids.length;
+  if (!complete) {
+    const persisted = await atomicConfigUpdate(() => {});
+    Object.assign(config, persisted);
+  }
 }
 
 // ── helpers ─────────────────────────────────────────────────
 
+// Is `url` a /tc-acct/<name> account pin aimed at OUR proxy? Parsed rather than
+// prefix-matched so every local spelling counts (localhost, 127.0.0.1, [::1]),
+// while a pin URL for a different host/port is not ours to honour.
+/** @param {string | null | undefined} url @param {number | string} port */
+function isLocalAccountPin(url, port) {
+  if (!url) return false;
+  let u;
+  try { u = new URL(url); } catch { return false; }
+  const host = u.hostname.replace(/^\[|\]$/g, '');
+  const isLocal = host === 'localhost' || host === '127.0.0.1' || host === '::1';
+  // An omitted port means the scheme default, which still matches a proxy that
+  // happens to run on 80/443.
+  const urlPort = u.port || (u.protocol === 'https:' ? '443' : '80');
+  return isLocal && urlPort === String(port) && u.pathname.startsWith('/tc-acct/');
+}
+/** @param {string} flag */
 function argValue(flag) {
   const i = args.indexOf(flag);
   return (i >= 0 && args[i + 1]) ? args[i + 1] : null;
-}
-
-// Hostname of the configured upstream (the host MITM-intercepts under `run`).
-function upstreamHost(config) {
-  try { return new URL(config.upstream || 'https://api.anthropic.com').hostname; }
-  catch { return 'api.anthropic.com'; }
 }
 
 // Keep the terminal title in sync with the active account (e.g. "teamclaude 2/4
@@ -1841,10 +2729,12 @@ function upstreamHost(config) {
 // opt out entirely with TEAMCLAUDE_NO_TITLE. Polls (rather than hooking every
 // currentIndex mutation) and writes only when the title actually changes.
 // Returns an idempotent stop() that restores the shell's previous title.
+/** @param {AccountManager} accountManager */
 function startTerminalTitleUpdater(accountManager) {
   const out = process.stdout;
   if (!out.isTTY || process.env.TEAMCLAUDE_NO_TITLE) return () => {};
 
+  /** @type {string | null} */
   let last = null;
   const render = () => {
     const total = accountManager.accounts.length;
@@ -1874,7 +2764,8 @@ function startTerminalTitleUpdater(accountManager) {
 // CLI changes take effect without a restart. A closed local port refuses the
 // connection immediately, so this is a no-op (and near-instant) when nothing is
 // running. Reload picks up new accounts, credential, priority, and enable/disable
-// changes; account removals still need a restart.
+// changes, plus eventLogging and blockedModels edits; account removals still
+// need a restart.
 async function notifyRunningServer(config) {
   const port = config?.proxy?.port;
   if (!port) return;

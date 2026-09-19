@@ -13,37 +13,37 @@ function exhaust(account, utilization) {
   account.quota.unified7dReset = Date.now() + 3600_000;
 }
 
-test('when every account is over threshold, a finite priority beats a less-utilized unranked probe target', () => {
+test('finite priority cannot authorize spending over exhausted quota', () => {
   const accounts = [oauth('ranked', { priority: 100 }), oauth('unranked')];
   const am = new AccountManager(accounts, 0.98);
   exhaust(am.accounts[0], 0.99);
   exhaust(am.accounts[1], 0.985);
 
-  assert.equal(am.getActiveAccount().name, 'ranked');
+  assert.equal(am.getActiveAccount(), null);
 });
-test('when every account is over threshold, getActiveAccount probes instead of refusing', () => {
+test('when every account is over threshold, ordinary routing refuses without a spending probe', () => {
   const am = new AccountManager([oauth('a'), oauth('b')], 0.98);
   exhaust(am.accounts[0], 0.99);
   exhaust(am.accounts[1], 0.985);
 
   const picked = am.getActiveAccount();
-  assert.ok(picked, 'expected a probe account, not null');
-  // Least-utilized is the better probe target (most likely to still have headroom).
-  assert.equal(picked.name, 'b');
+  assert.equal(picked, null);
+  assert.equal(am.getActiveAccount(null, 'claude-sonnet-5'), null);
+  assert.equal(am._nextProbeAt, 0, 'ordinary routing never consumes a probe slot');
 });
 
-test('probing is throttled to one account per probe interval', () => {
+test('elapsed probe interval does not authorize ordinary spending', () => {
   const am = new AccountManager([oauth('a'), oauth('b')], 0.98);
   exhaust(am.accounts[0], 0.99);
   exhaust(am.accounts[1], 0.99);
 
-  assert.ok(am.getActiveAccount(), 'first call probes');
+  assert.equal(am.getActiveAccount(), null);
   // A second request inside the interval must refuse (synthetic 429), not probe again.
   assert.equal(am.getActiveAccount(), null);
 
-  // Once the interval elapses, a probe is allowed again.
+  // The metadata prober's interval is not a request admission bypass.
   am._nextProbeAt = Date.now() - 1;
-  assert.ok(am.getActiveAccount(), 'probe allowed after the interval');
+  assert.equal(am.getActiveAccount(), null);
 });
 
 test('a hard upstream rate-limit is respected — no probe, synthetic 429 stands', () => {
@@ -51,6 +51,14 @@ test('a hard upstream rate-limit is respected — no probe, synthetic 429 stands
   am.markRateLimited(0, 300);
   am.markRateLimited(1, 300);
   assert.equal(am.getActiveAccount(), null);
+});
+
+test('an expired unrelated reset cannot bypass a live exhausted weekly window', () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  exhaust(am.accounts[0], 0.99);
+  am.accounts[0].quota.unified5hReset = Date.now() - 1;
+  assert.equal(am.getActiveAccount(null, 'claude-sonnet-5'), null);
+  assert.equal(am.accounts[0].quota.unified7d, 0.99);
 });
 
 test('disabled accounts are never used as a probe target', () => {
@@ -67,7 +75,7 @@ test('a probe refreshing healthy quota restores normal (non-throttled) selection
   exhaust(am.accounts[0], 0.99);
 
   const probe = am.getActiveAccount();
-  assert.ok(probe, 'probe issued');
+  assert.equal(probe, null, 'ordinary traffic waits for fresh evidence');
   // Simulate the upstream response showing real headroom.
   am.updateQuota(0, { 'anthropic-ratelimit-unified-7d-utilization': '0.10' });
 

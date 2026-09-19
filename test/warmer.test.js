@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
 import { MaintenanceCoordinator } from '../src/maintenance-coordinator.js';
 import { Prober } from '../src/prober.js';
+import { resolveAccountPin } from '../src/server.js';
 import { Warmer } from '../src/warmer.js';
 import { accountIdKey } from '../src/identity.js';
 
@@ -55,6 +56,38 @@ test('an expired 5h window is a warm target again (keeps the timer going)', asyn
   assert.equal(spawn.calls.length, 1);
 });
 
+test('keep-warm never sends Codex or foreign provider credentials to Claude', async () => {
+  const am = new AccountManager([
+    oauth('claude'),
+    oauth('codex', { provider: 'codex', accountId: 'codex-account' }),
+    oauth('foreign', { upstream: 'https://api.example.invalid/anthropic' }),
+  ], 0.98);
+  const spawn = fakeSpawner();
+  const warmer = makeWarmer(am, spawn);
+  await warmer.warmAll();
+  assert.equal(spawn.calls.length, 1);
+  assert.deepEqual(warmer.getStatus().accounts.map(account => account.status), ['ok', 'not-applicable', 'not-applicable']);
+});
+
+test('spending keep-warm cannot bypass a full admission slot', async () => {
+  const am = new AccountManager([oauth('a')], 0.98, { maxConcurrent: 1 });
+  const held = await am.acquireAccount();
+  assert.strictEqual(held, am.accounts[0]);
+  const spawn = fakeSpawner();
+  const warmer = makeWarmer(am, spawn);
+  try {
+    await warmer.warmAll();
+    assert.equal(spawn.calls.length, 0);
+    assert.equal(am.accounts[0].inflight, 1);
+  } finally {
+    am.releaseAccount(held);
+  }
+  await warmer.warmAll();
+  assert.equal(spawn.calls.length, 1);
+  assert.equal(am.accounts[0].inflight, 0);
+  warmer.stop();
+});
+
 test('errored and exhausted accounts are skipped', async () => {
   const am = new AccountManager([oauth('err'), oauth('spent')], 0.98);
   am.accounts[0].status = 'error';
@@ -76,6 +109,22 @@ test('the spawn invocation is a minimal non-interactive claude pinned to the acc
   assert.deepEqual(spec.args, ['-p', '--bare', '--model', 'haiku', '--output-format', 'text', 'hi']);
   assert.equal(spec.env.ANTHROPIC_BASE_URL, `http://127.0.0.1:9999/tc-acct/${encodeURIComponent(accountIdKey(am.accounts[0]))}`);
   assert.equal(spec.env.ANTHROPIC_API_KEY, 'tc-secret');
+});
+
+test('warm-up pins distinguish one user across multiple organizations', async () => {
+  const am = new AccountManager([
+    oauth('person@example.com (Personal)', { accountUuid: 'account-1', orgUuid: 'org-personal' }),
+    oauth('person@example.com (Work)', { accountUuid: 'account-1', orgUuid: 'org-work' }),
+  ], 0.98);
+  const spawn = fakeSpawner();
+
+  await makeWarmer(am, spawn).warmAll();
+
+  const resolved = spawn.calls.map(({ env }) => {
+    const encodedPin = new URL(env.ANTHROPIC_BASE_URL).pathname.split('/').at(-1);
+    return resolveAccountPin(am, decodeURIComponent(encodedPin));
+  });
+  assert.deepEqual(resolved, am.accounts);
 });
 
 // ── status ───────────────────────────────────────────────────────────────────
@@ -137,6 +186,31 @@ test('unscheduling an immediate schedule prevents its queued callback from runni
   coordinator.shutdown();
 });
 
+test('coordinator shutdown clears one-shot schedule timers and rejects stale callbacks', async () => {
+  const coordinator = new MaintenanceCoordinator(new AccountManager([], 0.98), { log: () => {} });
+  const timers = [];
+  const cleared = [];
+  let calls = 0;
+  const timerOptions = {
+    setTimeoutFn: (fn, delay) => {
+      const timer = { fn, delay, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeoutFn: timer => cleared.push(timer),
+  };
+  coordinator.scheduleOnce('calendar', 1000, () => { calls++; }, timerOptions);
+  coordinator.scheduleOnce('rolling', 2000, () => { calls++; }, timerOptions);
+  coordinator.shutdown();
+  assert.deepEqual(cleared, timers);
+  assert.equal(coordinator.timers.size, 0);
+  assert.equal(coordinator.timerClearers.size, 0);
+  for (const timer of timers) await timer.fn();
+  assert.equal(calls, 0);
+  assert.equal(coordinator.scheduleOnce('closed', 1, () => { calls++; }, timerOptions), null);
+  assert.equal(timers.length, 2);
+});
+
 test('a slow scheduled callback is coalesced into at most one follow-up', async () => {
   const coordinator = new MaintenanceCoordinator(new AccountManager([], 0.98), { log: () => {} });
   let starts = 0;
@@ -178,12 +252,12 @@ test('a slow scheduled callback is coalesced into at most one follow-up', async 
 test('overlapping warm cycles are skipped while one is running', async () => {
   const am = new AccountManager([oauth('a')], 0.98);
   const warmer = makeWarmer(am, fakeSpawner());
-  warmer._runPromise = Promise.resolve();     // pretend a cycle is in flight
+  warmer._running = true;              // pretend a cycle is in flight
   await warmer.warmAll();              // must be a no-op
   assert.equal(warmer.lastRunStartedAt, null);
 });
 
-test('stop() aborts an in-flight sweep (kills the warm child, skips the rest)', async () => {
+test('coordinator shutdown aborts an in-flight sweep (kills the warm child, skips the rest)', async () => {
   const am = new AccountManager([oauth('a'), oauth('b')], 0.98);
   let aborts = 0;
   let started = 0;
@@ -196,7 +270,7 @@ test('stop() aborts an in-flight sweep (kills the warm child, skips the rest)', 
 
   const sweep = warmer.warmAll();          // don't await — it's mid-flight
   await new Promise(r => setTimeout(r, 10));
-  warmer.coordinator.shutdown();              // process shutdown aborts the hanging child
+  warmer.coordinator.shutdown();
   await sweep;
 
   assert.equal(aborts, 1, 'the in-flight child was aborted');
@@ -204,16 +278,40 @@ test('stop() aborts an in-flight sweep (kills the warm child, skips the rest)', 
   assert.equal(warmer.getStatus().accounts[0].status, 'cancelled');
 });
 
+test('stop() aborts a sweep without shutting down the shared coordinator', async () => {
+  const am = new AccountManager([oauth('a'), oauth('b')], 0.98);
+  const coordinator = new MaintenanceCoordinator(am, { log: () => {} });
+  let markStarted;
+  const started = new Promise(resolve => { markStarted = resolve; });
+  let calls = 0;
+  const warmer = makeWarmer(am, spec => new Promise((_resolve, reject) => {
+    calls++;
+    spec.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+    markStarted();
+  }), { coordinator });
+  const sweep = warmer.warmAll();
+  await started;
+  warmer.stop();
+  await sweep;
+  assert.equal(calls, 1, 'stop suppresses the remaining account');
+  assert.equal(warmer.getStatus().accounts[0].status, 'cancelled');
+  assert.equal(am.accounts[0].inflight, 0);
+  assert.equal(coordinator.closed, false);
+  coordinator.shutdown();
+});
+
 test('reschedule to a new interval does NOT trigger an extra (quota-spending) sweep', async () => {
   const am = new AccountManager([oauth('a')], 0.98);
   const spawn = fakeSpawner();
   const warmer = makeWarmer(am, spawn, { intervalMs: 600_000 });
-  warmer.start();                          // off→on: one immediate sweep
+  warmer.start();                          // configured interval must not spend at startup
   await new Promise(r => setTimeout(r, 5));
   const afterStart = spawn.calls.length;
+  assert.equal(afterStart, 0, 'startup does not spend quota');
   warmer.reschedule(300_000);              // interval CHANGE, already on
   await new Promise(r => setTimeout(r, 5));
   assert.equal(spawn.calls.length, afterStart, 'no extra sweep on an interval change');
+  warmer.stop();
 });
 test('a warm-up timeout is recorded separately from an account error', async () => {
   const am = new AccountManager([oauth('a')], 0.98);
@@ -323,4 +421,646 @@ test('standalone adapters must opt into ownership and stop shuts down only their
   new Warmer(am, { port: 3456, coordinator: shared, log: () => {} }).stop();
   assert.equal(shared.closed, false);
   shared.shutdown();
+});
+
+test('reset schedule waits for the next wall-clock warm-up without running immediately', async () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  const spawn = fakeSpawner();
+  let now = Date.parse('2026-09-01T06:00:00.000Z');
+  const timers = [];
+  const warmer = makeWarmer(am, spawn, {
+    schedule: { resetTime: '15:30', timezone: 'Europe/Moscow' },
+    nowFn: () => now,
+    setTimeoutFn: (fn, delay) => {
+      const timer = { fn, delay, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeoutFn: () => {},
+  });
+
+  warmer.start();
+
+  assert.equal(spawn.calls.length, 0, 'a scheduled warm-up must not run at startup');
+  assert.equal(timers[0].delay, 90 * 60 * 1000);
+  assert.equal(warmer.getStatus().nextWarmupAt, '2026-09-01T07:30:00.000Z');
+
+  now = Date.parse('2026-09-01T07:30:00.001Z');
+  await timers[0].fn();
+
+  assert.equal(spawn.calls.length, 1);
+  assert.equal(timers[1].delay, 24 * 60 * 60 * 1000 - 1);
+  assert.equal(warmer.getStatus().nextWarmupAt, '2026-09-02T07:30:00.000Z');
+});
+
+test('a reset timer that fires after its cron minute skips the missed warm-up', async () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  const spawn = fakeSpawner();
+  let now = Date.parse('2026-09-01T06:00:00.000Z');
+  const timers = [];
+  const warmer = makeWarmer(am, spawn, {
+    schedule: { resetTime: '15:30', timezone: 'Europe/Moscow' },
+    nowFn: () => now,
+    setTimeoutFn: (fn, delay) => {
+      const timer = { fn, delay, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeoutFn: () => {},
+  });
+  warmer.start();
+
+  now = Date.parse('2026-09-01T07:31:00.000Z');
+  await timers[0].fn();
+
+  assert.equal(spawn.calls.length, 0);
+  assert.equal(timers.length, 2);
+  assert.equal(warmer.getStatus().nextWarmupAt, '2026-09-02T07:30:00.000Z');
+});
+
+test('a rolling schedule rearms exactly five hours after each warm-up', async () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  const spawn = fakeSpawner();
+  let now = Date.parse('2026-09-01T06:00:00.000Z');
+  const timers = [];
+  const warmer = makeWarmer(am, spawn, {
+    schedule: {
+      mode: 'rolling',
+      resetTime: '15:30',
+      timezone: 'Europe/Moscow',
+      anchorResetAt: '2026-09-01T12:30:00.000Z',
+    },
+    nowFn: () => now,
+    setTimeoutFn: (fn, delay) => {
+      const timer = { fn, delay, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeoutFn: () => {},
+  });
+
+  warmer.start();
+  assert.equal(warmer.getStatus().nextWarmupAt, '2026-09-01T07:30:00.000Z');
+
+  now = Date.parse('2026-09-01T07:30:00.001Z');
+  await timers[0].fn();
+
+  assert.equal(spawn.calls.length, 1);
+  assert.equal(timers[1].delay, 5 * 60 * 60 * 1000 - 1);
+  assert.equal(warmer.getStatus().nextWarmupAt, '2026-09-01T12:30:00.000Z');
+  assert.equal(warmer.getStatus().nextTargetResetAt, '2026-09-01T17:30:00.000Z');
+});
+
+test('a rolling slot defers an account until just after its near-future reset', async () => {
+  const am = new AccountManager([oauth('near'), oauth('idle')], 0.98);
+  let now = Date.parse('2030-09-01T07:29:00.000Z');
+  am.accounts[0].quota.unified5hReset = Date.parse('2030-09-01T07:31:00.001Z');
+  const spawn = fakeSpawner();
+  const timers = [];
+  const warmer = makeWarmer(am, spawn, {
+    schedule: {
+      mode: 'rolling',
+      resetTime: '15:30',
+      timezone: 'Europe/Moscow',
+      anchorResetAt: '2030-09-01T12:30:00.000Z',
+    },
+    nowFn: () => now,
+    setTimeoutFn: (fn, delay) => {
+      const timer = { fn, delay, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeoutFn: () => {},
+  });
+  warmer.start();
+
+  now = Date.parse('2030-09-01T07:30:00.001Z');
+  await timers[0].fn();
+
+  assert.equal(spawn.calls.length, 1, 'the idle account warms at the rolling slot');
+  assert.equal(spawn.calls[0].env.ANTHROPIC_BASE_URL, `http://127.0.0.1:3456/tc-acct/${encodeURIComponent(accountIdKey(am.accounts[1]))}`);
+  const deferred = timers.find(timer => timer.delay === 70_000);
+  assert.ok(deferred, 'the near-reset account is deferred until reset + 10s');
+
+  now = Date.parse('2030-09-01T07:31:10.001Z');
+  await deferred.fn();
+
+  assert.equal(spawn.calls.length, 2);
+  assert.equal(spawn.calls[1].env.ANTHROPIC_BASE_URL, `http://127.0.0.1:3456/tc-acct/${encodeURIComponent(accountIdKey(am.accounts[0]))}`);
+  assert.equal(warmer.getStatus().nextWarmupAt, '2030-09-01T12:30:00.000Z');
+});
+
+test('a rolling slot does not defer an account beyond the two-minute tolerance', async () => {
+  const am = new AccountManager([oauth('outside')], 0.98);
+  let now = Date.parse('2030-09-01T07:29:00.000Z');
+  am.accounts[0].quota.unified5hReset = Date.parse('2030-09-01T07:32:00.002Z');
+  const spawn = fakeSpawner();
+  const timers = [];
+  const warmer = makeWarmer(am, spawn, {
+    schedule: {
+      mode: 'rolling',
+      resetTime: '15:30',
+      timezone: 'Europe/Moscow',
+      anchorResetAt: '2030-09-01T12:30:00.000Z',
+    },
+    nowFn: () => now,
+    setTimeoutFn: (fn, delay) => {
+      const timer = { fn, delay, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeoutFn: () => {},
+  });
+  warmer.start();
+
+  now = Date.parse('2030-09-01T07:30:00.001Z');
+  await timers[0].fn();
+
+  assert.equal(spawn.calls.length, 0);
+  assert.equal(timers.length, 2, 'only the next five-hour schedule timer is armed');
+  assert.equal(timers[1].delay, 5 * 60 * 60 * 1000 - 1);
+});
+
+test('a deferred rolling warm-up rechecks the account after reset', async () => {
+  const am = new AccountManager([oauth('near')], 0.98);
+  let now = Date.parse('2030-09-01T07:29:00.000Z');
+  am.accounts[0].quota.unified5hReset = Date.parse('2030-09-01T07:31:00.001Z');
+  const spawn = fakeSpawner();
+  const timers = [];
+  const warmer = makeWarmer(am, spawn, {
+    schedule: {
+      mode: 'rolling',
+      resetTime: '15:30',
+      timezone: 'Europe/Moscow',
+      anchorResetAt: '2030-09-01T12:30:00.000Z',
+    },
+    nowFn: () => now,
+    setTimeoutFn: (fn, delay) => {
+      const timer = { fn, delay, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeoutFn: () => {},
+  });
+  warmer.start();
+  now = Date.parse('2030-09-01T07:30:00.001Z');
+  await timers[0].fn();
+  const deferred = timers.find(timer => timer.delay === 70_000);
+  assert.ok(deferred);
+
+  now = Date.parse('2030-09-01T07:31:10.001Z');
+  am.accounts[0].quota.unified5hReset = now + 5 * 60 * 60 * 1000;
+  await deferred.fn();
+
+  assert.equal(spawn.calls.length, 0, 'normal use started a new window before the retry');
+});
+
+test('a deferred rolling warm-up skips a callback that fires after its minute', async () => {
+  const am = new AccountManager([oauth('near')], 0.98);
+  let now = Date.parse('2030-09-01T07:29:00.000Z');
+  am.accounts[0].quota.unified5hReset = Date.parse('2030-09-01T07:31:00.001Z');
+  const spawn = fakeSpawner();
+  const timers = [];
+  const warmer = makeWarmer(am, spawn, {
+    schedule: {
+      mode: 'rolling',
+      resetTime: '15:30',
+      timezone: 'Europe/Moscow',
+      anchorResetAt: '2030-09-01T12:30:00.000Z',
+    },
+    nowFn: () => now,
+    setTimeoutFn: (fn, delay) => {
+      const timer = { fn, delay, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeoutFn: () => {},
+  });
+  warmer.start();
+  now = Date.parse('2030-09-01T07:30:00.001Z');
+  await timers[0].fn();
+  const deferred = timers.find(timer => timer.delay === 70_000);
+  assert.ok(deferred);
+
+  now = Date.parse('2030-09-01T13:31:10.001Z');
+  await deferred.fn();
+
+  assert.equal(spawn.calls.length, 0, 'an old deferred slot must not be replayed after the next cadence point');
+});
+
+test('a deferred rolling warm-up does not outlive its minute during token refresh', async () => {
+  const am = new AccountManager([oauth('near')], 0.98);
+  let now = Date.parse('2030-09-01T07:29:00.000Z');
+  am.accounts[0].quota.unified5hReset = Date.parse('2030-09-01T07:31:00.001Z');
+  let finishRefresh;
+  am.ensureTokenFresh = () => new Promise(resolve => { finishRefresh = resolve; });
+  const spawn = fakeSpawner();
+  const timers = [];
+  const warmer = makeWarmer(am, spawn, {
+    schedule: {
+      mode: 'rolling',
+      resetTime: '15:30',
+      timezone: 'Europe/Moscow',
+      anchorResetAt: '2030-09-01T12:30:00.000Z',
+    },
+    nowFn: () => now,
+    setTimeoutFn: (fn, delay) => {
+      const timer = { fn, delay, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeoutFn: () => {},
+  });
+  warmer.start();
+  now = Date.parse('2030-09-01T07:30:00.001Z');
+  await timers[0].fn();
+  const deferred = timers.find(timer => timer.delay === 70_000);
+  assert.ok(deferred);
+
+  now = Date.parse('2030-09-01T07:31:10.001Z');
+  const retry = deferred.fn();
+  await new Promise(resolve => setImmediate(resolve));
+  now = Date.parse('2030-09-01T07:32:10.001Z');
+  finishRefresh();
+  await retry;
+
+  assert.equal(spawn.calls.length, 0, 'token refresh must not turn a stale retry into a catch-up request');
+});
+
+test('a deferred rolling warm-up rechecks eligibility after token refresh', async () => {
+  const am = new AccountManager([oauth('near')], 0.98);
+  let now = Date.parse('2030-09-01T07:29:00.000Z');
+  am.accounts[0].quota.unified5hReset = Date.parse('2030-09-01T07:31:00.001Z');
+  let finishRefresh;
+  am.ensureTokenFresh = () => new Promise(resolve => { finishRefresh = resolve; });
+  const spawn = fakeSpawner();
+  const timers = [];
+  const warmer = makeWarmer(am, spawn, {
+    schedule: {
+      mode: 'rolling',
+      resetTime: '15:30',
+      timezone: 'Europe/Moscow',
+      anchorResetAt: '2030-09-01T12:30:00.000Z',
+    },
+    nowFn: () => now,
+    setTimeoutFn: (fn, delay) => {
+      const timer = { fn, delay, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeoutFn: () => {},
+  });
+  warmer.start();
+  now = Date.parse('2030-09-01T07:30:00.001Z');
+  await timers[0].fn();
+  const deferred = timers.find(timer => timer.delay === 70_000);
+  assert.ok(deferred);
+
+  now = Date.parse('2030-09-01T07:31:10.001Z');
+  const retry = deferred.fn();
+  await new Promise(resolve => setImmediate(resolve));
+  am.accounts[0].quota.unified5hReset = now + 5 * 60 * 60 * 1000;
+  finishRefresh();
+  await retry;
+
+  assert.equal(spawn.calls.length, 0, 'normal use during refresh must suppress the deferred request');
+});
+
+test('replacing a rolling schedule aborts a deferred retry during token refresh', async () => {
+  const am = new AccountManager([oauth('near')], 0.98);
+  let now = Date.parse('2030-09-01T07:29:00.000Z');
+  am.accounts[0].quota.unified5hReset = Date.parse('2030-09-01T07:31:00.001Z');
+  let finishRefresh;
+  am.ensureTokenFresh = () => new Promise(resolve => { finishRefresh = resolve; });
+  const spawn = fakeSpawner();
+  const timers = [];
+  const warmer = makeWarmer(am, spawn, {
+    schedule: {
+      mode: 'rolling',
+      resetTime: '15:30',
+      timezone: 'Europe/Moscow',
+      anchorResetAt: '2030-09-01T12:30:00.000Z',
+    },
+    nowFn: () => now,
+    setTimeoutFn: (fn, delay) => {
+      const timer = { fn, delay, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeoutFn: () => {},
+  });
+  warmer.start();
+  now = Date.parse('2030-09-01T07:30:00.001Z');
+  await timers[0].fn();
+  const deferred = timers.find(timer => timer.delay === 70_000);
+  assert.ok(deferred);
+
+  now = Date.parse('2030-09-01T07:31:10.001Z');
+  const retry = deferred.fn();
+  await new Promise(resolve => setImmediate(resolve));
+  warmer.rescheduleSchedule(null);
+  finishRefresh();
+  await retry;
+
+  assert.equal(spawn.calls.length, 0, 'the obsolete retry must not spend quota after warm-up is disabled');
+  assert.equal(warmer.getStatus().mode, 'off');
+});
+
+test('replacing a rolling schedule aborts a deferred retry after its child starts', async () => {
+  const am = new AccountManager([oauth('near')], 0.98);
+  let now = Date.parse('2030-09-01T07:29:00.000Z');
+  am.accounts[0].quota.unified5hReset = Date.parse('2030-09-01T07:31:00.001Z');
+  let spawnedSignal;
+  let finishSpawn;
+  const spawnFn = spec => {
+    spawnedSignal = spec.signal;
+    return new Promise(resolve => { finishSpawn = resolve; });
+  };
+  const timers = [];
+  const warmer = makeWarmer(am, spawnFn, {
+    schedule: {
+      mode: 'rolling',
+      resetTime: '15:30',
+      timezone: 'Europe/Moscow',
+      anchorResetAt: '2030-09-01T12:30:00.000Z',
+    },
+    nowFn: () => now,
+    setTimeoutFn: (fn, delay) => {
+      const timer = { fn, delay, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeoutFn: () => {},
+  });
+  warmer.start();
+  now = Date.parse('2030-09-01T07:30:00.001Z');
+  await timers[0].fn();
+  const deferred = timers.find(timer => timer.delay === 70_000);
+  assert.ok(deferred);
+
+  now = Date.parse('2030-09-01T07:31:10.001Z');
+  const retry = deferred.fn();
+  await new Promise(resolve => setImmediate(resolve));
+  warmer.rescheduleSchedule(null);
+  const wasAborted = spawnedSignal.aborted;
+  finishSpawn(0);
+  await retry;
+
+  assert.equal(wasAborted, true, 'reconfiguration must cancel an already spawned obsolete retry');
+});
+
+test('deferred rolling warm-ups serialize accounts sharing the same reset', async () => {
+  const am = new AccountManager([oauth('first'), oauth('second')], 0.98);
+  let now = Date.parse('2030-09-01T07:29:00.000Z');
+  const resetAt = Date.parse('2030-09-01T07:31:00.001Z');
+  am.accounts[0].quota.unified5hReset = resetAt;
+  am.accounts[1].quota.unified5hReset = resetAt;
+  let finishFirstSpawn;
+  let activeSpawns = 0;
+  let maxActiveSpawns = 0;
+  const spawn = async spec => {
+    spawn.calls.push(spec);
+    activeSpawns += 1;
+    maxActiveSpawns = Math.max(maxActiveSpawns, activeSpawns);
+    if (spawn.calls.length === 1) await new Promise(resolve => { finishFirstSpawn = resolve; });
+    activeSpawns -= 1;
+    return 0;
+  };
+  spawn.calls = [];
+  const timers = [];
+  const warmer = makeWarmer(am, spawn, {
+    schedule: {
+      mode: 'rolling',
+      resetTime: '15:30',
+      timezone: 'Europe/Moscow',
+      anchorResetAt: '2030-09-01T12:30:00.000Z',
+    },
+    nowFn: () => now,
+    setTimeoutFn: (fn, delay) => {
+      const timer = { fn, delay, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeoutFn: () => {},
+  });
+  warmer.start();
+  now = Date.parse('2030-09-01T07:30:00.001Z');
+  await timers[0].fn();
+  const deferred = timers.filter(timer => timer.delay === 70_000);
+  assert.equal(deferred.length, 2);
+
+  now = Date.parse('2030-09-01T07:31:10.001Z');
+  const retries = deferred.map(timer => timer.fn());
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(spawn.calls.length, 1, 'the second retry waits for the first child');
+  finishFirstSpawn();
+  await Promise.all(retries);
+
+  assert.equal(spawn.calls.length, 2, 'both accounts must warm even when their deferred callbacks coincide');
+  assert.equal(maxActiveSpawns, 1);
+});
+
+test('a queued deferred rolling warm-up rechecks eligibility after waiting', async () => {
+  const am = new AccountManager([oauth('first'), oauth('second')], 0.98);
+  let now = Date.parse('2030-09-01T07:29:00.000Z');
+  const resetAt = Date.parse('2030-09-01T07:31:00.001Z');
+  am.accounts[0].quota.unified5hReset = resetAt;
+  am.accounts[1].quota.unified5hReset = resetAt;
+  let finishFirstSpawn;
+  const spawn = async spec => {
+    spawn.calls.push(spec);
+    if (spawn.calls.length === 1) await new Promise(resolve => { finishFirstSpawn = resolve; });
+    return 0;
+  };
+  spawn.calls = [];
+  const timers = [];
+  const warmer = makeWarmer(am, spawn, {
+    schedule: {
+      mode: 'rolling',
+      resetTime: '15:30',
+      timezone: 'Europe/Moscow',
+      anchorResetAt: '2030-09-01T12:30:00.000Z',
+    },
+    nowFn: () => now,
+    setTimeoutFn: (fn, delay) => {
+      const timer = { fn, delay, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeoutFn: () => {},
+  });
+  warmer.start();
+  now = Date.parse('2030-09-01T07:30:00.001Z');
+  await timers[0].fn();
+  const deferred = timers.filter(timer => timer.delay === 70_000);
+  assert.equal(deferred.length, 2);
+
+  now = Date.parse('2030-09-01T07:31:10.001Z');
+  const retries = deferred.map(timer => timer.fn());
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(spawn.calls.length, 1);
+  am.accounts[1].quota.unified5hReset = now + 5 * 60 * 60 * 1000;
+  finishFirstSpawn();
+  await Promise.all(retries);
+
+  assert.equal(spawn.calls.length, 1, 'normal use while queued must suppress the second deferred request');
+});
+
+test('stop cancels a deferred rolling warm-up', async () => {
+  const am = new AccountManager([oauth('near')], 0.98);
+  let now = Date.parse('2030-09-01T07:29:00.000Z');
+  am.accounts[0].quota.unified5hReset = Date.parse('2030-09-01T07:31:00.001Z');
+  const spawn = fakeSpawner();
+  const timers = [];
+  const warmer = makeWarmer(am, spawn, {
+    schedule: {
+      mode: 'rolling',
+      resetTime: '15:30',
+      timezone: 'Europe/Moscow',
+      anchorResetAt: '2030-09-01T12:30:00.000Z',
+    },
+    nowFn: () => now,
+    setTimeoutFn: (fn, delay) => {
+      const timer = { fn, delay, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeoutFn: () => {},
+  });
+  warmer.start();
+  now = Date.parse('2030-09-01T07:30:00.001Z');
+  await timers[0].fn();
+  const deferred = timers.find(timer => timer.delay === 70_000);
+  assert.ok(deferred);
+
+  warmer.stop();
+  now = Date.parse('2030-09-01T07:31:10.001Z');
+  await deferred.fn();
+
+  assert.equal(spawn.calls.length, 0);
+});
+
+test('a late rolling timer skips to the next five-hour lattice point', async () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  const spawn = fakeSpawner();
+  let now = Date.parse('2026-09-01T06:00:00.000Z');
+  const timers = [];
+  const warmer = makeWarmer(am, spawn, {
+    schedule: {
+      mode: 'rolling',
+      resetTime: '15:30',
+      timezone: 'Europe/Moscow',
+      anchorResetAt: '2026-09-01T12:30:00.000Z',
+    },
+    nowFn: () => now,
+    setTimeoutFn: (fn, delay) => {
+      const timer = { fn, delay, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeoutFn: () => {},
+  });
+  warmer.start();
+
+  now = Date.parse('2026-09-01T07:31:00.000Z');
+  await timers[0].fn();
+
+  assert.equal(spawn.calls.length, 0);
+  assert.equal(timers.length, 2);
+  assert.equal(warmer.getStatus().nextWarmupAt, '2026-09-01T12:30:00.000Z');
+});
+
+test('restoring a rolling schedule preserves its original phase', () => {
+  const schedule = {
+    mode: 'rolling',
+    resetTime: '15:30',
+    timezone: 'Europe/Moscow',
+    anchorResetAt: '2026-09-01T12:30:00.000Z',
+  };
+  const firstTimers = [];
+  const first = makeWarmer(new AccountManager([oauth('a')], 0.98), fakeSpawner(), {
+    schedule,
+    nowFn: () => Date.parse('2026-09-01T06:00:00.000Z'),
+    setTimeoutFn: (fn, delay) => {
+      const timer = { fn, delay, unref() {} };
+      firstTimers.push(timer);
+      return timer;
+    },
+    clearTimeoutFn: () => {},
+  });
+  first.start();
+  first.stop();
+
+  const restoredTimers = [];
+  const restored = makeWarmer(new AccountManager([oauth('a')], 0.98), fakeSpawner(), {
+    schedule,
+    nowFn: () => Date.parse('2026-09-01T08:00:00.000Z'),
+    setTimeoutFn: (fn, delay) => {
+      const timer = { fn, delay, unref() {} };
+      restoredTimers.push(timer);
+      return timer;
+    },
+    clearTimeoutFn: () => {},
+  });
+  restored.start();
+
+  assert.equal(restored.getStatus().nextWarmupAt, '2026-09-01T12:30:00.000Z');
+  assert.equal(restoredTimers[0].delay, 4.5 * 60 * 60 * 1000);
+});
+
+test('a timer from a replaced reset schedule cannot warm or rearm', async () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  const spawn = fakeSpawner();
+  const timers = [];
+  const warmer = makeWarmer(am, spawn, {
+    schedule: { resetTime: '15:30', timezone: 'Europe/Moscow' },
+    nowFn: () => Date.parse('2026-09-01T06:00:00.000Z'),
+    setTimeoutFn: (fn, delay) => {
+      const timer = { fn, delay, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeoutFn: () => {},
+  });
+  warmer.start();
+  warmer.rescheduleSchedule({ resetTime: '16:30', timezone: 'Europe/Moscow' });
+
+  await timers[0].fn();
+
+  assert.equal(spawn.calls.length, 0);
+  assert.equal(timers.length, 2);
+  assert.equal(warmer.getStatus().resetTime, '16:30');
+});
+
+test('a schedule replaced during warm-up cannot create an orphan timer', async () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  let finishSpawn;
+  const spawnFn = spec => {
+    spawnFn.calls.push(spec);
+    return new Promise(resolve => { finishSpawn = resolve; });
+  };
+  spawnFn.calls = [];
+  let now = Date.parse('2026-09-01T06:00:00.000Z');
+  const timers = [];
+  const warmer = makeWarmer(am, spawnFn, {
+    schedule: { resetTime: '15:30', timezone: 'Europe/Moscow' },
+    nowFn: () => now,
+    setTimeoutFn: (fn, delay) => {
+      const timer = { fn, delay, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeoutFn: () => {},
+  });
+  warmer.start();
+  now = Date.parse('2026-09-01T07:30:00.001Z');
+  const oldRun = timers[0].fn();
+  await new Promise(resolve => setImmediate(resolve));
+  warmer.rescheduleSchedule({ resetTime: '16:30', timezone: 'Europe/Moscow' });
+  finishSpawn(0);
+  await oldRun;
+
+  assert.equal(spawnFn.calls.length, 1);
+  assert.equal(timers.length, 2, 'only the replacement schedule owns a timer');
+  assert.equal(warmer.getStatus().resetTime, '16:30');
 });

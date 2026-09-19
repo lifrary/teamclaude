@@ -13,19 +13,25 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Cover the whole supported range — package.json declares "node >=18".
-        node: [18, 20, 22, 24]
+        # Cover the whole supported range — package.json declares "node >=20".
+        node: [20, 22, 24]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Node.js ${{ matrix.node }}
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ matrix.node }}
 
+      # `--ignore-scripts`: the devDependencies (eslint, typescript, @types/node)
+      # are needed for lint and typecheck only, and neither they nor their
+      # transitive packages need lifecycle scripts to work. Not running them denies a compromised package arbitrary code
+      # execution at install time. Still `npm install` rather than `npm ci`:
+      # package-lock.json is deliberately gitignored for this zero-dependency
+      # package, so there is no lockfile for `npm ci` to consume.
       - name: Install dependencies
-        run: npm install
+        run: npm install --ignore-scripts
 
       - name: Run tests
         run: npm test
@@ -34,14 +40,35 @@ jobs:
         if: matrix.node == 24
         run: npm run lint
 
+      # tsc over the JS sources, driven by their JSDoc (see tsconfig.json).
+      - name: Typecheck
+        if: matrix.node == 24
+        run: npm run typecheck
+
+      # The strict-mode ratchet (scripts/typecheck-strict.mjs): strict
+      # diagnostics per file may not grow against the pre-merge commit. For a
+      # pull request the checkout is the merge of the branch into master and
+      # the base is master's tip; for a push to master it is the previous tip.
+      # The base commit is fetched on its own, since the checkout is shallow.
+      - name: Strict typecheck ratchet
+        if: matrix.node == 24 && (github.event_name == 'pull_request' || github.event_name == 'push')
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
+            echo "No base commit for this event; skipping."; exit 0
+          fi
+          git fetch --no-tags --depth=1 origin "$BASE"
+          npm run typecheck:strict -- --base "$BASE"
+
   nix:
     name: nix package
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Nix
-        uses: cachix/install-nix-action@v31
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes

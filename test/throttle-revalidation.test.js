@@ -10,7 +10,8 @@ function oauth(name, extra = {}) {
 // burst throttles every account with a long retry-after hold; the hold lives
 // only in memory and nothing revalidates it, so teamclaude keeps refusing with
 // synthetic 429s even after upstream is healthy again, until a restart wipes
-// the holds. Revalidation lets a live probe clear a stale hold instead.
+// the holds. Ordinary requests never bypass a hold to spend quota; independently
+// obtained upstream evidence or natural expiry restores admission.
 
 test('within the floor, a rate-limit hold is respected verbatim (no probe)', () => {
   const am = new AccountManager([oauth('a'), oauth('b')], 0.98);
@@ -19,7 +20,7 @@ test('within the floor, a rate-limit hold is respected verbatim (no probe)', () 
   assert.equal(am.getActiveAccount(), null, 'freshly throttled fleet must refuse');
 });
 
-test('after the floor, a throttled account becomes a revalidation probe target', () => {
+test('after the floor, ordinary requests still respect an upstream hold', () => {
   const am = new AccountManager([oauth('a'), oauth('b')], 0.98);
   am.markRateLimited(0, 3600);
   am.markRateLimited(1, 3600);
@@ -28,11 +29,11 @@ test('after the floor, a throttled account becomes a revalidation probe target',
   am.accounts[1].throttledAt = Date.now() - am.throttleProbeFloorMs - 1;
 
   const probe = am.getActiveAccount();
-  assert.ok(probe, 'expected a revalidation probe, not a refusal');
-  assert.equal(probe.status, 'throttled', 'probe target is still formally throttled');
+  assert.equal(probe, null);
+  assert.equal(am.accounts[0].status, 'throttled');
 
-  // Probing stays rate-limited to one per probe interval.
-  assert.equal(am.getActiveAccount(exclude(probe)), null, 'second probe inside the interval must refuse');
+  // Model-scoped routing must respect the same hold.
+  assert.equal(am.getActiveAccount(null, 'claude-sonnet-5'), null);
 });
 
 test('a non-429 response clears the hold and returns the account to rotation', () => {
@@ -40,10 +41,10 @@ test('a non-429 response clears the hold and returns the account to rotation', (
   am.markRateLimited(0, 3600);
   am.accounts[0].throttledAt = Date.now() - am.throttleProbeFloorMs - 1;
   const probe = am.getActiveAccount();
-  assert.ok(probe);
+  assert.equal(probe, null);
 
   // server.js calls this on any non-429 upstream response.
-  am.clearRateLimited(probe.index);
+  am.clearRateLimited(am.accounts[0]);
   assert.equal(am.accounts[0].status, 'active');
   assert.equal(am.accounts[0].rateLimitedUntil, null);
   assert.equal(am.accounts[0].throttledAt, null);
@@ -51,11 +52,11 @@ test('a non-429 response clears the hold and returns the account to rotation', (
   assert.equal(am.getActiveAccount()?.name, 'a');
 });
 
-test('a probe that 429s again re-arms the hold and pushes the next probe out a full floor', () => {
+test('fresh upstream 429 evidence re-arms the hold without admitting a spending probe', () => {
   const am = new AccountManager([oauth('a')], 0.98);
   am.markRateLimited(0, 3600);
   am.accounts[0].throttledAt = Date.now() - am.throttleProbeFloorMs - 1;
-  assert.ok(am.getActiveAccount(), 'probe allowed after floor');
+  assert.equal(am.getActiveAccount(), null, 'elapsed floor is not admission');
 
   // Upstream said 429 again: forwardRequest re-arms via markRateLimited.
   am.markRateLimited(0, 3600);
@@ -76,7 +77,8 @@ test('constructor floor option is honored', () => {
   am.markRateLimited(0, 3600);
   assert.equal(am.getActiveAccount(), null, 'inside the tiny floor');
   am.accounts[0].throttledAt = Date.now() - 6;
-  assert.ok(am.getActiveAccount(), 'past the tiny floor');
+  assert.equal(am.getActiveAccount(), null, 'past the tiny floor still cannot spend');
+  assert.equal(am.throttleProbeFloorMs, 5);
 });
 
 test('natural hold expiry still clears state fully', () => {
@@ -87,7 +89,3 @@ test('natural hold expiry still clears state fully', () => {
   assert.equal(acct?.name, 'a');
   assert.equal(am.accounts[0].throttledAt, null, 'expiry must reset throttledAt too');
 });
-
-function exclude(account) {
-  return new Set([account.index]);
-}

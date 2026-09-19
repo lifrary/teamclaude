@@ -60,13 +60,14 @@ test('an owned-model request never falls back to a non-owner account', () => {
   assert.notEqual(acct?.name, 'claude'); // the deepseek model must not hit Claude
 });
 
-// Positive control: with no owner declared, the probe/fallback still works
+// Positive control: with no owner declared, ordinary selection still works
 // normally (ownership routing is inert unless someone declares a models list).
 test('ownership guard is inert when no account claims the model', () => {
   const am = new AccountManager([oauth('a'), oauth('b')], 0.98);
+  const acct = am.getActiveAccount(null, 'claude-sonnet-4-6');
+  assert.ok(acct, 'an available unclaimed model must be selectable');
   nearQuotaFutureReset(am, 0);
   nearQuotaFutureReset(am, 1);
-  // Every account near quota → a probe is allowed; some account is returned.
-  const acct = am.getActiveAccount(null, 'claude-sonnet-4-6');
-  assert.ok(acct, 'a probe target should still be selectable');
+  assert.equal(am.getActiveAccount(null, 'claude-sonnet-4-6'), null,
+    'ownership being inert must not authorize spending over quota');
 });

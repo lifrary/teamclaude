@@ -1,10 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { EventEmitter } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  compareVersions, installKind, fetchLatestVersion, checkForUpdate, runUpdate, PKG_NAME,
+  compareVersions, installKind, fetchLatestVersion, checkForUpdate, runUpdate, autoUpdate, isReleaseVersion,
+  resolveVersionLabel, updateAvailableFromCache, PKG_NAME,
 } from '../src/updater.js';
 
 // ── compareVersions ─────────────────────────────────────────
@@ -20,24 +22,27 @@ test('compareVersions orders x.y.z numerically and ignores pre-release', () => {
 
 // ── installKind ──────────────────────────────────────────────
 
-test('installKind detects a git checkout by a .git dir', () => {
+test('installKind detects a git checkout by a .git dir', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'tc-git-'));
   mkdirSync(join(dir, '.git'));
   try {
-    assert.equal(installKind({ root: dir, globalRoot: () => '/usr/lib/node_modules' }), 'git');
+    assert.equal(await installKind({ root: dir, globalRoot: () => '/usr/lib/node_modules' }), 'git');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('installKind flags a global npm install and distinguishes a local one', () => {
+test('installKind flags a global npm install and distinguishes a local one', async () => {
   const gRoot = '/usr/lib/node_modules';
   const global = `${gRoot}/@karpeleslab/teamclaude`;
   const local = '/home/x/project/node_modules/@karpeleslab/teamclaude';
-  assert.equal(installKind({ root: global, globalRoot: () => gRoot }), 'global');
-  assert.equal(installKind({ root: local, globalRoot: () => gRoot }), 'local');
+  assert.equal(await installKind({ root: global, globalRoot: () => gRoot }), 'global');
+  assert.equal(await installKind({ root: local, globalRoot: () => gRoot }), 'local');
+  // `npm root -g` is asked asynchronously now, so a probe that answers later is
+  // the shape the real one has.
+  assert.equal(await installKind({ root: global, globalRoot: async () => gRoot }), 'global');
 });
 
-test('installKind is unknown outside node_modules (e.g. running from source path)', () => {
-  assert.equal(installKind({ root: '/opt/teamclaude-src', globalRoot: () => null }), 'unknown');
+test('installKind is unknown outside node_modules (e.g. running from source path)', async () => {
+  assert.equal(await installKind({ root: '/opt/teamclaude-src', globalRoot: () => null }), 'unknown');
 });
 
 // ── fetchLatestVersion ───────────────────────────────────────
@@ -99,15 +104,234 @@ test('checkForUpdate reports no update when already on the latest', async () => 
 
 // ── runUpdate ────────────────────────────────────────────────
 
-test('runUpdate invokes the global npm install for the requested version', () => {
+// A fake `spawn`: a ChildProcess-shaped emitter that settles on the next tick
+// with an exit code, or with an 'error' when `error` is given.
+function fakeSpawn(calls, { code = 0, error = null } = {}) {
+  return (cmd, argv, opts) => {
+    calls.push([cmd, argv, opts]);
+    const child = new EventEmitter();
+    setImmediate(() => { if (error) child.emit('error', error); else child.emit('exit', code); });
+    return child;
+  };
+}
+
+test('runUpdate invokes the global npm install for the requested version', async () => {
   const calls = [];
-  const spawnImpl = (cmd, argv) => { calls.push([cmd, argv]); return { status: 0 }; };
-  const ok = runUpdate('2.3.4', { spawnImpl });
+  const ok = await runUpdate('2.3.4', { spawnImpl: fakeSpawn(calls) });
   assert.equal(ok, true);
-  assert.deepEqual(calls[0], ['npm', ['install', '-g', `${PKG_NAME}@2.3.4`]]);
+  assert.deepEqual(calls[0].slice(0, 2), ['npm', ['install', '-g', `${PKG_NAME}@2.3.4`]]);
 });
 
-test('runUpdate returns false when npm fails', () => {
-  assert.equal(runUpdate('2.3.4', { spawnImpl: () => ({ status: 1 }) }), false);
-  assert.equal(runUpdate('2.3.4', { spawnImpl: () => ({ error: new Error('ENOENT') }) }), false);
+test('runUpdate resolves false when npm fails', async () => {
+  assert.equal(await runUpdate('2.3.4', { spawnImpl: fakeSpawn([], { code: 1 }) }), false);
+  assert.equal(await runUpdate('2.3.4', { spawnImpl: fakeSpawn([], { error: new Error('ENOENT') }) }), false);
+  assert.equal(await runUpdate('2.3.4', { spawnImpl: () => { throw new Error('ENOENT'); } }), false);
+});
+
+// The install runs inside `server --headless`, the one process every client
+// depends on. A synchronous spawn parked the event loop for the whole install
+// (#353); the child must run beside it.
+test('runUpdate does not block the event loop while npm runs', async () => {
+  const calls = [];
+  let child;
+  const spawnImpl = (cmd, argv, opts) => { calls.push([cmd, argv, opts]); child = new EventEmitter(); return child; };
+  const pending = runUpdate('2.3.4', { spawnImpl });
+  // The install is "running": the loop must still turn.
+  let ticks = 0;
+  await new Promise(r => { const t = setInterval(() => { if (++ticks === 3) { clearInterval(t); r(); } }, 1); });
+  assert.equal(ticks, 3, 'timers ran while the install was in flight');
+  assert.equal(calls[0][2].stdio, 'inherit');
+  assert.equal(calls[0][2].timeout, 180000, 'a hung npm is still bounded');
+  child.emit('exit', 0);
+  assert.equal(await pending, true);
+});
+
+// ── the registry's "latest" is a string from the network ─────
+
+// compareVersions parses what it can, so "99.0.0 || npm:evil" reads as newer
+// than anything installed and used to go straight into `npm install -g`.
+test('isReleaseVersion accepts only x.y.z', () => {
+  for (const v of ['1.2.3', '0.0.1', '10.20.30']) assert.equal(isReleaseVersion(v), true, v);
+  for (const v of ['99.0.0 || npm:evil', '1.2', '1.2.3-beta.1', 'latest', ' 1.2.3', '1.2.3\n', '', null, undefined, 'v1.2.3']) {
+    assert.equal(isReleaseVersion(v), false, String(v));
+  }
+});
+
+test('runUpdate spawns nothing for a version that is not a release version', async () => {
+  const calls = [];
+  const spawnImpl = fakeSpawn(calls);
+  assert.equal(await runUpdate('99.0.0 || npm:evil', { spawnImpl }), false);
+  assert.equal(await runUpdate('1.2.3-beta.1', { spawnImpl }), false);
+  assert.equal(calls.length, 0);
+  // The literal tag the manual fallback uses is still fine.
+  assert.equal(await runUpdate('latest', { spawnImpl }), true);
+});
+
+// ── autoUpdate guards ────────────────────────────────────────
+
+/** A package root that is not a git checkout, so autoUpdate gets past its first check. */
+function nonGitRoot() {
+  return mkdtempSync(join(tmpdir(), 'tc-root-'));
+}
+
+test('autoUpdate skips a malformed registry version with a log line and installs nothing', async () => {
+  const root = nonGitRoot();
+  const logs = [];
+  let installed = 0;
+  try {
+    const res = await autoUpdate({
+      root, uid: 1000, log: (m) => logs.push(m),
+      check: async () => ({ current: '1.0.0', latest: '99.0.0 || npm:evil', updateAvailable: true }),
+      kind: () => 'global',
+      install: () => { installed++; return true; },
+    });
+    assert.equal(res.skipped, 'bad-version');
+    assert.equal(installed, 0);
+    assert.equal(logs.length, 1);
+    assert.match(logs[0], /not a release version/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('autoUpdate still installs a well-formed newer version for a global install', async () => {
+  const root = nonGitRoot();
+  const installs = [];
+  try {
+    const res = await autoUpdate({
+      root, uid: 1000, log: () => {},
+      check: async () => ({ current: '1.0.0', latest: '2.0.0', updateAvailable: true }),
+      kind: async () => 'global',
+      install: async (v) => { installs.push(v); return true; },
+    });
+    assert.equal(res.updated, true);
+    assert.deepEqual(installs, ['2.0.0']);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+// `sudo teamclaude server` would otherwise run `npm install -g` as root every
+// day, off a version string fetched from the network.
+test('autoUpdate never runs as root, and says so once', async () => {
+  const root = nonGitRoot();
+  const logs = [];
+  let checked = 0;
+  try {
+    const opts = {
+      root, uid: 0, log: (m) => logs.push(m),
+      check: async () => { checked++; return { current: '1.0.0', latest: '2.0.0', updateAvailable: true }; },
+      kind: () => 'global',
+      install: () => { throw new Error('must not install as root'); },
+    };
+    assert.equal((await autoUpdate(opts)).skipped, 'root');
+    assert.equal((await autoUpdate(opts)).skipped, 'root');
+    assert.equal(checked, 0, 'the registry is not even consulted');
+    assert.equal(logs.filter(l => /root/.test(l)).length, 1, 'warned exactly once across calls');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+// ── resolveVersionLabel ──────────────────────────────────────
+
+function labelRoot({ git = false, version = null } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'tc-label-'));
+  if (git) mkdirSync(join(dir, '.git'));
+  if (version) writeFileSync(join(dir, 'package.json'), JSON.stringify({ version }));
+  return dir;
+}
+
+// Answers keyed by git subcommand; anything unlisted fails the way the real git
+// does when HEAD is not on a tag, or when the checkout is shallow or broken.
+function gitStub(answers, seen = []) {
+  return async (file, args, opts) => {
+    seen.push([file, args, opts]);
+    const sub = args[0];
+    if (!(sub in answers)) throw new Error(`git ${sub}: no answer`);
+    return { stdout: answers[sub] };
+  };
+}
+
+test('resolveVersionLabel prefers the tag HEAD sits on', async () => {
+  const root = labelRoot({ git: true, version: '1.1.20' });
+  try {
+    const exec = gitStub({ describe: 'v1.1.20\n', 'rev-parse': 'b8bbfcc\n' });
+    assert.deepEqual(await resolveVersionLabel({ root, exec }), { label: 'v1.1.20', git: true });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('resolveVersionLabel falls back to the short sha off a tag', async () => {
+  const root = labelRoot({ git: true, version: '1.1.20' });
+  try {
+    const exec = gitStub({ 'rev-parse': 'b8bbfcc\n' });
+    assert.deepEqual(await resolveVersionLabel({ root, exec }), { label: 'b8bbfcc', git: true });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+// The server is started from the operator's own project directory. Resolving
+// against the process cwd would report that repository's sha as ours.
+test('resolveVersionLabel asks git about the package root, not the process cwd', async () => {
+  const root = labelRoot({ git: true, version: '1.1.20' });
+  const seen = [];
+  try {
+    await resolveVersionLabel({ root, exec: gitStub({ describe: 'v1.1.20\n' }, seen) });
+    assert.equal(seen[0][2].cwd, root);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('resolveVersionLabel reads package.json outside a checkout, without running git', async () => {
+  const root = labelRoot({ version: '1.1.20-pr378' });
+  const seen = [];
+  try {
+    const label = await resolveVersionLabel({ root, exec: gitStub({ describe: 'v9.9.9\n' }, seen) });
+    assert.deepEqual(label, { label: '1.1.20-pr378', git: false });
+    assert.equal(seen.length, 0, 'no git process for an npm install');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+// A shallow CI clone has no tags, and a checkout without the git binary answers
+// nothing at all — package.json is still readable in both.
+test('resolveVersionLabel falls through to package.json when git answers nothing', async () => {
+  const root = labelRoot({ git: true, version: '1.1.20' });
+  try {
+    assert.deepEqual(await resolveVersionLabel({ root, exec: gitStub({}) }), { label: '1.1.20', git: true });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('resolveVersionLabel reports local when nothing identifies the copy', async () => {
+  const root = labelRoot();
+  try {
+    assert.deepEqual(await resolveVersionLabel({ root, exec: gitStub({}) }), { label: 'local', git: false });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+// A tag name is drawn into the operator's terminal by the dashboard header.
+test('resolveVersionLabel strips control characters out of a tag name', async () => {
+  const root = labelRoot({ git: true, version: '1.1.20' });
+  try {
+    const exec = gitStub({ describe: 'v1\x1b[2J\x07evil\n' });
+    const { label } = await resolveVersionLabel({ root, exec });
+    assert.doesNotMatch(label, /[\x1b\x07]/);
+    assert.match(label, /v1/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+// ── updateAvailableFromCache ─────────────────────────────────
+
+test('updateAvailableFromCache answers from the cache alone', async () => {
+  const cachePath = tmpCache();
+  writeFileSync(cachePath, JSON.stringify({ checkedAt: 1, latest: '2.0.0' }));
+  assert.equal(await updateAvailableFromCache({ current: '1.0.0', cachePath }), true);
+  assert.equal(await updateAvailableFromCache({ current: '2.0.0', cachePath }), false);
+  assert.equal(await updateAvailableFromCache({ current: '3.0.0', cachePath }), false);
+});
+
+test('updateAvailableFromCache is false with no cache and with no version to compare', async () => {
+  assert.equal(await updateAvailableFromCache({ current: '1.0.0', cachePath: tmpCache() }), false);
+  const cachePath = tmpCache();
+  writeFileSync(cachePath, JSON.stringify({ checkedAt: 1, latest: '2.0.0' }));
+  assert.equal(await updateAvailableFromCache({ current: null, cachePath }), false);
+});
+
+// The daily check is what refreshes the cache; a stale entry is still the last
+// thing known, and reporting it is the same choice checkForUpdate makes.
+test('updateAvailableFromCache ignores how old the cached answer is', async () => {
+  const cachePath = tmpCache();
+  writeFileSync(cachePath, JSON.stringify({ checkedAt: 0, latest: '2.0.0' }));
+  assert.equal(await updateAvailableFromCache({ current: '1.0.0', cachePath }), true);
 });

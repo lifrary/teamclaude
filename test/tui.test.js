@@ -2,12 +2,14 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
 import { TUI } from '../src/tui.js';
+import { ensureAccountIds } from '../src/account-id.js';
 
 // Build a TUI wired to a real AccountManager + a config copy, without start()
 // (start() is what touches stdin/stdout — the constructor just sets fields). A
 // mock saveConfig records that a persist happened.
 function makeTUI(names = ['a0', 'a1', 'a2']) {
-  const accts = names.map(n => ({ name: n, type: 'apikey', apiKey: `sk-${n}` }));
+  // loadConfig assigns IDs before resolveAccounts builds the manager entries.
+  const accts = ensureAccountIds(names.map(n => ({ name: n, type: 'apikey', apiKey: `sk-${n}` })));
   const am = new AccountManager(accts.map(a => ({ ...a })), 0.98, 0, 5);
   const config = { accounts: accts.map(a => ({ ...a })) };
   let saves = 0;
@@ -209,15 +211,16 @@ test('the display order follows a reset rollover without any set operation', () 
 // background reorder retarget a pending delete onto a NEIGHBORING account.
 // The cursor must anchor the account OBJECT, not the row index.
 test('a live display reorder cannot retarget a pending delete (cursor anchors the object)', () => {
-  const am = new AccountManager([
+  const entries = ensureAccountIds([
     { name: 'a0', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
     { name: 'a1', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
-  ], 0.98, 0, 5);
+  ]);
+  const am = new AccountManager(entries, 0.98, 0, 5);
   const now = Date.now(), DAY = 86400_000;
   // a0 drains first (soonest weekly reset) → display order [a0, a1]
   am.accounts[0].quota.unified7d = 0.4; am.accounts[0].quota.unified7dReset = now + 1 * DAY;
   am.accounts[1].quota.unified7d = 0.4; am.accounts[1].quota.unified7dReset = now + 3 * DAY;
-  const config = { accounts: [{ name: 'a0' }, { name: 'a1' }] };
+  const config = { accounts: entries.map(entry => ({ ...entry })) };
   const tui = new TUI({ accountManager: am, config, saveConfig: async () => {}, syncAccounts: async () => 0, onQuit: () => {} });
 
   tui.selIdx = 0;
@@ -231,6 +234,18 @@ test('a live display reorder cannot retarget a pending delete (cursor anchors th
   tui._keySelect('enter');             // confirm — must delete the ANCHORED a0, not display[0]
   assert.deepEqual(am.accounts.map(a => a.name), ['a1'], 'the anchored account was deleted, not its neighbor');
   assert.deepEqual(config.accounts.map(a => a.name), ['a1']);
+});
+
+test('a vanished pending delete never falls back to the neighboring display row', () => {
+  const { tui, am, config, saves } = makeTUI(['a0', 'a1']);
+  tui._keyNormal('d');
+  am.removeAccount(0);
+  assert.equal(tui._selected(), null, 'rendering keeps the pending selection missing');
+  tui._keySelect('enter');
+  assert.deepEqual(am.accounts.map(account => account.name), ['a1']);
+  assert.deepEqual(config.accounts.map(account => account.name), ['a0', 'a1']);
+  assert.equal(saves(), 0);
+  assert.match(tui.log[0].msg, /no longer listed/i);
 });
 
 // ── normalization of legacy / duplicate priority values ─────────────────────
@@ -283,7 +298,7 @@ test('generated api names are collision-free after a delete (no duplicate)', asy
 
 const stripAnsi = s => s.replace(/\x1b\[[0-9;]*m/g, '');
 
-test('a wide row renders a third "Fbl" bar for an OAuth account', () => {
+test('family layout renders the F7 bar and hides it when the width budget excludes families', () => {
   const am = new AccountManager([
     { name: 'max-1', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
   ], 0.98, 0, 5);
@@ -298,14 +313,18 @@ test('a wide row renders a third "Fbl" bar for an OAuth account', () => {
   });
   const tui = new TUI({ accountManager: am, config: { accounts: [] }, saveConfig: async () => {}, syncAccounts: async () => 0, onQuit: () => {} });
 
-  const wide = stripAnsi(tui._renderAcct(am.accounts[0], 0, 10, true, true));
-  assert.match(wide, /Ses .*Wk .*Fbl .*94%/s, 'third bar labelled Fbl with the 7d_oi utilization');
+  const wide = stripAnsi(tui._renderAcct(0, 10, true, [], [], {}, true));
+  assert.match(wide, /Ses .*Wk .*F7 .*94%/s, 'family bar shows the 7d_oi utilization');
 
-  const mid = stripAnsi(tui._renderAcct(am.accounts[0], 0, 10, true, false));
-  assert.doesNotMatch(mid, /Fbl/, 'no third bar on mid widths');
+  const mid = stripAnsi(tui._renderAcct(0, 10, true, [], [], {}, false));
+  assert.match(mid, /Ses .*Wk /s);
+  assert.doesNotMatch(mid, /F7/, 'no family bar when the budget excludes it');
+  const narrow = stripAnsi(tui._renderAcct(0, 10, false, [], [], {}, false));
+  assert.match(narrow, /Ses /);
+  assert.doesNotMatch(narrow, /Wk |F7/, 'narrow layout retains only the session bar');
 });
 
-test('the Fbl bar prefers the 7d_oi window when multiple model windows exist', () => {
+test('the F7 bar prefers the 7d_oi window when multiple model windows exist', () => {
   const am = new AccountManager([
     { name: 'max-1', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
   ], 0.98, 0, 5);
@@ -313,23 +332,25 @@ test('the Fbl bar prefers the 7d_oi window when multiple model windows exist', (
   am.accounts[0].quota.modelWeekly['7d_xx'] = { utilization: 0.11, reset: Date.now() + 86400_000 };
   am.accounts[0].quota.modelWeekly['7d_oi'] = { utilization: 0.94, reset: Date.now() + 86400_000 };
   const tui = new TUI({ accountManager: am, config: { accounts: [] }, saveConfig: async () => {}, syncAccounts: async () => 0, onQuit: () => {} });
-  const row = stripAnsi(tui._renderAcct(am.accounts[0], 0, 10, true, true));
-  assert.match(row, /Fbl .*94%/s, '7d_oi (94%) shown, not the first-inserted window (11%)');
+  const row = stripAnsi(tui._renderAcct(0, 10, true, [], [], {}, true));
+  assert.match(row, /F7 .*94%/s, '7d_oi (94%) shown, not the first-inserted window (11%)');
+  assert.doesNotMatch(row, /11%/);
 });
 
-test('an unmeasured Fable window renders an empty Fbl bar; API-key rows pad the slot', () => {
+test('unmeasured OAuth rows retain Ses/Wk while API-key rows use Tok/Req without family padding', () => {
   const am = new AccountManager([
     { name: 'max-1', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
     { name: 'api-1', type: 'apikey', apiKey: 'sk-1' },
   ], 0.98, 0, 5);
   const tui = new TUI({ accountManager: am, config: { accounts: [] }, saveConfig: async () => {}, syncAccounts: async () => 0, onQuit: () => {} });
 
-  const oauthRow = stripAnsi(tui._renderAcct(am.accounts[0], 0, 10, true, true));
-  assert.match(oauthRow, /Fbl/, 'OAuth row always shows the Fbl label (with "-" until measured)');
+  const oauthRow = stripAnsi(tui._renderAcct(0, 10, true, [], [], {}, true));
+  assert.match(oauthRow, /Ses .*Wk /s);
+  assert.doesNotMatch(oauthRow, /F7|Tok |Req /, 'unmeasured family bars are omitted');
 
-  const apiRow = stripAnsi(tui._renderAcct(am.accounts[1], 1, 10, true, true));
-  assert.doesNotMatch(apiRow, /Fbl/, 'API-key accounts have no Fable window');
-  assert.equal(oauthRow.length, apiRow.length, 'slot padded so columns stay aligned');
+  const apiRow = stripAnsi(tui._renderAcct(1, 10, true, [], [], {}, true));
+  assert.match(apiRow, /Tok .*Req /s);
+  assert.doesNotMatch(apiRow, /F7|Ses |Wk /, 'API-key accounts have their own category budget');
 });
 
 // ── Reload (R) re-measures quota, not just accounts ──────────────────────────

@@ -2,7 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   accountId, accountIdKey, createIdentityRegistry, digestAccountId, parseAccountIdKey,
-  IdentityAmbiguityError, orgKey, sameIdentity, emailOf, matchAccounts,
+  IdentityAmbiguityError, orgKey, sameOrg, sameIdentity, emailOf, matchAccounts,
+  findUpsertTarget, updateAccountEntry, distinctAccounts, canUpsertOAuthAccount, oauthIdentityFields,
 } from '../src/identity.js';
 import { accountIdDigest, configIdentityDigest, identityTupleDigest } from '../src/config.js';
 
@@ -125,4 +126,203 @@ test('matchAccounts: unique email needs no org', () => {
 
 test('matchAccounts: no match returns empty', () => {
   assert.equal(matchAccounts(ACCTS, 'nobody@z.com').length, 0);
+});
+
+// The failure this guards against: one person, two organizations. Both entries
+// are auto-named from the same email, so a name match is not evidence that the
+// incoming login is the same account — and taking it as such overwrites the
+// other org's entry. The account disappears from the config while the running
+// server still holds it in memory, so the loss only becomes visible at the next
+// restart, far from the login that caused it.
+test('findUpsertTarget: a second org of the same person is a NEW entry, not an overwrite', () => {
+  const accounts = [
+    { name: 'a@x.com', accountUuid: 'u1', orgUuid: 'o-personal', orgName: 'Personal' },
+  ];
+  const incoming = { name: 'a@x.com', accountUuid: 'u1', orgUuid: 'o-acme', orgName: 'Acme' };
+  assert.equal(findUpsertTarget(accounts, incoming), -1);
+});
+
+test('findUpsertTarget: the same account+org updates in place', () => {
+  const accounts = [
+    { name: 'a@x.com (Personal)', accountUuid: 'u1', orgUuid: 'o-personal' },
+    { name: 'a@x.com (Acme)', accountUuid: 'u1', orgUuid: 'o-acme' },
+  ];
+  assert.equal(findUpsertTarget(accounts, { name: 'a@x.com', accountUuid: 'u1', orgUuid: 'o-acme' }), 1);
+});
+
+// A legacy entry predating stored org UUIDs must still be backfilled rather than
+// duplicated — "org unknown" means cannot tell, not different.
+test('findUpsertTarget: an entry with no org backfills instead of duplicating', () => {
+  const accounts = [{ name: 'a@x.com', accountUuid: 'u1' }];
+  assert.equal(findUpsertTarget(accounts, { name: 'a@x.com', accountUuid: 'u1', orgUuid: 'o-acme' }), 0);
+});
+
+test('findUpsertTarget: matches by name when neither side carries a UUID', () => {
+  const accounts = [{ name: 'a@x.com' }];
+  assert.equal(findUpsertTarget(accounts, { name: 'a@x.com', accountUuid: null }), 0);
+});
+
+// Two different people whose entries somehow share a display name must not
+// collapse into one either.
+test('findUpsertTarget: a different person with the same name is a new entry', () => {
+  const accounts = [{ name: 'shared', accountUuid: 'u1', orgUuid: 'o1' }];
+  assert.equal(findUpsertTarget(accounts, { name: 'shared', accountUuid: 'u2', orgUuid: 'o2' }), -1);
+});
+
+test('distinctAccounts: unknown identity on either side is never "different"', () => {
+  assert.equal(distinctAccounts({ name: 'a' }, { name: 'a', accountUuid: 'u1' }), false);
+  assert.equal(distinctAccounts({ accountUuid: 'u1' }, { accountUuid: 'u1', orgUuid: 'o1' }), false);
+  assert.equal(distinctAccounts({ accountUuid: 'u1', orgUuid: 'o1' }, { accountUuid: 'u1', orgUuid: 'o2' }), true);
+});
+
+test('anonymous OAuth upsert requires an identifiable profile', () => {
+  assert.equal(canUpsertOAuthAccount(null, false), false);
+  assert.equal(canUpsertOAuthAccount({ error: 'expired token' }, false), false);
+  assert.equal(canUpsertOAuthAccount({}, false), false);
+  assert.equal(canUpsertOAuthAccount({ email: 'account@example.com' }, false), true);
+  assert.equal(canUpsertOAuthAccount({ accountUuid: 'account-uuid' }, false), true);
+});
+
+test('explicitly named OAuth upsert remains available without a profile', () => {
+  assert.equal(canUpsertOAuthAccount(null, true), true);
+  assert.equal(canUpsertOAuthAccount({ error: 'offline' }, true), true);
+});
+
+test('unavailable profile fields do not erase stored OAuth identity', () => {
+  const stored = { accountUuid: 'account-uuid', orgUuid: 'org-uuid', orgName: 'Example' };
+
+  assert.deepEqual({ ...stored, ...oauthIdentityFields({ error: 'offline' }) }, stored);
+  assert.deepEqual({ ...stored, ...oauthIdentityFields({ email: 'account@example.com' }) }, stored);
+  assert.deepEqual(oauthIdentityFields({
+    accountUuid: 'new-account',
+    orgUuid: 'new-org',
+    orgName: 'New Example',
+  }), {
+    accountUuid: 'new-account',
+    orgUuid: 'new-org',
+    orgName: 'New Example',
+  });
+});
+
+// The merge applied at a findUpsertTarget hit. Both the CLI login/import path
+// and the TUI's import go through it, and the id it pins is what a running
+// server uses to find the account built from this entry: reissue it and that
+// account has no entry to be saved onto, so the next token it refreshes is
+// dropped instead of persisted, and the account fails on the following start
+// with a credential that was already rotated away.
+test('an upsert keeps the existing entry\'s id and name', () => {
+  const prev = { id: 'entry-0', name: 'chosen-name', type: 'oauth', accessToken: 'old', importFrom: '~/creds.json' };
+  const incoming = { name: 'profile@example.com', type: 'oauth', accessToken: 'fresh', accountUuid: 'u1' };
+
+  const merged = updateAccountEntry(prev, incoming);
+
+  assert.equal(merged.id, 'entry-0');
+  assert.equal(merged.name, 'chosen-name');
+  assert.equal(merged.accessToken, 'fresh', 'the credential is what an upsert is for');
+  assert.equal(merged.accountUuid, 'u1', 'and freshly learned identity lands too');
+  assert.equal(merged.importFrom, '~/creds.json', 'a disk-only field survives');
+});
+
+test('an upsert keeps the existing id even when the incoming record carries one', () => {
+  const merged = updateAccountEntry({ id: 'entry-0', name: 'a' }, { id: 'minted-elsewhere', name: 'a' });
+  assert.equal(merged.id, 'entry-0');
+});
+
+// A UUID match is evidence; a name match is a guess. sameIdentity makes both in
+// one pass, so a namesake entry carrying no UUID used to win purely by sitting
+// earlier in the list — and the incoming credential landed on it (#236).
+test('findUpsertTarget prefers the UUID match over an earlier namesake', () => {
+  const accounts = [
+    { name: 'a@x.com' },                                  // hand-added, no UUID
+    { name: 'a@x.com', accountUuid: 'u1', orgUuid: 'o1' }, // the real one
+  ];
+  assert.equal(findUpsertTarget(accounts, { name: 'a@x.com', accountUuid: 'u1', orgUuid: 'o1' }), 1);
+});
+
+test('findUpsertTarget still backfills a namesake when nothing contradicts it', () => {
+  // No UUID anywhere else to prefer, so the bare name match remains the answer —
+  // this is the legacy-entry backfill, which must keep working.
+  const accounts = [{ name: 'a@x.com' }];
+  assert.equal(findUpsertTarget(accounts, { name: 'a@x.com', accountUuid: 'u1', orgUuid: 'o1' }), 0);
+});
+
+test('findUpsertTarget does not let a UUID match cross organizations', () => {
+  const accounts = [
+    { name: 'a@x.com', accountUuid: 'u1', orgUuid: 'o-personal' },
+    { name: 'a@x.com', accountUuid: 'u1', orgUuid: 'o-acme' },
+  ];
+  assert.equal(findUpsertTarget(accounts, { name: 'a@x.com', accountUuid: 'u1', orgUuid: 'o-acme' }), 1);
+});
+
+// Which org field a record carries depends on what the profile returned when
+// the account was added, so the uuid form and the name form of one organization
+// are both in circulation. Keyed through orgKey they compared unequal, and on
+// the config-to-disk axis neither record claimed the other's row, so the row
+// was carried over and the account appeared twice after an upgrade (#328).
+test('sameOrg: incomparable org evidence does not imply canonical equality', () => {
+  const byUuid = { accountUuid: 'u1', orgUuid: 'O' };
+  const byName = { accountUuid: 'u1', orgName: 'Acme' };
+  assert.equal(sameOrg(byUuid, byName), null, 'a uuid against a name is no evidence either way');
+  assert.equal(sameIdentity(byUuid, byName), false, 'canonical identity cannot guess an org backfill');
+  assert.equal(distinctAccounts(byUuid, byName), false);
+});
+
+test('sameOrg: the uuid decides when both sides carry one, the name only when they do not', () => {
+  assert.equal(sameOrg({ orgUuid: 'O', orgName: 'Acme' }, { orgUuid: 'O', orgName: 'Acme Renamed' }), true);
+  assert.equal(sameOrg({ orgUuid: 'O1', orgName: 'Acme' }, { orgUuid: 'O2', orgName: 'Acme' }), false);
+  assert.equal(sameOrg({ orgUuid: 'O', orgName: 'Acme' }, { orgName: 'Acme' }), true);
+  assert.equal(sameOrg({ orgUuid: 'O', orgName: 'Acme' }, { orgName: 'Other' }), false);
+  assert.equal(sameOrg({}, { orgUuid: 'O' }), null);
+  assert.equal(sameOrg(null, undefined), null);
+});
+
+// findUpsertTarget's uuid pass takes sameIdentity's tolerant answer, which says
+// yes to an entry that never stored an organization — so a legacy entry sitting
+// earlier in the list won over the one whose organization actually matched, and
+// a login for a known organization landed its credential on the legacy row
+// (#327).
+test('findUpsertTarget prefers the entry whose organization matches over an earlier legacy entry', () => {
+  const accounts = [
+    { name: 'a@x.com', accountUuid: 'u1' },                 // no org stored: hand-added, or never probed
+    { name: 'a@x.com', accountUuid: 'u1', orgUuid: 'o2' },  // the one this login is for
+  ];
+  assert.equal(findUpsertTarget(accounts, { name: 'a@x.com', accountUuid: 'u1', orgUuid: 'o2' }), 1);
+  // The same organization under its name form is still the exact match.
+  const named = [
+    { name: 'a@x.com', accountUuid: 'u1' },
+    { name: 'a@x.com', accountUuid: 'u1', orgName: 'Acme' },
+  ];
+  assert.equal(findUpsertTarget(named, { name: 'a@x.com', accountUuid: 'u1', orgName: 'Acme' }), 1);
+});
+
+test('findUpsertTarget still backfills the legacy entry when no entry names the organization', () => {
+  const accounts = [
+    { name: 'a@x.com', accountUuid: 'u1' },
+    { name: 'a@x.com', accountUuid: 'u1', orgUuid: 'o-other' },
+  ];
+  assert.equal(findUpsertTarget(accounts, { name: 'a@x.com', accountUuid: 'u1', orgUuid: 'o2' }), 0);
+});
+
+test('findUpsertTarget still adds a genuinely new account', () => {
+  const accounts = [{ name: 'a@x.com', accountUuid: 'u1', orgUuid: 'o1' }];
+  assert.equal(findUpsertTarget(accounts, { name: 'b@x.com', accountUuid: 'u2', orgUuid: 'o2' }), -1);
+});
+
+// findConfigAccount used to take the first sameIdentity hit, and sameIdentity
+// compares organization only when both records carry one — so for one person
+// holding accounts in two orgs, both rows matched and a refreshed token was
+// written to whichever came first, recording one account's refresh-token family
+// against another account's row (#203). The entry id is exact.
+test('a token write resolves the right row for one person in two orgs', async () => {
+  const { AccountManager } = await import('../src/account-manager.js');
+  const rows = [
+    { id: 'i-personal', name: 'a@x.com', type: 'oauth', accountUuid: 'u1', orgUuid: 'o-personal', accessToken: 'p' },
+    { id: 'i-acme', name: 'a@x.com', type: 'oauth', accountUuid: 'u1', orgUuid: 'o-acme', accessToken: 'a' },
+  ];
+  const am = new AccountManager(rows, 0.98);
+  const acme = am.accounts.find(a => a.orgUuid === 'o-acme');
+  assert.equal(acme.id, 'i-acme', 'the account must carry its entry id');
+  // The row the write should land on is the one whose id matches, not the first
+  // identity match (which would be the personal row).
+  assert.equal(rows.findIndex(r => r.id === acme.id), 1);
 });

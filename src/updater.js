@@ -10,16 +10,23 @@
 // Every side-effecting dependency (fetch, spawn, the clock, the cache path) is
 // injectable so the logic is unit-testable without network or npm.
 
-import { spawnSync } from 'node:child_process';
+import { spawn, execFile } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { readFile, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
+import { promisify } from 'node:util';
 import { getConfigPath } from './config.js';
+import { safeLine } from './safe-text.js';
 
 export const PKG_NAME = '@karpeleslab/teamclaude';
 const REGISTRY = 'https://registry.npmjs.org';
 const DAY_MS = 24 * 60 * 60 * 1000;
+// Wide enough for `v1.2.3-rc.1+build`, narrow enough that a tag cannot be the
+// reason a fixed-width caller has no room left.
+const LABEL_MAX = 32;
+
+const pexec = promisify(execFile);
 
 /** Package root = one directory above this file's src/ directory. */
 function packageRoot() {
@@ -35,9 +42,45 @@ export function currentVersion(root = packageRoot()) {
   }
 }
 
-/** Numeric compare of x.y.z (prerelease/build suffix ignored). >0 if a is newer. */
+/**
+ * How the running copy identifies itself, for display: the exact tag when the
+ * checkout sits on one, else the short sha, else the shipped package.json
+ * version, else the literal `local`. `git` reports a checkout — npm cannot
+ * update one, so nothing should offer to.
+ *
+ * The git calls are pinned to the package root. `teamclaude server` is started
+ * from the operator's own project directory, and resolving against the process
+ * cwd would report that repository's sha as this package's version.
+ *
+ * @param {Object} [opts]
+ * @param {string} [opts.root]
+ * @param {(file: string, args: string[], options: { cwd: string, encoding: 'utf8', timeout: number }) => Promise<{ stdout: string }>} [opts.exec]
+ * @returns {Promise<{ label: string, git: boolean }>}
+ */
+export async function resolveVersionLabel({ root = packageRoot(), exec = pexec } = {}) {
+  const git = existsSync(join(root, '.git'));
+  if (git) {
+    /** @type {{ cwd: string, encoding: 'utf8', timeout: number }} */
+    const opts = { cwd: root, encoding: 'utf8', timeout: 2000 };
+    const probes = [['describe', '--tags', '--exact-match', 'HEAD'], ['rev-parse', '--short', 'HEAD']];
+    for (const args of probes) {
+      try {
+        const label = safeLine((await exec('git', args, opts)).stdout, LABEL_MAX);
+        if (label) return { label, git };
+      } catch { /* not on a tag, a shallow or broken checkout, or no git binary */ }
+    }
+  }
+  return { label: safeLine(currentVersion(root) || 'local', LABEL_MAX), git };
+}
+
+/**
+ * Numeric compare of x.y.z (prerelease/build suffix ignored). >0 if a is newer.
+ *
+ * @param {string} a
+ * @param {string} b
+ */
 export function compareVersions(a, b) {
-  const nums = (v) => String(v).split('+')[0].split('-')[0].split('.').map((n) => parseInt(n, 10) || 0);
+  const nums = (/** @type {string} */ v) => String(v).split('+')[0].split('-')[0].split('.').map((n) => parseInt(n, 10) || 0);
   const pa = nums(a), pb = nums(b);
   for (let i = 0; i < 3; i++) {
     const d = (pa[i] || 0) - (pb[i] || 0);
@@ -46,21 +89,29 @@ export function compareVersions(a, b) {
   return 0;
 }
 
-/** `npm root -g` (the global modules dir), or null if npm is unavailable. */
+/**
+ * `npm root -g` (the global modules dir), or null if npm is unavailable.
+ *
+ * Asynchronous on purpose: this runs inside the headless server, and npm takes
+ * up to a second or two to answer. A synchronous spawn parked the event loop
+ * for that long, with every client connection waiting behind it.
+ */
 function npmGlobalRoot() {
-  try {
-    const r = spawnSync('npm', ['root', '-g'], { encoding: 'utf8', timeout: 5000 });
-    if (r.status === 0 && r.stdout) return r.stdout.trim();
-  } catch { /* npm missing */ }
-  return null;
+  return new Promise((resolve) => {
+    try {
+      execFile('npm', ['root', '-g'], { encoding: 'utf8', timeout: 5000 }, (err, stdout) => {
+        resolve(!err && stdout ? stdout.trim() : null);
+      });
+    } catch { resolve(null); } // npm missing
+  });
 }
 
 /** How this copy was installed: 'git', 'global', 'local', or 'unknown'. */
-export function installKind({ root = packageRoot(), globalRoot = npmGlobalRoot } = {}) {
+export async function installKind({ root = packageRoot(), globalRoot = npmGlobalRoot } = {}) {
   if (existsSync(join(root, '.git'))) return 'git';
   const norm = root.split('\\').join('/');
   if (!norm.includes('/node_modules/')) return 'unknown';
-  const g = typeof globalRoot === 'function' ? globalRoot() : globalRoot;
+  const g = await (typeof globalRoot === 'function' ? globalRoot() : globalRoot);
   if (g && norm.startsWith(g.split('\\').join('/'))) return 'global';
   return 'local';
 }
@@ -87,9 +138,16 @@ export async function fetchLatestVersion({ fetchImpl = fetch, timeoutMs = 5000 }
 function defaultCacheFile() {
   return join(dirname(getConfigPath()), 'update-check.json');
 }
+/**
+ * @param {string} path
+ */
 async function readCache(path) {
   try { return JSON.parse(await readFile(path, 'utf8')); } catch { return {}; }
 }
+/**
+ * @param {string} path
+ * @param {object} obj
+ */
 async function writeCache(path, obj) {
   try { await writeFile(path, JSON.stringify(obj)); } catch { /* best effort */ }
 }
@@ -121,14 +179,71 @@ export async function checkForUpdate({
   return { current, latest, updateAvailable: compareVersions(latest, current) > 0 };
 }
 
-/** Install a specific version globally. Returns true on success. */
-export function runUpdate(version = 'latest', { spawnImpl = spawnSync } = {}) {
-  const r = spawnImpl('npm', ['install', '-g', `${PKG_NAME}@${version}`], {
-    stdio: 'inherit',
-    timeout: 180000,
-  });
-  return !!r && !r.error && r.status === 0;
+/**
+ * Whether the last recorded check saw a newer release. Cache only — never the
+ * registry — so a caller on a render or status path costs nothing. Like
+ * `checkForUpdate`, the cached `latest` is used regardless of its age.
+ *
+ * @param {Object} [opts]
+ * @param {string|null} [opts.current]
+ * @param {string} [opts.cachePath]
+ * @returns {Promise<boolean>}
+ */
+export async function updateAvailableFromCache({ current = currentVersion(), cachePath = defaultCacheFile() } = {}) {
+  if (!current) return false;
+  const { latest } = await readCache(cachePath);
+  return !!latest && compareVersions(latest, current) > 0;
 }
+
+/**
+ * Whether `v` is a plain release version, the only shape we ever pass to npm.
+ *
+ * The registry's `dist-tags.latest` is a string from the network, and
+ * compareVersions is lenient by design (it parses what it can), so a value like
+ * "99.0.0 || npm:evil" reads as newer and would go straight into
+ * `npm install -g <name>@<value>`. Only x.y.z is installed; anything else is
+ * reported and skipped.
+ * @param {unknown} v
+ */
+export function isReleaseVersion(v) {
+  return /^\d+\.\d+\.\d+$/.test(String(v));
+}
+
+/**
+ * Install a specific version globally. Resolves true on success. `version` must
+ * be a release version (or the literal `latest`), or nothing is spawned.
+ *
+ * The install is a child process the event loop keeps running beside, never a
+ * synchronous wait. `autoUpdate` runs this inside `server --headless`, the one
+ * process every client depends on: a synchronous `npm install -g` blocked it
+ * for the whole install, so the proxy accepted no connections, `teamclaude
+ * status` timed out and `teamclaude run` refused to launch — unattended, on
+ * whichever day the daily check found a new version (#353). The result only
+ * matters for the log line, and the new version applies on the next start
+ * regardless, so nothing is gained by waiting inline.
+ *
+ * `spawnImpl` is injectable and must return a ChildProcess-shaped emitter
+ * ('exit' with a code, or 'error').
+ */
+export function runUpdate(version = 'latest', { spawnImpl = spawn } = {}) {
+  if (version !== 'latest' && !isReleaseVersion(version)) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawnImpl('npm', ['install', '-g', `${PKG_NAME}@${version}`], {
+        stdio: 'inherit',
+        timeout: 180000,
+      });
+    } catch { resolve(false); return; }
+    if (!child || typeof child.once !== 'function') { resolve(false); return; }
+    child.once('error', () => resolve(false));
+    child.once('exit', (code) => resolve(code === 0));
+  });
+}
+
+// The root warning is printed once per process: autoUpdate runs at startup and
+// again at session end, and a daemon would otherwise say it every day.
+let rootWarned = false;
 
 /**
  * The automatic path used at startup / session-end. Skips dev checkouts and
@@ -136,23 +251,53 @@ export function runUpdate(version = 'latest', { spawnImpl = spawnSync } = {}) {
  * global install, or just prints a one-line notice otherwise. Cheap in the
  * common case: the expensive `npm root -g` probe only runs when an update is
  * actually available.
+ *
+ * Never runs as root. `sudo teamclaude server` would otherwise run
+ * `npm install -g` as root on a daily schedule, off a version string fetched
+ * from the network — the operator can run `teamclaude update` deliberately.
+ *
+ * `root`, `uid`, `check`, `kind` and `install` are injectable for tests.
+ *
+ * @param {Object} [opts]
+ * @param {{ autoUpdate?: boolean }} [opts.config]
+ * @param {boolean} [opts.force]
+ * @param {(line: string) => void} [opts.log]
+ * @param {string} [opts.root]
+ * @param {number|undefined} [opts.uid]
+ * @param {Function} [opts.check]
+ * @param {Function} [opts.kind]
+ * @param {Function} [opts.install]
  */
-export async function autoUpdate({ config = {}, force = false, log = console.error } = {}) {
-  const root = packageRoot();
+export async function autoUpdate({
+  config = {}, force = false, log = console.error,
+  root = packageRoot(), uid = process.getuid?.(),
+  check = checkForUpdate, kind = installKind, install = runUpdate,
+} = {}) {
   if (existsSync(join(root, '.git'))) return { skipped: 'git' }; // dev checkout — never touch
   if (process.env.TEAMCLAUDE_DISABLE_AUTOUPDATE || config.autoUpdate === false) {
     return { skipped: 'disabled' };
   }
-  const info = await checkForUpdate({ force });
+  if (uid === 0) {
+    if (!rootWarned) {
+      rootWarned = true;
+      log('[TeamClaude] Auto-update is disabled when running as root. Update deliberately with: teamclaude update');
+    }
+    return { skipped: 'root' };
+  }
+  const info = await check({ force });
   if (!info) return { skipped: 'check-failed' };
   if (!info.updateAvailable) return { ...info, upToDate: true };
+  if (!isReleaseVersion(info.latest)) {
+    log(`[TeamClaude] Ignoring registry "latest" that is not a release version: ${JSON.stringify(String(info.latest)).slice(0, 80)}`);
+    return { ...info, skipped: 'bad-version' };
+  }
 
-  if (installKind({ root }) !== 'global') {
+  if (await kind({ root }) !== 'global') {
     log(`[TeamClaude] Update available: ${info.current} → ${info.latest}. Run: teamclaude update`);
     return { ...info, notified: true };
   }
   log(`[TeamClaude] Updating ${info.current} → ${info.latest}…`);
-  const ok = runUpdate(info.latest);
+  const ok = await install(info.latest);
   log(ok
     ? `[TeamClaude] Updated to ${info.latest}. Restart teamclaude to use the new version.`
     : `[TeamClaude] Auto-update failed. Run manually: npm install -g ${PKG_NAME}@latest`);

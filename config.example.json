@@ -1,7 +1,16 @@
 {
   "proxy": {
     "port": 3456,
-    "apiKey": "tc-change-me-to-a-secret"
+    "apiKey": "tc-change-me-to-a-secret",
+    "clientKeys": [
+      { "name": "alice", "key": "tc-alice-own-secret" },
+      { "name": "bob", "key": "tc-bob-own-secret" }
+    ],
+    "usageDimensions": [
+      { "name": "project", "header": "x-teamclaude-project" },
+      { "name": "ref", "header": "x-teamclaude-ref" }
+    ],
+    "sessionDetail": false
   },
   "upstream": "https://api.anthropic.com",
   "overloadFallbackModel": null,
@@ -19,6 +28,12 @@
   "sx": {
     "apiKey": "your-sx-org-api-key",
     "mode": "429"
+  },
+  "distributeSessions": false,
+  "expiryRouting": {
+    "enabled": false,
+    "tolerance": 1.5,
+    "preempt": true
   },
   "accounts": [
     {
@@ -39,6 +54,12 @@
       "priority": 2
     },
     {
+      "name": "codex@example.com",
+      "type": "oauth",
+      "provider": "codex",
+      "priority": 0
+    },
+    {
       "name": "api-fallback",
       "type": "apikey",
       "priority": 10,
@@ -53,5 +74,12 @@
       "accounts": ["primary-max"],
       "color": "magenta"
     }
-  ]
+  ],
+  "upstreamProxy": "http://proxy.corp.example:3128",
+  "egress": {
+    "pin": "auto",
+    "checkUrl": "https://api.ipify.org",
+    "ttlSeconds": 30,
+    "holdSeconds": 120
+  }
 }

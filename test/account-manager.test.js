@@ -154,6 +154,51 @@ test('reevalIntervalMs <= 0 disables periodic re-prioritization (stays sticky)',
   assert.equal(am.getActiveAccount().name, 'acct-1');
 });
 
+test('real model traffic periodically spends the soonest weekly then session window', () => {
+  const am = new AccountManager(makeAccounts(2), 0.98, { reevalIntervalMs: 5 * MIN });
+  const now = Date.now();
+  const context = { model: 'claude-opus-5', sessionId: 'conversation' };
+  setSession(am, 0, 0.2, MIN, now);
+  setSession(am, 1, 0.2, HOUR, now);
+  setWeekly(am, 0, 0.2, 6 * 24 * HOUR, now);
+  setWeekly(am, 1, 0.2, 24 * HOUR, now);
+
+  assert.equal(am.getActiveAccount(null, context), am.accounts[1]);
+  assert.equal(am.currentIndex, 1);
+  // A manual same-priority preference gets a full reevaluation interval.
+  am.setCurrentAccount(0);
+  assert.equal(am.getActiveAccount(null, context), am.accounts[0]);
+  am.lastEvalAt = now - 6 * MIN;
+  assert.equal(am.getActiveAccount(null, context), am.accounts[1]);
+  // Once weekly windows tie, the earlier session reset decides.
+  setWeekly(am, 0, 0.2, 24 * HOUR, now);
+  assert.equal(am.getActiveAccount(null, context), am.accounts[1]);
+  am.lastEvalAt = now - 6 * MIN;
+  assert.equal(am.getActiveAccount(null, context), am.accounts[0]);
+});
+
+test('a due reevaluation on a diverted family leaves the shared cursor untouched', () => {
+  const am = new AccountManager(makeAccounts(2), 0.98, { reevalIntervalMs: 5 * MIN });
+  const now = Date.now();
+  setWeekly(am, 0, 0.2, 6 * 24 * HOUR, now);
+  setWeekly(am, 1, 0.2, 24 * HOUR, now);
+  am.accounts[0].quota.unified7dFable = 0.99;
+  am.accounts[0].quota.unified7dFableReset = now + HOUR;
+  am.accounts[0].quota.unified7dFableSeenAt = now;
+  am.lastEvalAt = now - 6 * MIN;
+  assert.equal(am.getActiveAccount(null, 'claude-fable-5'), am.accounts[1]);
+  assert.equal(am.currentIndex, 0);
+  assert.equal(am.getActiveAccount(null, 'claude-fable-5'), am.accounts[1]);
+  assert.equal(am.currentIndex, 0);
+});
+
+test('a disabled periodic timer keeps real model traffic sticky', () => {
+  const am = new AccountManager(makeAccounts(2), 0.98, { reevalIntervalMs: 0 });
+  setWeekly(am, 0, 0.2, 6 * 24 * HOUR);
+  setWeekly(am, 1, 0.2, 24 * HOUR);
+  assert.equal(am.getActiveAccount(null, 'claude-opus-5'), am.accounts[0]);
+});
+
 test('immediate switch when current hits threshold, picking by priority', () => {
   const am = new AccountManager(makeAccounts(3), 0.98, 5 * MIN);
   setSession(am, 0, 0.10, 4 * HOUR);
@@ -545,9 +590,22 @@ test('quota observations use newest field evidence and response wins equal-time 
     assert.equal(account.quota.unified5hReset, 30_000);
 
     now += 1;
+    am.updateQuota(account, {
+      'anthropic-ratelimit-unified-5h-utilization': '0.6',
+      'anthropic-ratelimit-unified-5h-reset': 'invalid',
+    });
+    assert.equal(account.quota.unified5h, 0.6);
+    assert.equal(account.quota.unified5hReset, 30_000, 'malformed reset is not evidence of an absent window');
+
+    now += 1;
     am.updateQuota(account, { 'anthropic-ratelimit-unified-5h-utilization': '0.4' });
     assert.equal(account.quota.unified5h, 0.4, 'newer utilization wins');
     assert.equal(account.quota.unified5hReset, null, 'new event never inherits an older reset');
+    assert.equal(account.quota.observations['5h'].utilization.expiresAt, null);
+    now -= 1;
+    am.applyUsageData(account, { fiveHour: { utilization: 0.9, resetAt: 40_000 } });
+    assert.equal(account.quota.unified5h, 0.4, 'older probe cannot replace newer response evidence');
+    assert.equal(account.quota.unified5hReset, null, 'older probe cannot resurrect a cleared reset');
   } finally {
     Date.now = originalNow;
   }

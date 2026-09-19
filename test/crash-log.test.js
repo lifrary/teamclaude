@@ -5,6 +5,52 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createCrashReporter, installCrashHandlers } from '../src/crash-log.js';
 import { getCrashLogPath } from '../src/config.js';
+import { execFile } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+
+const CRASH_LOG = fileURLToPath(new URL('../src/crash-log.js', import.meta.url));
+
+function crashIn(dir, source) {
+  const path = join(dir, 'crash.log');
+  return new Promise(resolve => {
+    execFile(process.execPath, ['--input-type=module', '--eval',
+      `import { installCrashHandlers } from ${JSON.stringify(CRASH_LOG)};
+       installCrashHandlers(${JSON.stringify(path)});
+       ${source}`], async (err, _stdout, stderr) => {
+      const logged = await readFile(path, 'utf-8').catch(() => '');
+      resolve({ code: err?.code ?? 0, stderr, logged });
+    });
+  });
+}
+
+test('an uncaught exception is recorded before the process dies', async () => {
+  await withTempDir(async dir => {
+    const { code, stderr, logged } = await crashIn(dir, 'setTimeout(() => { throw new Error("boom"); }, 0);');
+    assert.equal(code, 1);
+    assert.match(logged, /uncaughtException/);
+    assert.match(logged, /Error: boom/);
+    assert.match(logged, /at /);
+    assert.match(stderr, /Error: boom/);
+  });
+});
+
+test('an unhandled rejection is recorded too', async () => {
+  await withTempDir(async dir => {
+    const { code, logged } = await crashIn(dir, 'Promise.reject(new Error("nope"));');
+    assert.equal(code, 1);
+    assert.match(logged, /unhandledRejection/);
+    assert.match(logged, /Error: nope/);
+  });
+});
+
+test('separate process crashes append rather than overwrite', async () => {
+  await withTempDir(async dir => {
+    await crashIn(dir, 'throw new Error("first");');
+    const { logged } = await crashIn(dir, 'throw new Error("second");');
+    assert.match(logged, /Error: first/);
+    assert.match(logged, /Error: second/);
+  });
+});
 
 // A sink that records what would have gone to stderr, so a test can assert the
 // crash is still reported there even when the file write fails.
