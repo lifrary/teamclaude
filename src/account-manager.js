@@ -3981,9 +3981,9 @@ export class AccountManager {
         // that failed while e.g. the network was down): the refresh succeeding
         // is exactly the thing that failed, so the account rejoins rotation
         // without a proxy restart. An error set by the REQUEST path (upstream
-        // 401 despite a fresh token, non-transient send failure — see server.js)
-        // is NOT cleared here: the token endpoint accepting a rotation does not
-        // prove the API accepts the account, and blanket-reviving it would flap
+        // 401 despite a fresh token — see server.js) is NOT cleared here: the
+        // token endpoint accepting a rotation does not prove the API accepts
+        // the account, and blanket-reviving it would flap
         // it back into rotation to fail real client requests every sweep. Those
         // heal only via new credentials (updateAccountTokens) or a restart.
         if (account.status === 'error' && account._errorFromRefresh) {
@@ -4011,8 +4011,8 @@ export class AccountManager {
         // is what kept accounts wrongly "errored" after a momentary blip.
         // Either park is tagged refresh-caused so the keep-alive sweep revives
         // it the moment a refresh succeeds — but only on the TRANSITION: if the
-        // account was already 'error' from the request path (upstream 401 /
-        // send failure), a later failed sweep refresh must not relabel it, or
+        // account was already 'error' from the request path (upstream 401),
+        // a later failed sweep refresh must not relabel it, or
         // the next successful refresh would wrongly revive a rejected account.
         const isAuthRejection = err.status === 400 || err.status === 401 || err.status === 403;
         // isTokenExpired normalizes seconds-vs-milliseconds; a raw comparison

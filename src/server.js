@@ -89,6 +89,7 @@ import { classificationPath } from './classification-path.js';
  * @property {Set<ManagedAccount>} tried429
  * @property {Set<ManagedAccount>} tried5xx
  * @property {Set<ManagedAccount>} tried403
+ * @property {Set<ManagedAccount>} triedSend
  * @property {number} overloadRetries
  * @property {ManagedAccount|null} held
  * @property {number} queueTimeoutMs
@@ -273,6 +274,7 @@ function createLiveRequestContext(req, body, {
     tried429: new Set(),
     tried5xx: new Set(),
     tried403: new Set(),
+    triedSend: new Set(),
     overloadRetries: 0,
     held: null,
     queueTimeoutMs,
@@ -2743,11 +2745,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   ctx.logMaxBodyBytes ??= DEFAULT_LOG_MAX_BODY_BYTES;
   if (ctx.useSx == null) ctx.useSx = ctx.transport?.sx?.useByDefault?.() === true;
 
-  // Select account. On a failover retry (a prior account 429'd / 5xx'd / 403'd for
-  // this request) ctx.tried* is non-empty → pick a different account, skipping the
-  // ones already tried.
-  const excludeForSelect = (ctx.tried429.size || ctx.tried5xx.size || ctx.tried403.size)
-    ? new Set([...ctx.tried429, ...ctx.tried5xx, ...ctx.tried403, ...(ctx.detour ? ctx.rolledOff || [] : [])])
+  // Select account. On a failover retry (a prior account 429'd / 5xx'd / 403'd /
+  // failed to send for this request) ctx.tried* is non-empty → pick a different
+  // account, skipping the ones already tried.
+  const excludeForSelect = (ctx.tried429.size || ctx.tried5xx.size || ctx.tried403.size || ctx.triedSend.size)
+    ? new Set([...ctx.tried429, ...ctx.tried5xx, ...ctx.tried403, ...ctx.triedSend,
+      ...(ctx.detour ? ctx.rolledOff || [] : [])])
     : null;
   const restingGen = ctx.held != null ? ctx.restingGen
     : !ctx.pinnedAccount && !ctx.detour
@@ -3687,20 +3690,17 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     }
 
     if (retryCount < maxRetries && !res.headersSent) {
-      // Same cause-tagging as the 401 path: a non-transient SEND failure is not
-      // a refresh failure, so the token sweep must not auto-revive it. Only tag
-      // on the transition, preserving an earlier refresh-caused label.
-      // Deliberately NO valid-token demotion here (unlike the 401 path): a send
-      // failure is a transport observation, not deterministic account-level
-      // rejection evidence, so it must not permanently park an account whose
-      // only proven defect was a failed refresh. If the sweep later revives it
-      // and the transport problem persists, the first real request re-parks it
-      // — this time labeled send-caused (the transition above fires from
-      // 'active') — so mislabeling self-corrects in at most one bounded flap,
-      // whereas demoting would trade that for permanent in-run capacity loss.
-      if (account.status !== 'error') account._errorFromRefresh = false;
-      account.status = 'error';
-      releaseHeld(); // this account errored; fail over to another
+      // A thrown send failure is a transport observation, not evidence against
+      // the account: a bad credential comes back as a 401 RESPONSE, never a
+      // throw. So skip the account for the rest of THIS request only and fail
+      // over; it stays in rotation. Parking it in 'error' here took healthy
+      // accounts out until a restart, since nothing heals a request-path error,
+      // and a host that sleeps or changes networks can abort sockets with codes
+      // the transient set does not list (ECONNABORTED, EADDRNOTAVAIL). On
+      // 2026-09-23 that left 5 of 10 accounts parked while each still served a
+      // direct request on the token the proxy held.
+      ctx.triedSend.add(account);
+      releaseHeld(); // skip this account for this request; fail over to another
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
     }
     ctx.status = 502;
