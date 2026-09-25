@@ -1402,6 +1402,14 @@ export function relayHttpForward(req, res) {
 // fleet; the whole prefix is the fix, not a growing allowlist of sub-paths.
 const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/'];
 
+// Claude Code's connectivity check. It needs no account and spends no quota, but
+// it used to take an inference slot like any request: on 2026-09-25, with the
+// fleet's 9 slots full, 215 of 263 checks failed (164 queued until the client
+// gave up at 10s, 51 refused with a 429), and each failure tells the client its
+// network is down. Relayed to upstream as sent, so the answer still says whether
+// the API is reachable.
+const CONNECTIVITY_CHECK_PATH = '/api/hello';
+
 // Claude Code's session id is a UUID, but other clients tag sessions too, so
 // the shape is a conservative charset rather than the UUID grammar: wide enough
 // that a non-UUID client keeps its session tracking, tight enough that nothing
@@ -1585,6 +1593,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // request into a 404 that it does not return today.
       const classifiedPath = classificationPath(req.url);
       if (CLIENT_CREDENTIAL_PATHS.some((p) => classifiedPath.startsWith(p))) { await relayStream(req, res, upstream, sx); return; }
+      if (classifiedPath === CONNECTIVITY_CHECK_PATH) { await relayStream(req, res, upstream, sx); return; }
 
       // MITM-mode pin. A CONNECT carrying `Proxy-Authorization: Basic <acct>:…`
       // has no URL to hang a `/tc-acct/` prefix on — the path inside the tunnel
@@ -2651,6 +2660,48 @@ export function exhaustedMessage(accountManager, model, retryAfter) {
   return `No account can serve this request${scope}: all ${pool}${aside} are at their quota or rate limit.${when}`;
 }
 
+/**
+ * The message behind the synthetic 429 when every account that could serve the
+ * request is at its concurrency cap.
+ *
+ * It used to read `All N accounts are at their concurrency cap` with N counting
+ * every account of the provider. On 2026-09-25 a 10-account fleet had 7 accounts
+ * benched at 98-100% of their weekly quota and 3 holding 3 of 3 slots each, so
+ * the operator was told ten accounts were busy and went looking for seven idle
+ * ones that did not exist. Counts only the accounts that can serve, names why the
+ * others cannot in the reason tokens `/teamclaude/status` publishes as
+ * `benchedReason`, and says when a full overflow queue is what refused the wait.
+ * @param {AccountManager} accountManager
+ * @param {ManagedAccount[]} accounts the provider's candidate accounts
+ * @param {{ exclude?: Set<unknown>|null, model?: string|null, advisorModel?: string|null }} context
+ * @param {number} retryAfter
+ */
+export function cappedMessage(accountManager, accounts, { exclude = null, model = null, advisorModel = null }, retryAfter) {
+  let available = 0;
+  /** @type {Map<string, number>} */
+  const others = new Map();
+  for (const account of accounts) {
+    const reason = exclude && (exclude.has(account) || exclude.has(account.index)) ? 'already tried'
+      : accountManager.unavailableReason(account, model, advisorModel);
+    if (reason == null) available++;
+    else {
+      // 'capped' is the operator's budget cap, a different thing from the
+      // concurrency cap this message is about.
+      const label = reason === 'capped' ? 'budget cap' : reason;
+      others.set(label, (others.get(label) || 0) + 1);
+    }
+  }
+  const busy = available === 1 ? 'All 1 available account is at its concurrency cap'
+    : `All ${available} available accounts are at their concurrency cap`;
+  const queue = accountManager.isQueueFull()
+    ? `, and the overflow queue is full (${accountManager.maxQueueDepth} waiting)` : '';
+  const benched = [...others.values()].reduce((sum, n) => sum + n, 0);
+  const rest = benched
+    ? `; the other ${benched} cannot serve ${model || 'this request'} (${[...others].map(([r, n]) => `${r}: ${n}`).join(', ')})`
+    : '';
+  return `${busy}${queue}${rest}. Retry in ${retryAfter}s.`;
+}
+
 // Upstream statuses that are transient and safe to retry. 500/502/503/504 may
 // differ by account or edge, so they use the fleet failover below. 529 is
 // different: it is Anthropic model capacity, not account health, and Claude Code
@@ -2946,7 +2997,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         message: ctx.tried403.size
           ? `Upstream refused ${ctx.tried403.size} of ${accts.length} accounts (${[...ctx.tried403].map(a => a.name).join(', ')}) and the rest are unavailable. Retry in ${retryAfter}s.`
           : merelyCapped
-            ? `All ${accts.length} accounts are at their concurrency cap. Retry in ${retryAfter}s.`
+            ? cappedMessage(accountManager, accts, { exclude: excludeForSelect, model: ctx.model, advisorModel: ctx.advisorModel }, retryAfter)
             : `All ${accts.length} accounts exhausted. Retry in ${retryAfter}s.`,
       },
     }));
