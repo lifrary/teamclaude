@@ -7,9 +7,10 @@ import { createProxyServer } from '../src/server.js';
 // Incident 2026-09-25: a 10-account fleet had 7 accounts benched at 98-100% of
 // their weekly quota and the other 3 holding 3 of 3 slots each. Clients were told
 // `All 10 accounts are at their concurrency cap`, so the operator went looking for
-// seven idle accounts that did not exist. In the same hour Claude Code's
-// connectivity check waited behind inference for a slot: 215 of 263 checks failed,
-// each one telling the client its network was down.
+// seven idle accounts that did not exist. In the same hours Claude Code's startup
+// preconnect (`HEAD /api/hello`, result discarded) waited behind inference for a
+// slot: 164 of 263 sat in the overflow queue until the client dropped them at 10s
+// and 51 were refused, holding queue positions real requests needed.
 
 const HOUR = 3600_000;
 
@@ -108,7 +109,7 @@ test('the concurrency-cap 429 says when the overflow queue refused the wait', as
   }
 });
 
-test('the connectivity check does not wait for an inference slot', async () => {
+test("Claude Code's startup preconnect does not wait for an inference slot", async () => {
   const seen = [];
   const upstream = okUpstream(seen);
   const upstreamPort = await listen(upstream);
@@ -131,7 +132,7 @@ test('the connectivity check does not wait for an inference slot', async () => {
 
     assert.equal(res.status, 200, 'answered by upstream, not refused or queued');
     const hello = seen.find(r => r.url === '/api/hello');
-    assert.ok(hello, 'the check reached upstream, so it still reports whether the API is reachable');
+    assert.ok(hello, 'the request reached upstream, so it still reports whether the API is reachable');
     assert.equal(hello.method, 'HEAD');
     assert.notEqual(hello.authorization, 'Bearer tok-0', 'no fleet token rides on a request that needs none');
     assert.equal(am.accounts[0].inflight, 1, 'no slot was taken');

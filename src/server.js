@@ -1402,13 +1402,15 @@ export function relayHttpForward(req, res) {
 // fleet; the whole prefix is the fix, not a growing allowlist of sub-paths.
 const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/'];
 
-// Claude Code's connectivity check. It needs no account and spends no quota, but
-// it used to take an inference slot like any request: on 2026-09-25, with the
-// fleet's 9 slots full, 215 of 263 checks failed (164 queued until the client
-// gave up at 10s, 51 refused with a 429), and each failure tells the client its
-// network is down. Relayed to upstream as sent, so the answer still says whether
-// the API is reachable.
-const CONNECTIVITY_CHECK_PATH = '/api/hello';
+// Claude Code's startup preconnect: every process sends one `HEAD /api/hello` to
+// ANTHROPIC_BASE_URL with a 10s timeout and discards the result (2.1.282; skipped
+// when HTTPS_PROXY is set, so MITM clients never send it). It needs no account and
+// spends no quota, but it used to take an inference slot like any request: on
+// 2026-09-25, with the fleet's 9 slots full, 164 of 263 sat in the overflow queue
+// until the client dropped them at 10s and 51 were refused with a 429, holding
+// queue positions real requests needed. Relayed to upstream as sent, so any other
+// client that asks this path still learns whether the API is reachable.
+const PRECONNECT_PATH = '/api/hello';
 
 // Claude Code's session id is a UUID, but other clients tag sessions too, so
 // the shape is a conservative charset rather than the UUID grammar: wide enough
@@ -1593,7 +1595,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // request into a 404 that it does not return today.
       const classifiedPath = classificationPath(req.url);
       if (CLIENT_CREDENTIAL_PATHS.some((p) => classifiedPath.startsWith(p))) { await relayStream(req, res, upstream, sx); return; }
-      if (classifiedPath === CONNECTIVITY_CHECK_PATH) { await relayStream(req, res, upstream, sx); return; }
+      if (classifiedPath === PRECONNECT_PATH) { await relayStream(req, res, upstream, sx, 'Preconnect relay'); return; }
 
       // MITM-mode pin. A CONNECT carrying `Proxy-Authorization: Basic <acct>:…`
       // has no URL to hang a `/tc-acct/` prefix on — the path inside the tunnel
@@ -2002,9 +2004,10 @@ function sxAgent(sx, targetHost) {
  * stream is a long-poll: the client keeps the request open indefinitely and
  * the upstream may withhold response headers for minutes between events. No
  * buffering, no timeout, no reconstruction — just pipe bytes both ways as they
- * arrive, exactly like a transparent proxy would.
+ * arrive, exactly like a transparent proxy would. `label` names the caller in the
+ * error log, since the preconnect relay shares this path.
  */
-function relayStream(req, res, upstream, sx) {
+function relayStream(req, res, upstream, sx, label = 'Remote Control relay') {
   const target = new URL(`${upstream}${req.url}`);
   /** @type {import('node:http').OutgoingHttpHeaders} */
   const headers = {};
@@ -2041,7 +2044,7 @@ function relayStream(req, res, upstream, sx) {
   });
 
   upstreamReq.on('error', (err) => {
-    console.error('[TeamClaude] Remote Control relay error:', describeConnectError(err));
+    console.error(`[TeamClaude] ${label} error:`, describeConnectError(err));
     if (!res.headersSent) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Upstream unreachable' } }));
