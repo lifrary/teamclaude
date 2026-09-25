@@ -676,6 +676,10 @@ async function serverCommand() {
       setImmediate(sweepTokens);
       tokenSweepInterval = setInterval(sweepTokens, tokenRefreshIntervalMs);
       tokenSweepInterval.unref?.();
+      // A refresh that failed only because the network was down (typically the
+      // first seconds after a wake) is retried within seconds, never later than
+      // the sweep itself would have.
+      accountManager.enableRefreshRetry({ maxMs: tokenRefreshIntervalMs });
     }
     // Announce an egress proxy, especially one inherited from the environment:
     // it changes where every upstream byte goes, and a value nobody typed here
@@ -770,6 +774,7 @@ async function serverCommand() {
     // teardown could rotate a refresh token upstream and lose the new one to
     // the un-awaited config write racing process.exit.
     if (tokenSweepInterval) clearInterval(tokenSweepInterval);
+    accountManager.disableRefreshRetry();
     await tokenSweepPromise;
     await Promise.all([...tokenWrites]);
     await persistQuotaState();

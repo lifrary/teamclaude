@@ -285,3 +285,99 @@ test('an account with unknown expiry is swept forced so its chain cannot silentl
   assert.equal(await am.refreshLapsedTokens(), 1, 'unknown-expiry account is selected');
   assert.deepEqual(calls, [{ name: 'a0', force: true }], 'forced — the non-forced gate never fires for null expiry');
 });
+
+// ── Transient-park retry: heal within seconds of the network coming back ────
+// After a wake from sleep the first refreshes run before Wi-Fi has reconnected,
+// and every account whose access token lapsed during the sleep is parked by the
+// failure. The sweep heals such a park, but only at its next interval: measured
+// on 2026-09-25, that benched every account with quota left for 4.5 minutes.
+
+const waitFor = async (predicate, timeoutMs = 2000) => {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) return false;
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+  return true;
+};
+
+function flakyRefresh(failures) {
+  const calls = [];
+  const fn = async () => {
+    calls.push(Date.now());
+    if (calls.length <= failures) throw new Error('fetch failed');
+    return { accessToken: 'new-at', refreshToken: 'new-rt', expiresAt: Date.now() + HOUR };
+  };
+  return { fn, calls };
+}
+
+test('a transiently parked refresh is retried on a short backoff, not at the next sweep', async () => {
+  const refresh = flakyRefresh(2);
+  const am = new AccountManager(makeAccounts(1), 0.98, { refreshFn: refresh.fn });
+  am.enableRefreshRetry({ baseMs: 10, maxMs: 40 });
+  const acct = am.accounts[0];
+  acct.expiresAt = Date.now() - HOUR;                        // lapsed during the sleep
+  try {
+    await am.ensureTokenFresh(acct);                         // the network is not back yet
+    assert.equal(acct.status, 'error', 'the failed refresh parks the expired account');
+    assert.ok(await waitFor(() => acct.status === 'active'), 'healed without waiting for a sweep');
+    assert.equal(acct.credential, 'new-at');
+    assert.equal(refresh.calls.length, 3, 'one attempt per backoff step until the network is back');
+    assert.equal(am._refreshRetry?.delayMs, 10, 'the backoff resets once nothing is parked');
+  } finally {
+    am.disableRefreshRetry();
+  }
+});
+
+test('the retry backoff doubles while the network stays down, capped at maxMs', async () => {
+  const refresh = flakyRefresh(Infinity);
+  const am = new AccountManager(makeAccounts(1), 0.98, { refreshFn: refresh.fn });
+  am.enableRefreshRetry({ baseMs: 10, maxMs: 40 });
+  am.accounts[0].expiresAt = Date.now() - HOUR;
+  try {
+    await am.ensureTokenFresh(0);
+    assert.ok(await waitFor(() => refresh.calls.length >= 5), 'the retries keep coming');
+  } finally {
+    am.disableRefreshRetry();
+  }
+  const gaps = refresh.calls.slice(1).map((t, i) => t - refresh.calls[i]);
+  // A timer never fires early; the 2 ms slack covers Date.now() granularity.
+  [10, 20, 40, 40].forEach((min, i) => assert.ok(gaps[i] >= min - 2, `gap ${i} was ${gaps[i]} ms, expected at least ${min}`));
+});
+
+test('an auth rejection or an upstream-auth error is never retried by the backoff', async () => {
+  const calls = [];
+  const am = new AccountManager(makeAccounts(2), 0.98, {
+    refreshFn: async sent => {
+      calls.push(sent);
+      if (sent === 'rt-0') throw Object.assign(new Error('Token refresh failed (400): invalid_grant'), { status: 400 });
+      throw new Error('fetch failed');                       // transient, but the park is not refresh-caused
+    },
+  });
+  am.enableRefreshRetry({ baseMs: 10, maxMs: 40 });
+  const [rejected, requestPath] = am.accounts;
+  rejected.expiresAt = Date.now() - HOUR;
+  requestPath.expiresAt = Date.now() - HOUR;
+  requestPath.status = 'error';
+  requestPath._errorFromRefresh = false;                     // an upstream 401, which no refresh heals
+  try {
+    await am.ensureTokenFresh(rejected);
+    await am.ensureTokenFresh(requestPath);
+    assert.equal(am._refreshRetry?.timer, null, 'nothing is scheduled');
+    await new Promise(resolve => setTimeout(resolve, 60));
+    assert.equal(calls.length, 2, 'no retry reached the token endpoint');
+  } finally {
+    am.disableRefreshRetry();
+  }
+});
+
+test('without enableRefreshRetry a parked refresh waits for the sweep (no background timers)', async () => {
+  const refresh = flakyRefresh(1);
+  const am = new AccountManager(makeAccounts(1), 0.98, { refreshFn: refresh.fn });
+  const acct = am.accounts[0];
+  acct.expiresAt = Date.now() - HOUR;
+  await am.ensureTokenFresh(acct);
+  await new Promise(resolve => setTimeout(resolve, 60));
+  assert.equal(refresh.calls.length, 1);
+  assert.equal(acct.status, 'error');
+});

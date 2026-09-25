@@ -451,6 +451,10 @@ export class AccountManager {
     this._warmupCursor = 0;
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
+    // Off until enableRefreshRetry(), so a manager built by a test or a one-shot
+    // CLI command never starts timers that reach the real token endpoint.
+    /** @type {{ baseMs: number, maxMs: number, delayMs: number, timer: ReturnType<typeof setTimeout>|null, running: boolean }|null} */
+    this._refreshRetry = null;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
     // OAuth token refresh.
     this._refreshFn = refreshFn;
@@ -4032,6 +4036,14 @@ export class AccountManager {
             // would stop the retry that heals it.
             account._deadRefreshToken = sent;
             console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}" needs re-login (refresh token rejected) — run: teamclaude login`);
+          } else if (account._errorFromRefresh) {
+            // The refresh token is probably fine and only the network was not:
+            // left to the next keep-alive sweep, the account stays benched for up
+            // to a full interval after the network is back. After a wake from
+            // sleep that benched every account with quota left for four and a
+            // half minutes (2026-09-25), since the first refreshes ran before
+            // Wi-Fi had reconnected.
+            this._scheduleRefreshRetry();
           }
         }
         return { ok: false, error: err.message };
@@ -4866,6 +4878,56 @@ export class AccountManager {
     } finally {
       this._sweepInFlight = false;
     }
+  }
+
+  /**
+   * Retry refreshes that a transient failure parked on a doubling backoff, from
+   * `baseMs` up to `maxMs`, instead of leaving them to the next keep-alive sweep.
+   * @param {{ baseMs?: number, maxMs?: number }} [opts]
+   */
+  enableRefreshRetry({ baseMs = 5_000, maxMs = 300_000 } = {}) {
+    this.disableRefreshRetry();
+    const base = Math.max(1, baseMs);
+    this._refreshRetry = { baseMs: base, maxMs: Math.max(base, maxMs), delayMs: base, timer: null, running: false };
+  }
+
+  disableRefreshRetry() {
+    if (this._refreshRetry?.timer) clearTimeout(this._refreshRetry.timer);
+    this._refreshRetry = null;
+  }
+
+  /** @param {LiveAccount} a */
+  _isTransientRefreshPark(a) {
+    return a.type === 'oauth' && !!a.refreshToken && a.status === 'error'
+      && a._errorFromRefresh === true && a._deadRefreshToken !== a.refreshToken;
+  }
+
+  _scheduleRefreshRetry() {
+    const retry = this._refreshRetry;
+    if (!retry || retry.timer || retry.running) return;
+    retry.timer = setTimeout(() => {
+      retry.timer = null;
+      this._retryParkedRefreshes().catch(() => {});
+    }, retry.delayMs);
+    retry.timer.unref?.();
+    retry.delayMs = Math.min(retry.delayMs * 2, retry.maxMs);
+  }
+
+  async _retryParkedRefreshes() {
+    const retry = this._refreshRetry;
+    if (!retry || retry.running) return;
+    retry.running = true;
+    try {
+      // Sequential, like the sweep: a burst is what the token endpoint throttles.
+      for (const a of this.accounts.filter(x => this._isTransientRefreshPark(x))) {
+        await this.ensureTokenFresh(a, !a.expiresAt).catch(() => {});
+      }
+    } finally {
+      retry.running = false;
+    }
+    if (this._refreshRetry !== retry) return;
+    if (this.accounts.some(a => this._isTransientRefreshPark(a))) this._scheduleRefreshRetry();
+    else retry.delayMs = retry.baseMs;
   }
 
   replaceAccount(accountOrIndex, acctData) {
