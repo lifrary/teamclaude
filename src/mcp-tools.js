@@ -298,7 +298,7 @@ const WRITE_TOOLS = [
   {
     name: 'set_account_priority',
     title: 'Set account priority',
-    description: 'Set an account\'s rotation priority: lower is preferred, default 0, negative allowed. Saved to the config file.',
+    description: 'Set an account\'s rotation priority: lower is preferred and negative is allowed. An account with no priority is unranked and sorts after every number. Saved to the config file.',
     properties: { ...ACCOUNT_ARGS, priority: { type: 'integer' } },
     required: ['account', 'priority'],
     write: true,

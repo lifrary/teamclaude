@@ -79,3 +79,22 @@ test("the TUI's in-flight removal (memory first, disk not yet saved) is neither 
   assert.deepEqual(await syncAccountsFromDisk(disk, mem, am), { added: 0, removed: 0 });
   assert.deepEqual(am.accounts.map(a => a.name), ['a@x.com']);
 });
+
+// An empty account list on disk is far likelier a bad read or a broken hand
+// edit than a request to empty the pool, and acting on it would take every
+// running account out at once.
+test('a disk config listing no accounts removes none of the running ones', async () => {
+  const mem = { accounts: [acct('a@x.com', 'id-a'), acct('b@x.com', 'id-b')] };
+  const am = new AccountManager(mem.accounts.map(a => ({ ...a })), 0.98, { refreshFn: async () => { throw new Error('no refresh'); } });
+  const errors = [];
+  const original = console.error;
+  console.error = (...args) => errors.push(args.join(' '));
+  try {
+    assert.deepEqual(await syncAccountsFromDisk({ accounts: [] }, mem, am), { added: 0, removed: 0 });
+  } finally {
+    console.error = original;
+  }
+  assert.deepEqual(am.accounts.map(a => a.name), ['a@x.com', 'b@x.com']);
+  assert.equal(mem.accounts.length, 2);
+  assert.ok(errors.some(line => line.includes('lists no accounts')), 'and it says why it kept them');
+});

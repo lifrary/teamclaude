@@ -141,6 +141,8 @@ export async function fetchResetCreditDetails(account, { fetchImpl = proxyFetch,
     const res = await fetchImpl(url, {
       headers: codexHeaders(account),
       signal: AbortSignal.timeout(timeoutMs),
+      // The account's own egress proxy, like every other credentialed call.
+      routing: account.routing ?? null,
     });
     if (!res.ok) return { error: `HTTP ${res.status}`, status: res.status };
     const data = await res.json();
@@ -190,6 +192,7 @@ export async function consumeResetCredit(account, { creditId = null, redeemReque
       headers: { ...codexHeaders(account), 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(timeoutMs),
+      routing: account.routing ?? null,
     });
     // A declined redemption comes back 200 with its reason in `code`, so the
     // verdict is read from the BODY and a non-2xx means only that no verdict

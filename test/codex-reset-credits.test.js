@@ -1060,3 +1060,18 @@ test('the status line says how old the reading is', () => {
   const both = resetCreditLine({ quota: { resetCredits: { available: 1, applicable: 0, seenAt: now - DAY } } }, paint, now);
   assert.match(both, /none applicable to a window right now, as of 1d ago$/);
 });
+
+// Both calls carry the account's bearer token, so a routed account's egress
+// proxy has to carry them too (#441), as it does every other credentialed call.
+test('reading and redeeming reset credits go through the account\'s own proxy', async () => {
+  const routing = { type: 'socks5', host: '127.0.0.1', port: 1080 };
+  const seen = [];
+  const fetchImpl = async (_url, options) => {
+    seen.push(options.routing);
+    return { ok: true, json: async () => ({ credits: [], code: 'no_credit' }) };
+  };
+  await fetchResetCreditDetails({ credential: 'secret', accountId: 'acct-1', routing }, { fetchImpl });
+  await consumeResetCredit({ credential: 'secret', accountId: 'acct-1', routing }, { redeemRequestId: 'uuid-1' }, { fetchImpl });
+  await fetchResetCreditDetails({ credential: 'secret', accountId: 'acct-2' }, { fetchImpl });
+  assert.deepEqual(seen, [routing, routing, null]);
+});

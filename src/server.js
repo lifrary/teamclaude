@@ -3921,7 +3921,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // way, up to a full connect timeout later, so move on now. A pin still
   // targets exactly the account it names. Skipped for this request only, like a
   // send failure: the cooldown the refresh armed is what keeps later requests off.
-  if (!ctx.pinnedAccount && retryCount < maxRetries && accountManager.isRoutingDown(account.index)) {
+  if (!ctx.pinnedAccount && retryCount < maxRetries && accountManager.isRoutingDown(account)) {
     ctx.triedSend.add(account);
     releaseHeld(); // failing over to a different account
     return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
@@ -4125,12 +4125,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     accountManager.updateQuota(account, rateLimitHeaders, ctx.model);
 
     // Any response at all came back through the account's routing proxy.
-    accountManager.clearRoutingFailed(account.index);
+    accountManager.clearRoutingFailed(account);
 
     // And a response that is not an error is proof its API key works: the 401
     // cooldown and the count behind its length start over (#473). Only that —
     // a 429 or a 5xx says nothing about the key either way.
-    if (upstreamRes.status < 400) accountManager.clearCredentialRejected(account.index);
+    if (upstreamRes.status < 400) accountManager.clearCredentialRejected(account);
 
     // A non-429 is normally live proof a hold no longer binds — but a 403 is proof
     // of the opposite: upstream is refusing this account, not serving it. Clearing
@@ -4265,7 +4265,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // because every pass adds its account to tried401, which selection skips;
       // the no-account branch answers once none is left.
       if (account.type !== 'oauth' || !account.refreshToken) {
-        accountManager.markCredentialRejected(account.index, account.type !== 'oauth'
+        accountManager.markCredentialRejected(account, account.type !== 'oauth'
           ? 'upstream rejected its API key (401)'
           : 'upstream rejected its token (401) and it has no refresh token');
       }
@@ -4665,7 +4665,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // same connect failure. isTransientUpstreamError reads it as not transient, so
     // this request fails over below — skipped for this request, never parked.
     if (isRoutingFailure(err)) {
-      const until = accountManager.markRoutingFailed(account.index);
+      const until = accountManager.markRoutingFailed(account);
       const hold = until ? `; out of rotation for ${Math.max(1, Math.round((until - Date.now()) / 1000))}s` : '';
       // err.message, not the cause chain: the chain ends at the bare socket
       // error, which does not say a routing proxy was involved.

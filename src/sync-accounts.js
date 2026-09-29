@@ -182,7 +182,15 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
   // resolved before removeAccount renumbers the manager list.
   const pendingAdds = addedAccountIds(memConfig);
   let removed = 0;
-  for (let i = accountManager.accounts.length - 1; i >= 0; i--) {
+  // A disk config that names no account at all is far likelier to be a bad
+  // read or a broken hand edit than an operator removing the whole fleet, and
+  // dropping every running account on it would take the proxy out entirely.
+  // Keep them and say so; removing them all is one explicit remove per account.
+  const emptyDisk = diskConfig.accounts.length === 0 && accountManager.accounts.length > 0;
+  if (emptyDisk) {
+    console.error(`[TeamClaude] The config on disk lists no accounts; keeping the ${accountManager.accounts.length} running ones. Remove accounts one by one to empty the pool.`);
+  }
+  for (let i = accountManager.accounts.length - 1; i >= 0 && !emptyDisk; i--) {
     const gone = accountManager.accounts[i];
     if (claimed.has(gone) || pendingAdds.has(gone.id)) continue;
     const cfgIdx = configIndexFor(memConfig.accounts, accountManager.accounts, i);
