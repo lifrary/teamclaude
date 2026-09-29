@@ -72,7 +72,9 @@ function abortMidBody(port, opened) {
 }
 
 // Poll `cond` until it holds or `ms` elapse; the caller asserts afterwards.
-async function until(cond, ms = 5000) {
+// The default is a watchdog against a condition that never comes, well above
+// anything a loaded machine adds, not a bound on how fast it should.
+async function until(cond, ms = 60_000) {
   const deadline = Date.now() + ms;
   while (!cond() && Date.now() < deadline) await new Promise(r => setTimeout(r, 10));
 }

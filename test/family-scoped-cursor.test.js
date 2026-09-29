@@ -92,7 +92,11 @@ test('advisor requests keep their own cursor, so interleaving with plain request
       assert.equal(am.getActiveAccount(null, OPUS).name, 'a');
     }
   });
-  assert.equal(lines.length, 1, lines.join('\n'));
+  // One divert line. The advisor's narrowing line (#479) is a fact about this
+  // fleet, said once, and not a move.
+  const moves = lines.filter(l => !/Advisor model/.test(l));
+  assert.equal(moves.length, 1, lines.join('\n'));
+  assert.equal(lines.filter(l => /Advisor model/.test(l)).length, 1, lines.join('\n'));
   assert.equal(am.accounts[am.currentIndex].name, 'a');
 });
 

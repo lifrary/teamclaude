@@ -18,10 +18,12 @@ import { createHash } from 'node:crypto';
 import { providerOf } from './provider.js';
 
 /**
- * Identity-bearing fields shared by config entries and live accounts.
- * @typedef {{ provider?: string | null, accountId?: string | null, accountUuid?: string | null, orgUuid?: string | null, orgName?: string | null, name?: string | null }} IdentityAccount
+ * Identity-bearing fields shared by config entries and live accounts, plus the
+ * entry fields (`id`, `priority`, `disabled`) callers read or write on an
+ * account matched through here (matchAccounts, resolveAccount).
+ * @typedef {{ provider?: string | null, accountId?: string | null, userId?: string | null, accountUuid?: string | null, orgUuid?: string | null, orgName?: string | null, name?: string | null, id?: string | null, priority?: number | null, disabled?: boolean }} IdentityAccount
  * @typedef {Readonly<
- *   { tag: 'provider-account', provider: 'codex', providerAccountId: string } |
+ *   { tag: 'provider-account', provider: 'codex', providerAccountId: string, providerUserId?: string } |
  *   { tag: 'provider-name', provider: 'codex', name: string } |
  *   { tag: 'uuid-org-uuid', accountUuid: string, orgUuid: string } |
  *   { tag: 'uuid-org-name', accountUuid: string, orgName: string } |
@@ -79,13 +81,21 @@ export function sameOrg(a, b) {
 /**
  * Produce a tagged canonical identity. Existing Claude keys remain stable;
  * Codex keys occupy a separate provider namespace and retain opaque account IDs.
+ * Members of one ChatGPT workspace share its account ID (#474), so a Codex
+ * identity also carries the user ID when the credentials supplied one; an entry
+ * saved without it keeps the key it always had.
  * @param {IdentityAccount | null | undefined} account
  * @returns {AccountId}
  */
 export function accountId(account) {
   if (providerOf(account) === 'codex') {
     const providerAccountId = typeof account?.accountId === 'string' ? account.accountId.trim() : null;
-    if (providerAccountId) return Object.freeze({ tag: 'provider-account', provider: 'codex', providerAccountId });
+    if (providerAccountId) {
+      const providerUserId = typeof account?.userId === 'string' ? account.userId.trim() : null;
+      return Object.freeze(providerUserId
+        ? { tag: 'provider-account', provider: 'codex', providerAccountId, providerUserId }
+        : { tag: 'provider-account', provider: 'codex', providerAccountId });
+    }
     const name = normalized(account?.name);
     if (!name) throw new IdentityAmbiguityError('Codex account has neither an account ID nor a name');
     return Object.freeze({ tag: 'provider-name', provider: 'codex', name });
@@ -115,7 +125,10 @@ export function accountIdKey(idOrAccount) {
         : supplied.tag === 'name' ? { tag: supplied.tag, name: normalized(supplied.name) } : supplied;
   switch (id.tag) {
     case 'provider-account':
-      if (id.provider === 'codex' && id.providerAccountId) return `p:codex:c:${encodeURIComponent(id.providerAccountId)}`;
+      if (id.provider === 'codex' && id.providerAccountId) {
+        const key = `p:codex:c:${encodeURIComponent(id.providerAccountId)}`;
+        return id.providerUserId ? `${key}:u:${encodeURIComponent(id.providerUserId)}` : key;
+      }
       break;
     case 'provider-name': {
       const name = normalized(id.name);
@@ -143,6 +156,18 @@ export function accountIdKey(idOrAccount) {
 /** @param {unknown} key @returns {AccountId} */
 export function parseAccountIdKey(key) {
   if (typeof key !== 'string') throw new IdentityAmbiguityError('Invalid AccountId key');
+  // Encoded segments never hold a raw ':', so a member key cannot be mistaken
+  // for an account key; it is tried first because the pattern below would
+  // otherwise read its whole tail as the account ID.
+  const member = /^p:codex:c:([^:]+):u:([^:]+)$/.exec(key);
+  if (member) {
+    let providerAccountId, providerUserId;
+    try {
+      providerAccountId = decodeURIComponent(member[1]);
+      providerUserId = decodeURIComponent(member[2]);
+    } catch { throw new IdentityAmbiguityError('Invalid AccountId key'); }
+    return Object.freeze({ tag: 'provider-account', provider: 'codex', providerAccountId, providerUserId });
+  }
   const provider = /^p:codex:([cn]):(.+)$/.exec(key);
   if (provider) {
     let value;
@@ -224,12 +249,20 @@ export function resolveAccount(accounts, ref) {
 }
 
 /** Exact canonical equality; incomplete UUID identities do not backfill.
+ * One tolerance, for Codex (#474): an entry saved before user IDs were recorded
+ * still matches a member of its ChatGPT workspace by account ID. Two members
+ * that both carry a user ID must carry the same one.
  * @param {AccountId | IdentityAccount} a
  * @param {AccountId | IdentityAccount} b
  */
 export function sameIdentity(a, b) {
   try {
-    return accountIdKey(a) === accountIdKey(b);
+    const left = a && 'tag' in a ? a : accountId(a);
+    const right = b && 'tag' in b ? b : accountId(b);
+    if (accountIdKey(left) === accountIdKey(right)) return true;
+    return left.tag === 'provider-account' && right.tag === 'provider-account'
+      && left.providerAccountId === right.providerAccountId
+      && (!left.providerUserId || !right.providerUserId);
   } catch {
     return false;
   }
@@ -245,7 +278,9 @@ export function sameIdentity(a, b) {
  */
 export function distinctAccounts(a, b) {
   if (providerOf(a) !== providerOf(b)) return true;
-  if (a?.accountId && b?.accountId) return a.accountId !== b.accountId;
+  if (a?.accountId && b?.accountId) {
+    return a.accountId !== b.accountId || (!!a.userId && !!b.userId && a.userId !== b.userId);
+  }
   if (!a?.accountUuid || !b?.accountUuid) return false;
   if (a.accountUuid !== b.accountUuid) return true;
   return sameOrg(a, b) === false;
@@ -342,12 +377,37 @@ export function matchAccounts(accounts, query, orgFilter) {
 }
 
 /**
+ * Whether a failed fetchProfile proves the token is dead, as opposed to merely
+ * unreachable. Only a 401 counts. A 5xx, a timeout or a DNS failure says
+ * nothing about the token, and neither does a 403: the upstream answers 403
+ * "Request not allowed" to a valid token from an unexpected region (see
+ * egress-guard.js), and an org-policy 403 is a cooldown at request time, not a
+ * dead credential — a fresh token would meet the same answer.
+ *
+ * @param {Record<string, any>|null|undefined} profile - a fetchProfile result, success or error
+ */
+export function isTokenRejection(profile) {
+  return profile?.status === 401;
+}
+
+/**
  * Automatic naming is safe only when the profile identifies the account.
  * An explicit name is the caller's opt-in to importing without detection.
  * @param {{ error?: unknown, accountUuid?: unknown, email?: unknown } | null | undefined} profile
  * @param {unknown} userNamed
  */
 export function canUpsertOAuthAccount(profile, userNamed) {
+  // A token the upstream has REJECTED is dead, and --name must not override
+  // that. The import reports success and then every request 401s, with nothing
+  // pointing back at the account that was already known to be bad at the moment
+  // it was added.
+  //
+  // Only a definitive refusal counts — a 401 the caller could not refresh away
+  // (oauth.js profileForCredentials renews a stale access token before the
+  // profile gets here). A 5xx, a 403, a timeout or a DNS failure says nothing
+  // about the token, and a healthy one must stay importable from a restricted
+  // network — which is what `userNamed` is for, and still is.
+  if (isTokenRejection(profile)) return false;
   return Boolean(
     userNamed
     || (profile && !profile.error && (profile.accountUuid || profile.email))

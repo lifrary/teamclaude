@@ -5,7 +5,8 @@
   "type": "module",
   "main": "src/index.js",
   "bin": {
-    "teamclaude": "src/index.js"
+    "teamclaude": "src/index.js",
+    "teamrouter": "src/index.js"
   },
   "files": [
     "src/"

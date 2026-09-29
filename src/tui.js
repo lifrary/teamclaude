@@ -1,6 +1,6 @@
 import { createWriteStream } from 'node:fs';
 import { gatingUtilization } from './model.js';
-import { importCredentials, fetchProfile } from './oauth.js';
+import { importCredentials, fetchProfile, formatMoney } from './oauth.js';
 import {
   sameIdentity,
   findUpsertTarget,
@@ -8,13 +8,17 @@ import {
   canUpsertOAuthAccount,
   oauthIdentityFields,
 } from './identity.js';
-import { configIndexFor, managerAccountFor, markAccountRemoved } from './account-pairing.js';
-import { PROVIDERS, providerOf } from './provider.js';
+import { configIndexFor, managerAccountFor, markAccountRemoved, markAccountAdded } from './account-pairing.js';
+import { PROVIDERS, providerOf, isSubscriptionAccount, upstreamFor } from './provider.js';
 import { mintAccountId } from './account-id.js';
-import { formatPercent } from './status-renderer.js';
-import { resolveMaxUsage } from './model.js';
-import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy } from './upstream-proxy.js';
+import { formatPercent, heldResetCredits } from './status-renderer.js';
+import { resolveMaxUsage, resolveMaxSpendMinor, switchThresholdDiffs } from './model.js';
+import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy, localListener, isSelfProxy } from './upstream-proxy.js';
+import { describeRouting, parseRoutingUrl, routingToUrl, checkRouting } from './account-routing.js';
 import { sanitizeText, safeLine } from './safe-text.js';
+// The setting rules live in one module; the CLI, the MCP tools and this screen
+// all read them from there, so they cannot drift apart (#426).
+import { MAX_PROBE_SECONDS, ROUTE_COLORS } from './config-ops.js';
 import { isLocalUpstream } from './provider.js';
 
 /**
@@ -51,7 +55,6 @@ const FORCE_REPAINT_MS = 60_000;
 // a 32-bit millisecond delay: past 2,147,483 s setInterval overflows and fires
 // every millisecond, which is a probe storm rather than a slow probe. A week
 // is far under that and already longer than any quota window.
-const PROBE_MAX_SECONDS = 7 * 24 * 3600;
 const ESC = '\x1b[';
 const RESET = `${ESC}0m`;
 const BOLD = `${ESC}1m`;
@@ -75,7 +78,6 @@ const NAMED_FG = {
   brightmagenta: 95, brightcyan: 96,
 };
 // Ordered list of the plain names, offered in the editor prompt / help.
-const ROUTE_COLOR_NAMES = ['red', 'green', 'yellow', 'blue', 'magenta', 'cyan'];
 const isRouteColor = name => Object.prototype.hasOwnProperty.call(NAMED_FG, String(name || '').toLowerCase());
 // A paint function for a route's color, falling back to cyan for blank/unknown.
 const routeColorFn = name => {
@@ -224,23 +226,53 @@ const BAR_MAX = 20;
 // when the row has width to spare, but never drops below it, so a narrow
 // terminal lays the table out exactly as it did before the column could grow.
 const NAME_MIN = 12;
+// Providers in declaration order: the order rows and panes are drawn in.
+const PROVIDER_ORDER = Object.keys(PROVIDERS);
+// Two provider pools side by side: the gutter between the panes.
+const PANE_GUTTER = ' │ ';
+// Pane bars: at least wide enough for `10h23m`, and past that only once every
+// name is whole.
+const PANE_BAR_MAX = 12;
+const PANE_BAR_FLOOR = 8;
+// The narrowest a list draws both shared bars in, full width and in a pane.
+const LIST_MIN = 70;
+const PANE_MIN = 62;
 
 // Clear space the centred version label needs on each side before it is drawn
 // at all. Below that it reads as a collision with the title or the port block,
 // so the whole label is dropped rather than squeezed.
 const HEAD_GAP = 2;
 
+// Where an account sits in the list the operator arranged — the sort key behind
+// _displayOrder, written by _doMoveAccount and by nothing else.
+//
+// An account with no `displayOrder` has never been placed: every account on a
+// config that predates the field, and every account added since the last
+// arrangement. Those list after every account that has one, which is where a
+// new account already appeared back when this list was array order — so the
+// answer to "where does the one I just logged in with go" does not change with
+// the feature, and there is nothing to migrate.
+const listRank = (/** @type {any} */ a) => (Number.isFinite(a?.displayOrder) ? a.displayOrder : Infinity);
+
+// How long a reorder waits after the last move before it is written. Longer
+// than a terminal's key-repeat interval, so a held arrow is one write; short
+// enough that the file is current by the time anyone looks at it.
+const ORDER_SAVE_DELAY_MS = 400;
+
 // Which pair of bars a row draws: the subscription buckets (Ses/Wk, plus the
-// S7/F7 family bars) when any unified reading exists, else the metered Tok/Req
-// pair an API-key account reports. The account row budget is drawn per
+// S7/F7 family bars) for a subscription or any unified reading, else the metered
+// Tok/Req pair an API-key account reports. The account row budget is drawn per
 // category (#234): the two kinds of row share no bar, so sizing an API-key row
 // for family bars it never draws only left it short of the edge.
-function rowCategory(q, type) {
-  return (q.unified5h != null || q.unified7d != null || q.unified7dSonnet != null || q.unified7dFable != null)
-    || type === 'oauth' ? 'unified' : 'metered';
+function rowCategory(/** @type {any} */ account) {
+  const q = displayQuota(account);
+  return (isSubscriptionAccount(account) || q.unified5h != null || q.unified7d != null || q.unified7dSonnet != null || q.unified7dFable != null)
+    ? 'unified' : 'metered';
 }
 
-function displayQuota(account) {
+// The quota a row draws: the shared fields, plus the learned Fable weekly
+// window standing in for `unified7dFable` while that field is unreported.
+function displayQuota(/** @type {any} */ account) {
   const q = account.quota || {};
   const fable = q.modelWeekly?.['7d_oi'];
   return fable && q.unified7dFable == null
@@ -255,19 +287,83 @@ function displayQuota(account) {
 // `threshold` is a number, or a per-bucket lookup (bucket → number) so a family
 // is judged against its OWN configured threshold rather than the global one.
 /**
- * Short row tag for an account that bills real money past its plan limits:
- * `$!` once something has actually been billed, `$` while it merely can be,
- * '' when it cannot. ASCII on purpose — the row is width-budgeted to the cell,
- * and a glyph whose width varies by terminal would push it past the edge.
+ * Short row tag for an account that bills real money past its plan limits: the
+ * month-to-date amount once something has actually been billed (`$14.35`), `$`
+ * while it merely can be, '' when it cannot. With a money cap configured
+ * (accounts[].maxSpend) the cap trails it, `$14.35/20`, so the row shows how
+ * much of the budget is gone without a trip to the status screen. ASCII on
+ * purpose — the row is width-budgeted to the cell, and a glyph whose width
+ * varies by terminal would push it past the edge; the budget takes this tag's
+ * width from the same call, so a longer amount widens the column, never the row.
  *
  * Deliberately not shown for an account that spent earlier and has since been
  * switched off: the row reports what rotating onto this account costs now, and
  * the status screen carries the fuller history.
+ *
+ * @param {any} quota
+ * @param {number | null} [maxSpend] the account's accounts[].maxSpend, if any
  */
-export function spendTag(quota) {
+export function spendTag(quota, maxSpend = null) {
   const spend = quota?.spend;
   if (!spend?.enabled) return '';
-  return (spend.usedMinor || 0) > 0 ? '$!' : '$';
+  const used = spend.usedMinor || 0;
+  const capMinor = resolveMaxSpendMinor(maxSpend, spend);
+  const cap = capMinor == null ? '' : `/${compactMoney(capMinor, spend)}`;
+  if (used <= 0) return `$${cap}`;
+  return `${formatMoney({ ...spend, limitMinor: null })}${cap}`;
+}
+
+// `20` for a whole-unit cap, `12.5` otherwise: the cap is the operator's own
+// round number, so the cents that formatMoney always carries would only be
+// noise after the slash.
+/** @param {number} minor @param {{ exponent?: number } | null | undefined} spend */
+function compactMoney(minor, spend) {
+  return String(minor / 10 ** (spend?.exponent ?? 2));
+}
+
+// The type column: the auth kind (7 columns), or the provider in a mixed pool.
+// The row and the width budget both take its width from here.
+function typeColumn(/** @type {any[]} */ accounts) {
+  /** @type {Set<keyof typeof PROVIDERS>} */
+  const pooled = new Set(accounts.map(providerOf));
+  const mixed = pooled.size > 1;
+  return { mixed, width: mixed ? Math.max(...[...pooled].map(id => PROVIDERS[id].label.length)) : 7 };
+}
+
+/**
+ * Short row tag for an account holding free Codex rate-limit reset credits:
+ * `RC1` for one, `RC2` for two, '' for none. ASCII for the same reason spendTag
+ * is — the row is budgeted to the cell, and a glyph whose width varies by
+ * terminal pushes it past the edge.
+ *
+ * The number is what the account HOLDS. It is deliberately not the number that
+ * could be redeemed right now: only the detail rows say whether a given credit
+ * is supported by the plan, and they cost a request nobody should make to draw
+ * a badge. See codex-reset-credits.js.
+ *
+ * A reading older than RESET_CREDIT_MAX_AGE_MS draws nothing: the row has no
+ * room to say how old the count is, so past the point where it stops being
+ * worth anything the honest tag is no tag.
+ *
+ * @param {Record<string, any>|null|undefined} quota
+ * @param {number} [now]  ms epoch the reading's age is measured from
+ */
+export function resetCreditTag(quota, now = Date.now()) {
+  const available = heldResetCredits(quota, now);
+  return available ? `RC${available}` : '';
+}
+
+/**
+ * Short row tag for the extra-usage fallback (`accounts[].allowExtraUsage`):
+ * `xu!` while the account is serving past its quota and billing for it, `xu`
+ * while it is merely allowed to, '' otherwise. Same shape and colours as the
+ * money tag beside it, for the same width-budget reason.
+ * @param {boolean} allowed
+ * @param {boolean} serving
+ */
+export function extraUsageTag(allowed, serving) {
+  if (serving) return 'xu!';
+  return allowed ? 'xu' : '';
 }
 
 export function blockedFamilies(quota, threshold) {
@@ -286,6 +382,51 @@ export function blockedFamilies(quota, threshold) {
   return out;
 }
 
+// Matches THRESHOLD_BUCKET_LABELS in status-renderer.js — same short names on
+// both surfaces, so an operator moving from `teamclaude status` text to the
+// live TUI (or attach mode) sees the identical tag rather than relearning it.
+/** @type {Object<string, string>} */
+const THRESHOLD_TAG_LABELS = {
+  unified5h: '5h', unified7d: '7d', unified7dSonnet: 'sonnet', unified7dFable: 'fable',
+  tokens: 'tokens', requests: 'requests',
+};
+
+/**
+ * "switch at 100%" / "switch 7d 90%, fable 80%" — the account's OWN
+ * switchThreshold (issue #409), or '' when it has none or every override it
+ * carries merely repeats what the fleet already resolves to (see
+ * switchThresholdDiffs). `fleetFor(bucket)` is the fleet-only lookup —
+ * `this.am.thresholdFor(bucket)` with no account arg, which both AccountManager
+ * and RemoteAccountManager answer identically, so attach mode reads the same
+ * tag the live server would show.
+ * @param {any} account
+ * @param {(bucket: string) => number} fleetFor
+ */
+export function switchThresholdTag(account, fleetFor) {
+  const diffs = switchThresholdDiffs(account?.switchThreshold, fleetFor);
+  if (!diffs.length) return '';
+  const parts = diffs.map(({ bucket, value }) => {
+    const label = bucket === 'default' ? 'at' : (THRESHOLD_TAG_LABELS[bucket] || bucket);
+    return `${label} ${formatPercent(value)}`;
+  });
+  return `switch ${parts.join(', ')}`;
+}
+
+/**
+ * "via socks5h://alice:***@host:1080" — the account's OWN egress proxy, or ''
+ * when it has none: the fleet path is the default and earns no tag. The live
+ * TUI reads the parsed object the manager holds; an attached dashboard reads
+ * the already-masked string the status payload carries (passwords never cross
+ * that boundary) — both land here.
+ * @param {any} account
+ */
+export function routingTag(account) {
+  const r = account?.routing;
+  if (!r) return '';
+  const text = typeof r === 'string' ? r : describeRouting(r);
+  return text ? `via ${text}` : '';
+}
+
 /** Fit a line to exactly w columns: truncate if too long, pad if too short.
  *  Truncation drops a wide glyph that would straddle the limit, so the result
  *  can come up one column short; pad that too — the frame is repainted in
@@ -299,6 +440,11 @@ export function fitLine(s, w) {
   }
   if (v < w) return s + ' '.repeat(w - v);
   return s;
+}
+
+/** A pane's title, `w` columns wide: the label, then a rule to the pane's edge. */
+function paneTitle(/** @type {string} */ label, /** @type {number} */ w) {
+  return fitLine(` ${bold(label)} ${dim('─'.repeat(Math.max(1, w - vw(label) - 2)))}`, w);
 }
 
 function formatReset(resetTs) {
@@ -362,9 +508,11 @@ function barColor(ratio, resetTs, windowMs, threshold) {
  * The label (e.g. "Ses 2h30m" or "45%") is drawn on top of the bar.
  * windowMs is the bucket's rolling-window length; when known, the color tracks
  * burn rate instead of raw fill. threshold is the routing switch threshold, at
- * or above which the bar goes red regardless of pace.
+ * or above which the bar goes red regardless of pace. showPct false drops the
+ * percentage wherever a countdown can stand in its place (config
+ * `quotaBarPercent`); with no countdown the percentage is the label either way.
  */
-export function bar(ratio, w = 10, resetTs, windowMs, threshold) {
+export function bar(ratio, w = 10, resetTs, windowMs, threshold, showPct = true) {
   const rst = formatReset(resetTs);
 
   if (ratio == null || isNaN(ratio)) {
@@ -381,9 +529,19 @@ export function bar(ratio, w = 10, resetTs, windowMs, threshold) {
   const f = Math.round(ratio * w);
   const { bg, fg } = barColor(ratio, resetTs, windowMs, threshold);
 
-  // Always show usage %, and append the reset countdown when it fits.
+  // Both fields when the bar is wide enough to hold them, `97% · 2h30m`, and
+  // the countdown alone when it is not: the countdown is what the width budget
+  // already treats as load-bearing (a row cut mid-bar "loses the reset countdown
+  // its tail carries", see the backstop in the row renderer), so the percentage
+  // is the field that yields. From BAR_MIN up the label is therefore one field
+  // entire or the other, never half of one — half a countdown reads as a
+  // different number, not a shorter one; below BAR_MIN the slice that follows
+  // still cuts it, as it did before. The other two quota readouts already draw
+  // both values in this order — the ` · ` between them is the dashboard's
+  // (src/dashboard.js).
   const pct = (ratio * 100).toFixed(0) + '%';
-  const label = (rst && pct.length + 1 + rst.length <= w) ? `${pct} ${rst}` : pct;
+  const both = showPct && rst ? `${pct} · ${rst}` : '';
+  const label = both && vw(both) <= w ? both : (rst || pct);
   const text = label.slice(0, w);
   const pad = w - text.length;
   const lp = Math.floor(pad / 2);
@@ -434,6 +592,8 @@ export class TUI {
     refreshQuota = /** @type {import('./server.js').ProxyServer['refreshQuotaAll']|undefined} */ (undefined),
     onQuit, sx = /** @type {import('./sx.js').SxManager|null} */ (null),
     probeQuota = /** @type {import('./prober.js').Prober['probeAll']|null} */ (null),
+    // Cast so the destructured binding is the callback type, not `null`: index.js passes a function here.
+    loginAccount = /** @type {null | ((account: Record<string, any>) => Promise<{ action: 'updated' | 'added', name: string }>)} */ (null),
     activityLogPath = /** @type {string|null} */ (null),
     // Attach mode: the accounts belong to a server in another process, reached
     // over its control plane. Everything that would mutate local state is off,
@@ -443,6 +603,8 @@ export class TUI {
     // Injectable so the import path can be exercised without a real credentials
     // file or a live profile call.
     readCredentials = importCredentials, readProfile = fetchProfile,
+    // Injectable so setting an account's proxy can be exercised without one.
+    testRouting = checkRouting,
     // Names the activity column against the session id the client sent. Absent
     // or disabled leaves every row showing the short id.
     sessionTitles = /** @type {import('./session-titles.js').SessionTitles|null} */ (null),
@@ -462,9 +624,12 @@ export class TUI {
     /** @type {Awaited<ReturnType<import('./sx.js').SxManager['getBalance']>>} */
     this.sxBalance = null;   // last fetched sx.org balance, for the settings screen
     this.probeQuota = probeQuota; // on-demand fleet-wide quota refresh (may be null)
+    /** @type {null | ((account: Record<string, any>) => Promise<{ action: 'updated' | 'added', name: string }>)} */
+    this.loginAccount = loginAccount; // browser (re-)login for a chosen account (may be null)
     this.activityLogPath = activityLogPath;
     this._readCredentials = readCredentials;
     this._readProfile = readProfile;
+    this._testRouting = testRouting;
     this._activityStream = null;
     this.sessionTitles = sessionTitles;
     this.versionLabel = versionLabel;
@@ -476,7 +641,7 @@ export class TUI {
     /** @type {PickerState|null} */
     this.pick = null;        // active list picker (routes editor accounts/bucket/color)
     this.pickReturn = 'routes'; // mode to fall back to when the picker closes
-    this.selAction = null;   // switch | remove | toggle
+    this.selAction = null;   // switch | remove | toggle | login | reorder | routing
     this.selIdx = 0;         // cursor POSITION over the display list (render hint)
     /** @type {TuiAccount|null} */
     this.selAcct = null;     // cursor ANCHOR: the selected account object
@@ -486,6 +651,7 @@ export class TUI {
     this.selRoute = null;    // in switch mode: null = global default, else a route to pin
     this.selReturn = 'normal'; // mode to fall back to when select mode closes
     this.setIdx = 0;         // cursor row on the settings screen (BIOS-style nav)
+    this.setScroll = 0;      // first body line the settings screen shows (see _viewport)
     this.blockIdx = 0;       // cursor row on the blocked-models editor
     this.inputPrompt = '';
     this.inputBuf = '';
@@ -496,11 +662,17 @@ export class TUI {
     this.frame = 0;
     this.running = false;
     this.timer = null;
+    /** @type {ReturnType<typeof setTimeout>|null} */
+    this._orderSaveTimer = null; // a reorder waiting to be written: see _doMoveAccount
     // Injectable so a test can drive the repaint tick by hand instead of
     // sleeping through real 500ms/5s intervals.
     this._setTimeout = setTimeout;
     this._origLog = null;
     this._origErr = null;
+    this._origWarn = null;
+    // Set once the terminal has reported a failure. Everything that would
+    // write to it checks this first.
+    this._stdoutDead = false;
   }
 
   // ── lifecycle ──────────────────────────────────────
@@ -543,11 +715,28 @@ export class TUI {
     // thing blocked. Non-blocking here, and the paint below drops a frame
     // when the terminal is behind instead of waiting for it.
     this._setStdoutBlocking(false);
+    // The other half of that bargain: a non-blocking write reports failure
+    // asynchronously, as an 'error' event on the stream, and an unhandled one
+    // becomes an uncaughtException that ends the process. So a terminal going
+    // away — a pane closed, a pty recreated — took the whole proxy with it, and
+    // the hard exit skipped stop() and the state save. A display may no more
+    // kill the proxy than block it, so the failure is given somewhere to go
+    // before the first write. A handler left over from an earlier start() is
+    // dropped first: stop() can leave one attached (see there), and a second
+    // would log the same failure twice.
+    if (this._stdoutErrorHandler) process.stdout.removeListener('error', this._stdoutErrorHandler);
+    this._stdoutDead = false;
+    this._stdoutErrorHandler = (/** @type {any} */ err) => this._terminalGone('stdout', err);
+    process.stdout.on('error', this._stdoutErrorHandler);
     process.stdout.write(`${ESC}?1049h${ESC}?25l`);
     process.stdin.setRawMode(true);
     process.stdin.resume();
     process.stdin.setEncoding('utf8');
     this._dataHandler = d => this._onData(d);
+    // The read side of the same terminal fails the same way (EIO once the pty
+    // is gone) and is just as fatal with nobody listening.
+    this._stdinErrorHandler = (/** @type {any} */ err) => this._terminalGone('stdin', err);
+    process.stdin.on('error', this._stdinErrorHandler);
     // A resize reflows the terminal itself, so the cached frame says nothing
     // about what is on screen — always repaint.
     this._resizeHandler = () => this.render({ force: true });
@@ -557,12 +746,42 @@ export class TUI {
     // Redirect console to activity log
     this._origLog = console.log;
     this._origErr = console.error;
+    this._origWarn = console.warn;
     console.log = (...a) => this._addLog(a.join(' '));
     console.error = (...a) => this._addLog(a.join(' '));
+    // warn as well: the one caller (an unrecognised distributeSessions value on
+    // reload) otherwise writes raw over the dashboard and misses the log (#414).
+    console.warn = (...a) => this._addLog(a.join(' '));
 
     this._lastFrame = null;   // entering the alt screen always paints
     this.render();
     this._scheduleTick();
+  }
+
+  /**
+   * The terminal reported a failure on either of its streams: it is gone, and
+   * every later write would fail the same way.
+   *
+   * Said once, through the console.error saved before start() patched it — the
+   * patched one feeds the activity pane, which is the thing nobody can see any
+   * more. Once is enough: the stream stays dead and a line per failed write
+   * would say nothing new.
+   *
+   * The server keeps serving without a display; that a closed pane must not
+   * end every routed session is the whole point. An attach client is nothing
+   * but its display, so it quits.
+   * @param {'stdout' | 'stdin'} stream
+   * @param {any} err
+   */
+  _terminalGone(stream, err) {
+    if (this._stdoutDead) return;
+    this._stdoutDead = true;
+    const report = this._origErr || console.error;
+    report(`[TeamClaude] terminal lost (${stream}: ${err?.code || err?.message || err}); ` +
+      (this.remote ? 'closing the attach client' : 'the proxy keeps running without a display'));
+    // A failure that arrives after stop() — a write still queued when the
+    // operator quit — is only recorded: the exit is already under way.
+    if (this.remote && this.running) { this.stop(); this.onQuit?.(); }
   }
 
   /** Fast while something is animating, slow when there is nothing to animate. */
@@ -595,10 +814,15 @@ export class TUI {
   stop() {
     this.running = false;
     if (this.timer) { clearTimeout(this.timer); this.timer = null; }
+    // Written now rather than dropped: quitting inside the debounce window
+    // would otherwise lose the last arrangement the operator saw on screen.
+    this._flushOrderSave();
     if (this._origLog) console.log = this._origLog;
     if (this._origErr) console.error = this._origErr;
+    if (this._origWarn) console.warn = this._origWarn;
     if (this._activityStream) { this._activityStream.end(); this._activityStream = null; }
     if (this._dataHandler) process.stdin.removeListener('data', this._dataHandler);
+    if (this._stdinErrorHandler) { process.stdin.removeListener('error', this._stdinErrorHandler); this._stdinErrorHandler = null; }
     if (this._resizeHandler) process.stdout.removeListener('resize', this._resizeHandler);
     if (this._drainHandler) { process.stdout.removeListener('drain', this._drainHandler); this._drainHandler = null; }
     // Blocking again for the exit sequence: a non-blocking write can still be
@@ -606,7 +830,27 @@ export class TUI {
     // screen with no cursor is the one state an operator cannot recover
     // without knowing the escape by heart.
     this._setStdoutBlocking(true);
-    process.stdout.write(`${ESC}?25h${ESC}?1049l`);
+    // Restoring the screen is best-effort, and skipped outright for a terminal
+    // already known to be gone: there is nobody left to restore it for.
+    //
+    // The stdout error listener is released only once this last write is
+    // confirmed. Flipping back to blocking does not make writes ALREADY QUEUED
+    // synchronous, and a failed write is reported as an event after this
+    // returns, while shutdown() is still stopping the prober and awaiting a
+    // state save. Removing the listener here unconditionally would hand that
+    // late EPIPE to nobody and end the process inside exactly that window.
+    // Writes complete in order, so a clean callback for this one means nothing
+    // the TUI wrote is still outstanding; on failure, or with the terminal
+    // already dead, the listener stays and keeps absorbing.
+    const guard = this._stdoutErrorHandler;
+    const release = (/** @type {any} */ err) => {
+      if (err || !guard || this._stdoutErrorHandler !== guard) return;
+      process.stdout.removeListener('error', guard);
+      this._stdoutErrorHandler = null;
+    };
+    if (!this._stdoutDead) {
+      try { process.stdout.write(`${ESC}?25h${ESC}?1049l`, release); } catch { /* terminal already gone */ }
+    }
     try { process.stdin.setRawMode(false); } catch {}
     process.stdin.pause();
   }
@@ -682,6 +926,17 @@ export class TUI {
     if (d === '\x03') return this._key('ctrl-c');
     if (d === '\x7f' || d === '\x08') return this._key('bs');
     if (d.length === 1 && d >= ' ') return this._key(d);
+    // A paste arrives as ONE chunk of many characters, which the line above
+    // turns away, so a pasted proxy URL or API key vanished without a sign,
+    // and those are exactly the values nobody types by hand. Only a text
+    // prompt takes it, and never anything holding an escape: that is a key
+    // sequence this parser does not know, not text. Control characters are
+    // dropped, the clipboard's trailing newline among them, so a paste fills
+    // the prompt and the operator still presses Enter on what they can see.
+    if (this.mode === 'input' && d.length > 1 && !d.includes('\x1b')) {
+      this.inputBuf += d.replace(/[\x00-\x1f\x7f]/g, '');
+      this.render();
+    }
   }
 
   _key(k) {
@@ -760,6 +1015,20 @@ export class TUI {
       enter: () => this._promptInput('Switch threshold % (1-100, tenths allowed)', v => this._doSetThreshold(v.trim())),
     });
 
+    // Fleet-scoped because the policy behind it is: a credit is spent only when
+    // the whole Codex pool is dry. It sits here, on the screen, rather than in
+    // the config file alone because the one thing an operator needs from this
+    // setting is to be able to kill it at once.
+    fields.push({
+      id: 'autoRedeemResets',
+      label: 'Auto-redeem',
+      hint: '←→ toggle',
+      value: () => (this.config.autoRedeemResets === true ? green('on') : gray('off')),
+      left: () => this._toggleAutoRedeemResets(),
+      right: () => this._toggleAutoRedeemResets(),
+      enter: () => this._toggleAutoRedeemResets(),
+    });
+
     fields.push({
       id: 'probe',
       label: 'Quota probe',
@@ -771,6 +1040,16 @@ export class TUI {
       left: () => this._nudgeProbe(-30),
       right: () => this._nudgeProbe(+30),
       enter: () => this._promptInput('Quota probe seconds (0=off, min 30)', v => this._doSetProbe(v.trim())),
+    });
+
+    fields.push({
+      id: 'quotaBarPercent',
+      label: 'Bar percentage',
+      hint: '←→ toggle',
+      value: () => (this.config.quotaBarPercent !== false ? green('on') : gray('off')),
+      left: () => this._toggleQuotaBarPercent(),
+      right: () => this._toggleQuotaBarPercent(),
+      enter: () => this._toggleQuotaBarPercent(),
     });
 
     fields.push({
@@ -854,6 +1133,22 @@ export class TUI {
       });
     }
 
+    // Two arrangeable rows is the least that can be arranged. Below that the
+    // row would open a screen on which no key does anything.
+    if (this._arrangeable().length > 1) {
+      fields.push({
+        id: 'orderAccounts',
+        label: 'Reorder accounts',
+        hint: 'Enter to arrange',
+        value: () => dim('—'),
+        enter: () => {
+          const first = this.am.accounts[this._arrangeable()[0]] || null;
+          this.mode = 'select'; this.selAction = 'reorder'; this.selAcct = first;
+          this.selIdx = Math.max(0, this._displayList().indexOf(first)); this.selReturn = 'settings';
+        },
+      });
+    }
+
     fields.push({
       id: 'upstreamProxy',
       label: 'Upstream proxy',
@@ -872,6 +1167,23 @@ export class TUI {
       },
       enter: () => this._promptInput('Upstream proxy (host:port, or blank for direct)', v => this._doSetUpstreamProxy(v.trim())),
     });
+
+    // ONE account's own proxy (accounts[].routing), beside the fleet's: the two
+    // answer the same question at different scopes. Named "proxy", not
+    // "routing": "Manage routing" above is the per-model routes screen, and two
+    // rows sharing a word would send the operator to the wrong one.
+    if (this.am.accounts.length > 0) {
+      fields.push({
+        id: 'accountProxy',
+        label: 'Account proxy',
+        hint: 'Enter to pick',
+        value: () => {
+          const n = this.am.accounts.filter((/** @type {any} */ a) => a.routing).length;
+          return n ? green(`${n} of ${this.am.accounts.length} routed`) : dim('(none)');
+        },
+        enter: () => { this.mode = 'select'; this.selAction = 'routing'; this.selIdx = 0; this.selAcct = this._displayList()[0] || null; this.selReturn = 'settings'; },
+      });
+    }
 
     if (this.sx) {
       const sx = this.sx;
@@ -975,10 +1287,13 @@ export class TUI {
     // Tenths of a percent are kept; anything finer is quantised so the stored
     // value is the one the screen shows.
     const v = Math.round(pct * 10) / 1000;
+    const prev = { config: this.config.switchThreshold, live: this.am.switchThreshold };
     this.config.switchThreshold = v;
     this.am.switchThreshold = v; // apply to the running rotation immediately
-    try { await this.saveConfig(this.config); }
-    catch (e) { this._addLog(`Failed to save: ${e.message}`); }
+    if (!await this._saveSetting('switch threshold', () => {
+      this.config.switchThreshold = prev.config;
+      this.am.switchThreshold = prev.live;
+    })) { this.mode = 'settings'; if (this.running) this.render(); return; }
     this._addLog(`Switch threshold set to ${formatPercent(v)}`);
     this.mode = 'settings';
     if (this.running) this.render();
@@ -989,8 +1304,8 @@ export class TUI {
     if (Number.isNaN(secs) || secs < 0) {
       this._addLog('Invalid interval — enter 0 (off) or seconds'); this.mode = 'settings'; if (this.running) this.render(); return;
     }
-    if (secs > PROBE_MAX_SECONDS) {
-      this._addLog(`Invalid interval — at most ${PROBE_MAX_SECONDS}s (7 days)`); this.mode = 'settings'; if (this.running) this.render(); return;
+    if (secs > MAX_PROBE_SECONDS) {
+      this._addLog(`Invalid interval — at most ${MAX_PROBE_SECONDS}s (7 days)`); this.mode = 'settings'; if (this.running) this.render(); return;
     }
     if (secs > 0 && secs < 30) secs = 30; // match the CLI minimum (don't hammer the usage endpoint)
     this.config.quotaProbeSeconds = secs;
@@ -1004,14 +1319,18 @@ export class TUI {
     if (this.running) this.render();
   }
 
-  /** Move the cursor by dir (±1) over the CURRENT display order, re-anchoring the object. */
-  /** @param {number} dir */
-  _moveSel(dir) {
+  /** Move the cursor by dir (±1) over the CURRENT display order, re-anchoring the object.
+   *  `rows` narrows the walk to a subset drawn in that order (reorder mode walks
+   *  only the rows it can move); selIdx stays a position in the full list. */
+  /** @param {number} dir @param {TuiAccount[]|null} [rows] */
+  _moveSel(dir, rows = null) {
     const list = this._displayList();
-    if (list.length === 0) return;
-    this._selected(); // sync selIdx to the anchored account's current position
-    this.selIdx = Math.min(Math.max(0, this.selIdx + dir), list.length - 1);
-    this.selAcct = list[this.selIdx];
+    const walk = rows || list;
+    if (walk.length === 0) return;
+    const current = this._selected(); // sync selIdx to the anchored account's current position
+    const at = rows ? rows.indexOf(current) : this.selIdx;
+    this.selAcct = walk[Math.min(Math.max(0, at + dir), walk.length - 1)];
+    this.selIdx = Math.max(0, list.indexOf(this.selAcct));
   }
 
   _keyNormal(k) {
@@ -1035,6 +1354,15 @@ export class TUI {
       }
     } else if (this.remote) {
       return;
+    } else if (k === 'l' && this.loginAccount) {
+      // Re-login: an OAuth account whose refresh token upstream has rejected stays
+      // in 'error' until someone signs in again, and that someone is usually
+      // looking at this screen. The cursor starts on the first account that needs
+      // it, so the common case is `l`, Enter.
+      const list = this._displayList();
+      this.selAcct = list.find(account => account.status === 'error') || list[0] || null;
+      this.mode = 'select'; this.selAction = 'login'; this.selReturn = 'normal';
+      this._selected();
     } else if (k === 'e') {
       const account = this._selected();
       if (account) this._doToggleEnabled(this.am.accounts.indexOf(account));
@@ -1047,12 +1375,35 @@ export class TUI {
   }
 
   // Confirm deletion or select a switch route; ordinary switch/enable/order
-  // actions otherwise use the object-anchored normal-mode cursor directly.
+  // actions otherwise use the object-anchored normal-mode cursor directly. The
+  // pickers opened from `l` and the settings screen (login, account proxy,
+  // reorder) run here too, on the same anchored cursor.
   _keySelect(k) {
-    if (k === 'up' || k === 'k') this._moveSel(-1);
-    else if (k === 'down' || k === 'j') this._moveSel(+1);
+    // Reorder mode walks the arrangeable rows only: a locally-served row is
+    // drawn but cannot be moved, so stopping on one would be a dead cursor.
+    const rows = this.selAction === 'reorder' ? this._arrangeable().map(i => this.am.accounts[i]) : null;
+    if (k === 'up' || k === 'k') this._moveSel(-1, rows);
+    else if (k === 'down' || k === 'j') this._moveSel(+1, rows);
+    // Tab / ←→ (switch only): cycle which route the pick applies to. null = the
+    // global default account; each getRoutes() entry = a per-route manual pin.
+    // ↑↓ move within the account list, so ←→ are free to move across targets.
+    // Pins are runtime state of the server's rotation, so attach mode — which
+    // can only ask for the default account — leaves these keys alone.
     else if ((k === 'tab' || k === 'right') && this.selAction === 'switch' && !this.remote) this._cycleSelRoute(+1);
     else if (k === 'left' && this.selAction === 'switch' && !this.remote) this._cycleSelRoute(-1);
+    // ←→ in reorder mode move the ACCOUNT, not the cursor. ↑↓ already walk the
+    // rows, so this is the pair left over, and ←→ is what "change the thing the
+    // cursor is on" already means on the settings screen this is opened from.
+    // The cursor does not move with the key: the anchored account is the one
+    // being dragged, and the row it marks travels with it.
+    else if ((k === 'left' || k === 'h') && this.selAction === 'reorder') this._doMoveAccount(-1);
+    else if ((k === 'right' || k === 'l') && this.selAction === 'reorder') this._doMoveAccount(+1);
+    else if (k === 'enter' && this.selAction === 'reorder') {
+      // Every move is already applied, so Enter only means "done" — and it has
+      // to be caught here, ahead of the remove branch below, which is what an
+      // unlisted action falls into.
+      this.mode = this.selReturn;
+    }
     else if (k === 'enter') {
       const account = this._selected();
       const idx = this.am.accounts.indexOf(account);
@@ -1063,10 +1414,17 @@ export class TUI {
       }
       if (this.selAction === 'switch') { this._doSwitchSelection(idx); return; }
       else if (this.selAction === 'toggle') this._doToggleEnabled(idx);
+      else if (this.selAction === 'login') this._doLogin(idx);
+      // Opens the URL prompt, which leaves select mode by itself; the mode
+      // check below then has nothing to undo.
+      else if (this.selAction === 'routing') this._promptAccountRouting(idx);
       else this._doRemove(idx);
       if (this.mode === 'select') this.mode = this.selReturn;
     }
     else if (k === 'esc' || k === 'q') { this.mode = this.selReturn; }
+    // Leaving the reorder screen by either key writes a move still waiting on
+    // its timer, so "done" means on disk. A no-op for every other action.
+    if (this.mode !== 'select') this._flushOrderSave();
   }
 
   /** @param {string} k */
@@ -1218,11 +1576,56 @@ export class TUI {
     }
   }
 
+  // Browser login for the account under the cursor (the `l` key). The row
+  // chooses the PROVIDER's sign-in page and tells the operator which identity to
+  // sign in as; it does not choose where the tokens go. They go to the account
+  // the browser actually signed in as — the same identity match `teamclaude
+  // login` makes — because writing one person's tokens onto the row that was
+  // merely highlighted would be a credential crossing. So a sign-in as someone
+  // else is reported as exactly that, and the picked row stays in need of one.
+  // Fire-and-forget: the flow waits on a human for up to two minutes, and the
+  // dashboard has to stay live meanwhile.
+  async _doLogin(/** @type {number} */ idx) {
+    const acct = this.am.accounts[idx];
+    if (!acct) { this._addLog('That account is no longer listed'); return; }
+    if (!this.loginAccount) { this._addLog('Login unavailable'); return; }
+    if (acct.type !== 'oauth') { this._addLog(`"${acct.name}" is not an OAuth account — nothing to sign in to`); return; }
+    // An importFrom row owns no tokens of its own: every reload re-reads the
+    // file it points at, so tokens the upsert wrote onto the row would be
+    // ignored on the next reload and the account would land back in `error`.
+    const entry = acct.id ? this.config?.accounts?.find((/** @type {any} */ c) => c.id === acct.id) : null;
+    if (entry?.importFrom) { this._addLog(`"${acct.name}" reads its tokens from ${entry.importFrom} — sign in there instead`); return; }
+    // One at a time: a second flow would race the first for the browser, and
+    // for Codex for the fixed callback port as well.
+    if (this._loggingIn) { this._addLog(`Still waiting on the sign-in for "${this._loggingIn}"`); return; }
+    this._loggingIn = acct.name;
+    this._addLog(`Sign in as "${acct.name}" in the browser (waits 2 minutes)...`);
+    try {
+      const outcome = await this.loginAccount(acct);
+      if (outcome?.name && outcome.name !== acct.name) {
+        this._addLog(`Signed in as "${outcome.name}" (${outcome.action}), not "${acct.name}" — that one still needs a login`);
+      } else {
+        this._addLog(`Logged in "${acct.name}"`);
+      }
+    } catch (/** @type {any} */ e) {
+      this._addLog(`Login failed for "${acct.name}": ${e?.message || e}`);
+    } finally {
+      this._loggingIn = null;
+      if (this.running) this.render();
+    }
+  }
+
   async _doSync() {
     try {
-      const count = await this.syncAccounts();
-      if (count > 0) {
-        this._addLog(`Synced ${count} new account(s) from config`);
+      const r = await this.syncAccounts();
+      // { added, removed } from the server's reload; a bare count from an
+      // older hook still reads as additions only.
+      const added = typeof r === 'number' ? r : (r?.added || 0);
+      const removed = typeof r === 'number' ? 0 : (r?.removed || 0);
+      // A removal shortens the list under the cursor, the same as _doRemove.
+      if (this.selIdx >= this.am.accounts.length) this.selIdx = Math.max(0, this.am.accounts.length - 1);
+      if (added > 0 || removed > 0) {
+        this._addLog(`Synced from config: +${added} account(s), -${removed} account(s)`);
       } else {
         this._addLog('Config reloaded, credentials refreshed');
       }
@@ -1288,6 +1691,65 @@ export class TUI {
     this.mode = 'settings';
   }
 
+  /** @param {number} idx */
+  _promptAccountRouting(idx) {
+    const acct = this.am.accounts[idx];
+    if (!acct) return;
+    // `none`, as the CLI and the MCP tool spell it: _promptInput drops a blank
+    // entry, which is the right meaning for blank here too (no change).
+    this._promptInput(`Proxy for ${safeLine(acct.name, 40)} (URL${acct.routing ? ', or none to clear' : ''})`,
+      (/** @type {string} */ v) => this._doSetAccountRouting(idx, v.trim()));
+  }
+
+  /** Set or clear one account's own proxy. A new URL is tested first, as the
+   *  CLI does, and for a stronger reason: here the change is live the moment it
+   *  is made, so a mistyped password would take a serving account out of
+   *  rotation with the operator watching.
+   *  @param {number} idx
+   *  @param {string} value */
+  async _doSetAccountRouting(idx, value) {
+    const acct = this.am.accounts[idx];
+    if (!acct) return;
+    let routing = null;
+    if (!/^(none|off|-)$/i.test(value)) {
+      try {
+        routing = parseRoutingUrl(value);
+      } catch (/** @type {any} */ e) {
+        this._addLog(`Invalid proxy: ${e.message}`);
+        return;
+      }
+      if (!routing) return;
+      // Our own listener would pass the test below (this server answers a
+      // CONNECT) and then loop every request straight back in.
+      if (isSelfProxy(routing, localListener(this.config))) {
+        this._addLog(`Proxy not set: ${describeRouting(routing)} is this server's own address, and would loop back into it`);
+        return;
+      }
+      this._addLog(`Testing ${describeRouting(routing)}...`);
+      if (this.running) this.render();
+      const check = await this._testRouting(routing, upstreamFor(acct, this.config.upstream));
+      if (!check.ok) {
+        this._addLog(`Proxy not set: ${check.error}`);
+        if (this.running) this.render();
+        return;
+      }
+    }
+
+    // Resolved before the await below: a manager index is not a config index
+    // (see _doToggleDisabled).
+    const cfgIdx = configIndexFor(this.config.accounts, this.am.accounts, idx);
+    this.am.setRouting(idx, routing);
+    // An explicit null, not a deleted key: the save merges over the on-disk
+    // entry, and a missing key would leave the old `routing` standing.
+    if (cfgIdx >= 0) this.config.accounts[cfgIdx].routing = routing ? routingToUrl(routing) : null;
+    try { await this.saveConfig(this.config); }
+    catch (/** @type {any} */ e) { this._addLog(`Failed to save: ${e.message}`); }
+    this._addLog(routing
+      ? `"${safeLine(acct.name, 64)}" now leaves through ${describeRouting(routing)}`
+      : `Cleared the proxy for "${safeLine(acct.name, 64)}"; it uses the fleet egress`);
+    if (this.running) this.render();
+  }
+
   // ── sx.org settings ────────────────────────────────
 
   _loadSxBalance() {
@@ -1316,15 +1778,37 @@ export class TUI {
     if (this.running) this.render();
   }
 
+  /**
+   * Save the shared config after a settings change; on a failed save, put the
+   * old value back. The gates (event logging, the blocklist, session titles, the
+   * sx mode) are read live off the same object, so a value that stayed in memory
+   * after the save failed would change what the running server does while disk
+   * still said otherwise, and the settings row would show the new value the
+   * whole time. Restoring it keeps memory, screen and file in step, and the log
+   * line says which setting was left alone (#443).
+   * @param {string} label what the row is called, for the log line
+   * @param {() => void} revert puts the previous value back in memory
+   * @returns {Promise<boolean>} whether the save landed
+   */
+  async _saveSetting(label, revert) {
+    try { await this.saveConfig(this.config); return true; }
+    catch (/** @type {any} */ e) {
+      revert();
+      this._addLog(`Failed to save: ${e.message} — ${label} left unchanged`);
+      if (this.running) this.render();
+      return false;
+    }
+  }
+
   // Cycle off → on-429 → always (dir +1) or the reverse (dir -1). Keeps the API
   // key, so the user can disable sx.org without deconfiguring it.
   async _cycleSxMode(dir = 1) {
     if (!this.sx) return;
     const order = ['off', '429', 'always'];
     const next = order[(order.indexOf(this.sx.getMode()) + dir + order.length) % order.length];
+    const prev = this.config.sx;
     this.config.sx = { ...(this.config.sx || {}), mode: next };
-    try { await this.saveConfig(this.config); }
-    catch (e) { this._addLog(`Failed to save: ${e.message}`); }
+    if (!await this._saveSetting('sx.org mode', () => { this.config.sx = prev; })) return;
     const r = await this.sx.setMode(next);
     this._addLog(`sx.org mode: ${this._sxModeLabel(next)}${r.ok ? '' : ` — ${r.error}`}`);
     if (next !== 'off') this._loadSxBalance();
@@ -1336,22 +1820,53 @@ export class TUI {
     // The shared config object is what a save writes and a reload re-applies,
     // so it is the record; the store is configured from it, never the reverse.
     const enabled = !this.sessionTitles.enabled;
+    const prev = this.config.sessionTitles;
     this.config.sessionTitles = { ...this.config.sessionTitles, enabled };
     this.sessionTitles.configure(this.config.sessionTitles);
-    try { await this.saveConfig(this.config); }
-    catch (e) { this._addLog(`Failed to save: ${e.message}`); }
+    if (!await this._saveSetting('session titles', () => {
+      this.config.sessionTitles = prev;
+      this.sessionTitles.configure(prev);
+    })) return;
     this._addLog(`Session titles: ${enabled ? 'on' : 'off'}`);
+    if (this.running) this.render();
+  }
+
+  async _toggleAutoRedeemResets() {
+    // Whether a spent weekly Codex window may spend one of that account's free
+    // rate-limit reset credits. Fleet-scoped: the policy it arms is about the
+    // whole pool being dry, so its switch is too. The redeemer reads it off the
+    // shared config per refusal, so the assignment is the whole application and
+    // the save is only what survives a restart.
+    //
+    // A per-account `autoRedeemReset: false` still exempts its account while
+    // this is on; nothing per-account can switch it ON.
+    const prev = this.config.autoRedeemResets;
+    const next = prev !== true;
+    this.config.autoRedeemResets = next;
+    if (!await this._saveSetting('auto-redeem', () => { this.config.autoRedeemResets = prev; })) return;
+    this._addLog(`Auto-redeem Codex reset credits: ${next ? 'on' : 'off'}`);
+    if (this.running) this.render();
+  }
+
+  async _toggleQuotaBarPercent() {
+    // Absent means on, so the first toggle from a config that predates the key
+    // has to write `false` — hence the comparison rather than a negation.
+    const prev = this.config.quotaBarPercent;
+    const on = prev === false;
+    this.config.quotaBarPercent = on;
+    if (!await this._saveSetting('bar percentage', () => { this.config.quotaBarPercent = prev; })) return;
+    this._addLog(`Quota bar percentage: ${on ? 'on' : 'off'}`);
     if (this.running) this.render();
   }
 
   async _cycleEventLogging(dir = 1) {
     // Claude Code telemetry display/handling: show → hide → block → show.
     const order = ['show', 'hide', 'block'];
-    const cur = this.config.eventLogging || 'hide';
+    const prev = this.config.eventLogging;
+    const cur = prev || 'hide';
     const next = order[(order.indexOf(cur) + dir + order.length) % order.length];
     this.config.eventLogging = next; // shared config object; the server reads it live
-    try { await this.saveConfig(this.config); }
-    catch (e) { this._addLog(`Failed to save: ${e.message}`); }
+    if (!await this._saveSetting('event logging', () => { this.config.eventLogging = prev; })) return;
     this._addLog(`Event logging: ${next}`);
     if (this.running) this.render();
   }
@@ -1361,10 +1876,10 @@ export class TUI {
     // Base-URL keeps a shell's other tools off the proxy (#382); MITM covers the
     // hard-coded endpoints and the Codex CLI. Read from disk by those commands,
     // so the save is the whole application.
-    const next = this.config.defaultClientMode === 'base-url' ? 'mitm' : 'base-url';
+    const prev = this.config.defaultClientMode;
+    const next = prev === 'base-url' ? 'mitm' : 'base-url';
     this.config.defaultClientMode = next;
-    try { await this.saveConfig(this.config); }
-    catch (/** @type {any} */ e) { this._addLog(`Failed to save: ${e.message}`); }
+    if (!await this._saveSetting('client mode', () => { this.config.defaultClientMode = prev; })) return;
     this._addLog(`Default client mode: ${next} (run/env without a flag)`);
     if (this.running) this.render();
   }
@@ -1450,6 +1965,11 @@ export class TUI {
           this.am.addAccount(this.config.accounts[idx]);
         }
         this._addLog(`Updated account "${prev.name}"`);
+        // Which account a credential belongs to is only known once its profile
+        // has been read, so that one lookup cannot go through a proxy it has
+        // not found yet. Said, because the operator routed this account to
+        // keep its traffic off this machine's address.
+        if (prev.routing) this._addLog(`Note: "${safeLine(prev.name, 64)}" has its own proxy, and this import's profile lookup did not go through it`);
       } else {
         // New org for this person: disambiguate colliding email names with " (org)".
         if (profile?.accountUuid) {
@@ -1469,6 +1989,9 @@ export class TUI {
         entry.id = mintAccountId();
         this.config.accounts.push(entry);
         this.am.addAccount(entry);
+        // Recorded until the save below lands: a reload that reads the file
+        // first would find a running account with no row and drop it.
+        markAccountAdded(this.config, entry.id);
         this._addLog(`Imported account "${entry.name}"`);
       }
 
@@ -1486,6 +2009,9 @@ export class TUI {
     const entry = { id: mintAccountId(), name, type: 'apikey', apiKey };
     this.config.accounts.push(entry);
     this.am.addAccount(entry);
+    // Same window as in _doImport: the account exists here before it does on
+    // disk, and a reload in between must not read the file as a removal.
+    markAccountAdded(this.config, entry.id);
     await this.saveConfig(this.config);
     this._addLog(`Added API key account "${name}"`);
   }
@@ -1522,19 +2048,35 @@ export class TUI {
   // use-or-lose (soonest reset, then least used). So pinning a few accounts to an
   // explicit order leaves the rest on the auto rotation.
 
-  /** Ranked accounts (priority set), in order: priority asc, then array index. */
+  /** Ranked accounts (priority set), in order: priority asc, then the tie order
+   *  the list draws (_arrangedOrder), then array index. */
   _rankedSorted() {
     return this.am.accounts
       .filter(a => a.priority != null)
-      .sort((a, b) => (a.priority - b.priority) || (a.index - b.index));
+      .sort((a, b) => (a.priority - b.priority) || this._arrangedOrder(a, b) || (a.index - b.index));
+  }
+
+  /** Ties within one rank, or among the unranked: locally-served rows last,
+   *  whatever a number says, then the order the operator arranged from the
+   *  settings screen (displayOrder, see _doMoveAccount). 0 when neither decides.
+   *  @param {TuiAccount} a @param {TuiAccount} b */
+  _arrangedOrder(a, b) {
+    const local = Number(isLocalUpstream(a)) - Number(isLocalUpstream(b));
+    if (local) return local;
+    const [ra, rb] = [listRank(a), listRank(b)];
+    // Infinity - Infinity is NaN, so two unplaced accounts are a tie.
+    return ra === rb ? 0 : ra - rb;
   }
 
   /**
-   * Display order: ranked accounts first (in rank order), then unranked in
-   * their ACTUAL automatic drain order (weekly reset soonest first — the same
-   * comparator selection uses), so the list shows what "auto" will do next.
-   * autoCompare returns 0 on ties and Array.sort is stable, so accounts with
-   * no quota data keep their array order (the previous display behavior).
+   * Display order, one provider group after another (two panes draw them side
+   * by side): ranked accounts first (in rank order), then unranked in the order
+   * the operator arranged, else their ACTUAL automatic drain order (weekly
+   * reset soonest first — the same comparator selection uses), so the list
+   * shows what "auto" will do next. Locally-served rows sit last within their
+   * rank (_arrangedOrder). autoCompare returns 0 on ties and Array.sort is
+   * stable, so accounts with no quota data keep their array order (the previous
+   * display behavior).
    */
   _displayList() {
     const ranked = this._rankedSorted();
@@ -1549,8 +2091,10 @@ export class TUI {
         return reset(a) - reset(b);
       };
     const auto = this.am.accounts.filter(a => !set.has(a)).sort((a, b) =>
-      Number(isLocalUpstream(a)) - Number(isLocalUpstream(b)) || compare(a, b));
-    return [...ranked, ...auto];
+      this._arrangedOrder(a, b) || compare(a, b));
+    // Stable, so within a provider the ranked-then-auto order above stands.
+    const provider = (/** @type {TuiAccount} */ a) => PROVIDER_ORDER.indexOf(providerOf(a));
+    return [...ranked, ...auto].sort((a, b) => provider(a) - provider(b));
   }
 
   /** 1-based rank position among the ranked accounts, or null if unranked. */
@@ -1667,10 +2211,86 @@ export class TUI {
     return this._doToggleEnabled(idx);
   }
 
+  /** Move the selected account `delta` rows through the list as drawn.
+   *
+   *  The array is NOT permuted. Route pins, session pins, `currentIndex`,
+   *  `TC_ACCT` and the disable/switch CLI paths address an account by its
+   *  manager index — reordering `am.accounts` would silently repoint every one
+   *  of them at a different account. So the rows are sorted by a field instead,
+   *  and each account keeps the slot it has held since startup. The account
+   *  being dragged is the anchored cursor (_selected), which rides with it.
+   *
+   *  It is not `priority` either. That field is rotation preference, set by
+   *  the order mode (`o`, _moveOrder). Deriving it from where a row sits on
+   *  screen would re-rank rotation as a side effect of tidying the display,
+   *  which is a routing change nobody asked for.
+   *
+   *  Every arrangeable account is renumbered from its new position rather than
+   *  only the two that moved: before the first move there are no numbers to
+   *  insert between, and a dense 0..n-1 is the form that reads in a hand-edited
+   *  config.
+   *
+   *  A move stays inside the account's own provider group and rank tier.
+   *  _displayList sorts by provider, then by rank, before it reads this field,
+   *  so swapping numbers with a neighbour from the other provider or another
+   *  rank would rewrite the config while no row moved. Unranked accounts share
+   *  one tier, which is where an arrangement shows. The locally-served rows are
+   *  already out of reach: _arrangeable leaves them out, so neither end of a
+   *  move can be one.
+   *
+   *  @param {number} delta  rows to travel: -1 up the list, +1 down it
+   */
+  _doMoveAccount(delta) {
+    const order = this._arrangeable();
+    const from = order.indexOf(this.am.accounts.indexOf(this._selected()));
+    const to = from + delta;
+    if (from < 0 || to < 0 || to >= order.length) return; // already at the end it was pushed against
+    // The edge of a provider group or a rank tier is an end of the list as far
+    // as a move goes: nothing is renumbered and nothing is saved.
+    const [moving, neighbour] = [this.am.accounts[order[from]], this.am.accounts[order[to]]];
+    if (providerOf(neighbour) !== providerOf(moving)) return;
+    if ((neighbour.priority ?? null) !== (moving.priority ?? null)) return;
+    order.splice(to, 0, ...order.splice(from, 1));
+    order.forEach((/** @type {number} */ mgrIdx, /** @type {number} */ pos) => {
+      this.am.accounts[mgrIdx].displayOrder = pos;
+      // Onto this account's own entry: a manager index is not a config index
+      // (account-pairing.js), and an account whose entry the config no longer
+      // holds keeps its position on screen with nothing to persist.
+      const cfgIdx = configIndexFor(this.config.accounts, this.am.accounts, mgrIdx);
+      if (cfgIdx >= 0) this.config.accounts[cfgIdx].displayOrder = pos;
+    });
+    // Nothing is logged on success. The row visibly moves, which is the whole
+    // feedback a drag needs, and a held arrow key would otherwise push the
+    // activity pane out from under the list being arranged.
+    //
+    // The save waits for the keys to stop. It is a locked read-merge-write of
+    // the whole config, and a held arrow would otherwise run one per repeat.
+    if (this._orderSaveTimer) clearTimeout(this._orderSaveTimer);
+    this._orderSaveTimer = setTimeout(() => { this._flushOrderSave(); }, ORDER_SAVE_DELAY_MS);
+  }
+
+  /** Write an arrangement that is still waiting on its timer, if one is.
+   *
+   *  Called by the timer, on leaving reorder mode and from stop(), so the wait
+   *  is only ever a delay: no way off the screen leaves a move unsaved.
+   *
+   *  @returns {Promise<void>}
+   */
+  async _flushOrderSave() {
+    if (!this._orderSaveTimer) return;
+    clearTimeout(this._orderSaveTimer);
+    this._orderSaveTimer = null;
+    try { await this.saveConfig(this.config); }
+    catch (/** @type {any} */ e) { this._addLog(`Failed to save: ${e.message}`); }
+  }
+
   // ── rendering ──────────────────────────────────────
 
   render({ force = false } = {}) {
     if (!this.running) return;
+    // Nobody can see it: composing a frame for a dead terminal every tick is
+    // work for nothing.
+    if (this._stdoutDead) return;
     // Guard against re-entry: clearing an expired quota logs, and _addLog calls
     // render() again — without this the nested call would render twice.
     if (this._rendering) return;
@@ -1688,6 +2308,10 @@ export class TUI {
    * again costs a wake-up and a terminal round trip to change nothing.
    */
   _paint(buf, force) {
+    // stdout has already failed once: the terminal is gone, every further
+    // write would fail the same way, and a stream that never drains would
+    // strand the pending-paint handshake below. Serving continues blind.
+    if (this._stdoutDead) return;
     const stale = Date.now() - (this._lastPaintAt || 0) >= FORCE_REPAINT_MS;
     if (!force && !stale && buf === this._lastFrame) return;
     // The terminal has not taken the previous frame yet. Painting anyway would
@@ -1780,7 +2404,14 @@ export class TUI {
       : this.mode === 'add' ? 'settings'
       : this.mode;
     if (view === 'settings') {
-      this._renderSettings(lines);
+      const selLine = this._renderSettings(lines);
+      // The settings body grows with every account and every setting, and a
+      // short terminal used to cut it off silently: the footer, and the rows
+      // past the fold, were pushed off the buffer with nothing said (#445).
+      // The body scrolls instead, following the cursor row.
+      const headerH = 2;   // the title line and its rule, drawn above
+      const body = lines.splice(headerH);
+      lines.push(...this._viewport(body, selLine - headerH, H - footerH - headerH));
     } else if (view === 'routes') {
       this._renderRoutes(lines);
     } else if (view === 'pick') {
@@ -1797,105 +2428,26 @@ export class TUI {
         ? '  The server reports no accounts.'
         : '  No accounts configured. Press [g] → Add account.'));
     } else {
-      lines.push('');
-
-
+      // Anchor the cursor against the order about to be drawn (render hint).
       this._selected();
-      const routes = this.am.getRoutes?.() || [];
-      const genRoutes = routes.filter(r => routeFamily(r) === null);
-      // Bar width, budgeted PER ROW CATEGORY (#234). A subscription row draws
-      // Ses/Wk and the S7/F7 family bars; an API-key row draws Tok/Req and
-      // nothing else. Neither shares a bar with the other, so the two are laid
-      // out against separate budgets: every subscription row lines up with the
-      // other subscription rows, every API-key row with the other API-key rows,
-      // and an API-key row no longer pays for family columns it never draws (or
-      // for a blocked-family tag only a subscription row can carry). Within a
-      // category the budget is still shared, on purpose: bars line up and equal
-      // lengths mean equal percentages, and the whitespace that costs a row
-      // without a tag is the price of that.
-      //
-      // The budget must count every column the widest row in the category
-      // actually draws, or the row overruns the terminal and fitLine cuts the
-      // tail off — which is how the S7/F7 bars lost the reset countdown they
-      // carry. Three parts beyond the bars themselves:
-      //   - the fixed prefix (marker, name, type, status, first bar label),
-      //   - the route-marker cells, one per general route,
-      //   - 6 columns of label for each bar past the first (`  Wk `, ` ►F7  `).
-      // The `⊘ Sonnet Fable` tag is reserved for only when some account is
-      // actually blocked; the common case where nothing is spends those columns
-      // on the bars instead of leaving the row short of the edge.
-      const categoryOf = a => rowCategory(displayQuota(a), a.type);
-      const routeCells = genRoutes.length ? genRoutes.length + 1 : 0;
-      const budgetFor = (members) => {
-        const anyFable = members.some(a => displayQuota(a).unified7dFable != null);
-        const anySonnet = members.some(a => displayQuota(a).unified7dSonnet != null);
-        const tagW = members.reduce((w, a) => {
-          const names = blockedFamilies(displayQuota(a), key => this.am.thresholdFor(key));
-          return names.length ? Math.max(w, 4 + vw(names.join(' '))) : w;
-        }, 0);
-        // Same rule for the `$`/`$!` money tag: a column the row can draw is a
-        // column the budget has to know about, or the row overflows exactly the
-        // way #228 fixed.
-        const spendW = members.reduce((w, a) => {
-          const tag = spendTag(a.quota);
-          return tag ? Math.max(w, 2 + vw(tag)) : w;
-        }, 0);
-        const rankW = members.reduce((w, a) => Math.max(w, a.priority != null ? 3 + String(this._rankOf(a)).length : this.mode === 'order' ? 6 : 0), 0);
-        const fixed = 32 + NAME_MIN + routeCells + tagW + spendW + rankW;
-        const roomFor = n => fixed + 6 * (n - 1) + n * BAR_MIN <= W;
-        // The family bars are the first thing to go: below the width where they
-        // fit even at BAR_MIN they would push the row past the edge, and a row
-        // cut mid-bar reads worse than one that simply doesn't draw them (the
-        // `⊘` tag still says which family is barred).
-        // The second shared bar answers to roomFor too, not just to a width
-        // threshold. `W >= 70` alone let the reservations (a 16-column
-        // blocked-family tag on two families, plus route cells) leave less than
-        // BAR_MIN per bar, and the floor below then overrode the budget: two
-        // accounts blocked on both families drew 72 columns at W=70, which
-        // fitLine silently cut (#234).
-        const showBoth = W >= 70 && roomFor(2);
-        const showFamily = showBoth && (anyFable || anySonnet) && roomFor(2 + (anyFable ? 1 : 0) + (anySonnet ? 1 : 0));
-        const nbars = (showBoth ? 2 : 1) + (showFamily ? (anyFable ? 1 : 0) + (anySonnet ? 1 : 0) : 0);
-        // Backstop for the case no count of bars can fix: when even one bar at
-        // BAR_MIN overruns the row, the floor has to yield. A narrow bar reads
-        // worse than a wide one; a row cut mid-bar loses the reset countdown its
-        // tail carries, and does it without saying so.
-        const avail = Math.floor((W - fixed - 6 * (nbars - 1)) / nbars);
-        const bw = avail < BAR_MIN
-          ? Math.max(1, avail)
-          : Math.min(BAR_MAX, avail);
-        const slack = Math.max(0, W - fixed - 6 * (nbars - 1) - nbars * bw);
-        return { bw, showBoth, showFamily, anyFable, anySonnet, slack };
-      };
-      const budgets = new Map();
-      for (const a of this.am.accounts) {
-        const cat = categoryOf(a);
-        if (!budgets.has(cat)) budgets.set(cat, budgetFor(this.am.accounts.filter(m => categoryOf(m) === cat)));
-      }
-      const anyFable = [...budgets.values()].some(b => b.anyFable);
-      const anySonnet = [...budgets.values()].some(b => b.anySonnet);
-
-      // Whatever the chrome and the capped bars leave over goes to the name
-      // column, up to the longest name in the fleet, so a wide terminal shows
-      // whole addresses instead of `a-considerab`. The name column is one width
-      // for the whole table (it is the prefix every row shares), so it grows by
-      // the smallest slack any category has left: `fixed` already reserves
-      // NAME_MIN, so only the surplus past it is spent here, and no category's
-      // rows are pushed past the budget above.
-      const longestName = Math.max(0, ...this.am.accounts.map(a => vw(a.name)));
-      const slack = Math.min(...[...budgets.values()].map(b => b.slack));
-      const nameW = Math.max(NAME_MIN, Math.min(longestName, NAME_MIN + slack));
-
-      // The single account each secondary bucket currently routes to (null = none
-      // can serve it right now). Marked next to that account's F7/S7 bar — the
-      // secondary-quota analogue of ► marking the default route's current account.
-      const familyTarget = {
-        fable: anyFable && this.am.previewRouteIndex ? this.am.previewRouteIndex('claude-fable-5') : null,
-        sonnet: anySonnet && this.am.previewRouteIndex ? this.am.previewRouteIndex('claude-sonnet-4-6') : null,
-      };
-      for (const i of this._displayOrder()) {
-        const b = budgets.get(categoryOf(this.am.accounts[i]));
-        lines.push(this._renderAcct(i, b.bw, b.showBoth, routes, genRoutes, familyTarget, b.showFamily, nameW));
+      // Two providers, two panes; the titles take the spacer line. One column when
+      // the panes cannot draw every bar the rows have.
+      const current = this._currentRows();
+      const groups = this._providerGroups();
+      const split = groups.length === 2 ? this._splitLayout(groups, W) : null;
+      if (split) {
+        const [a, b] = groups;
+        lines.push(paneTitle(PROVIDERS[a.provider].label, split.leftW) + dim(PANE_GUTTER) + paneTitle(PROVIDERS[b.provider].label, split.rightW));
+        for (let r = 0; r < Math.max(a.indices.length, b.indices.length); r++) {
+          const left = r < a.indices.length ? this._renderRow(a.indices[r], split.left, current) : '';
+          const right = r < b.indices.length ? this._renderRow(b.indices[r], split.right, current) : '';
+          lines.push(fitLine(left, split.leftW) + dim(PANE_GUTTER) + right);
+        }
+      } else {
+        lines.push('');
+        const order = this._displayOrder();
+        const layout = this._listLayout(order, W);
+        for (const i of order) lines.push(this._renderRow(i, layout, current));
       }
     }
 
@@ -1930,6 +2482,21 @@ export class TUI {
     }
     } // end non-settings body
 
+    // A body taller than the terminal used to push the footer off the bottom,
+    // and the footer is where a prompt is typed: on a settings screen longer
+    // than the window, the operator typed a value they could not see into a
+    // prompt they could not read. The header and footer now always stay, and
+    // the body between them is a window that follows the cursor row.
+    const HEADER_H = 2;
+    const bodyRoom = H - footerH - HEADER_H;
+    if (lines.length - HEADER_H > bodyRoom) {
+      const body = lines.slice(HEADER_H);
+      const at = Math.max(0, body.findIndex(l => strip(l).includes('▸')));
+      const from = Math.max(0, Math.min(body.length - bodyRoom, at - Math.floor(bodyRoom / 2)));
+      lines.length = HEADER_H;
+      lines.push(...body.slice(from, from + bodyRoom));
+    }
+
     // Pad to fill
     while (lines.length < H - footerH) lines.push('');
 
@@ -1948,14 +2515,264 @@ export class TUI {
     this._paint(buf, force);
   }
 
-  /** Translate the object-anchored display order into manager indices. */
+  /** Width budget for a list `W` wide, per row category, as one provider's pane when
+   *  `pane` is set; `stages` are the widths at which bars, names, then caps fit. */
+  _listLayout(/** @type {number[]} */ indices, /** @type {number} */ W, { pane = /** @type {string|null} */ (null), measure = false } = {}) {
+    const accts = indices.map(i => this.am.accounts[i]);
+    // Routes drive the inline markers; general (non-family) routes get a stable
+    // column each at the row start so the marker's position identifies the route.
+    const routes = this.am.getRoutes?.() || [];
+    const genRoutes = routes.filter((/** @type {any} */ r) => routeFamily(r) === null
+      && (pane == null || providerOf(r) === pane)); // a pane only holds its own provider's routes
+    // Bar width, budgeted PER ROW CATEGORY (#234). A subscription row draws
+    // Ses/Wk and the S7/F7 family bars; an API-key row draws Tok/Req and
+    // nothing else. Neither shares a bar with the other, so the two are laid
+    // out against separate budgets: every subscription row lines up with the
+    // other subscription rows, every API-key row with the other API-key rows,
+    // and an API-key row no longer pays for family columns it never draws (or
+    // for a blocked-family tag only a subscription row can carry). Within a
+    // category the budget is still shared, on purpose: bars line up and equal
+    // lengths mean equal percentages, and the whitespace that costs a row
+    // without a tag is the price of that.
+    //
+    // The budget must count every column the widest row in the category
+    // actually draws, or the row overruns the terminal and fitLine cuts the
+    // tail off — which is how the S7/F7 bars lost the reset countdown they
+    // carry. Three parts beyond the bars themselves:
+    //   - the fixed prefix (marker, name, type, status, first bar label),
+    //   - the route-marker cells, one per general route,
+    //   - 6 columns of label for each bar past the first (`  Wk `, ` ►F7  `).
+    // The `⊘ Sonnet Fable` tag is reserved for only when some account is
+    // actually blocked; the common case where nothing is spends those columns
+    // on the bars instead of leaving the row short of the edge.
+    const categoryOf = (/** @type {any} */ a) => rowCategory(a);
+    const routeCells = genRoutes.length ? genRoutes.length + 1 : 0;
+    // The type cell and the space after it, at the width the row pads it to.
+    const typeCell = pane == null ? typeColumn(this.am.accounts).width + 1 : 0;
+    const floor = pane == null ? LIST_MIN : PANE_MIN;
+    const barCap = pane == null ? BAR_MAX : PANE_BAR_MAX;
+    // The columns every name needs past NAME_MIN to be whole.
+    const longestName = Math.max(0, ...accts.map(a => vw(a.name)));
+    const nameWant = Math.max(0, longestName - NAME_MIN);
+    const budgetFor = (/** @type {string} */ cat, /** @type {any[]} */ members, /** @type {number} */ numW) => {
+      const anyFable = members.some(a => displayQuota(a).unified7dFable != null);
+      const anySonnet = members.some(a => displayQuota(a).unified7dSonnet != null);
+      const families = (anyFable ? 1 : 0) + (anySonnet ? 1 : 0);
+      const tagW = members.reduce((w, a) => {
+        const names = blockedFamilies(displayQuota(a), key => this.am.thresholdFor(key, a));
+        return names.length ? Math.max(w, 4 + vw(names.join(' '))) : w;
+      }, 0);
+      // Same rule for the money tag (`$`, or the billed amount with its `/cap`):
+      // a column the row can draw is a column the budget has to know about, or
+      // the row overflows exactly the way #228 fixed.
+      // The extra-usage `xu`/`xu!` tag is one more such column, drawn right
+      // after it on the same row, so a row's reserve is the two together.
+      const spendW = members.reduce((w, a) => {
+        const tag = spendTag(a.quota, a.maxSpend);
+        const xu = extraUsageTag(a.allowExtraUsage === true, this._onExtraUsage(a));
+        return Math.max(w, (tag ? 2 + vw(tag) : 0) + (xu ? 2 + vw(xu) : 0));
+      }, 0);
+      // Same rule again for the switch-threshold tag (#409) — silent on the
+      // common (no override, or one that matches the fleet) row, so it costs
+      // the budget nothing there, exactly like the two tags above it. It sits
+      // in `fixed`, so `span` and the pane `stages` carry it too: a pane is
+      // sized wide enough for the tag, or the split falls back to one column.
+      const switchW = members.reduce((/** @type {number} */ w, /** @type {any} */ a) => {
+        const tag = switchThresholdTag(a, key => this.am.thresholdFor(key));
+        return tag ? Math.max(w, 2 + vw(tag)) : w;
+      }, 0);
+      // Same rule again for the routing tag: silent for every account on the
+      // fleet path, so it costs the budget nothing there.
+      const routeW = members.reduce((/** @type {number} */ w, /** @type {any} */ a) => {
+        const tag = routingTag(a);
+        return tag ? Math.max(w, 2 + vw(tag)) : w;
+      }, 0);
+      // The rank tag (`#N`, or `auto` while the order mode is open) trails the
+      // row too, and the row number (`NN.`, see below) may lead it: numW columns.
+      const rankW = members.reduce((w, a) => Math.max(w, a.priority != null ? 3 + String(this._rankOf(a)).length : this.mode === 'order' ? 6 : 0), 0);
+      const fixed = 20 + numW + typeCell + NAME_MIN + routeCells + tagW + spendW + switchW + routeW + rankW;
+      const span = (/** @type {number} */ n, /** @type {number} */ bar) => fixed + 6 * (n - 1) + n * bar;
+      const roomFor = (/** @type {number} */ n) => span(n, BAR_MIN) <= W;
+      // No Ses bar once every Codex account here has said it meters no 5h window
+      // (`sessionWindowStated`, the fact a reading leaves behind; not
+      // `unified5h` itself, which the expiry sweep nulls every five hours on a
+      // row that does have one); a Claude row or an unreported account keeps it.
+      const shortBar = cat !== 'unified'
+        || members.some(a => providerOf(a) !== 'codex' || a.quota.sessionWindowStated !== false || a.quota.unified7d == null);
+      // The family bars are the first thing to go: below the width where they
+      // fit even at BAR_MIN they would push the row past the edge, and a row
+      // cut mid-bar reads worse than one that simply doesn't draw them (the
+      // `⊘` tag still says which family is barred).
+      // The second shared bar answers to roomFor too, not just to a width
+      // threshold. `W >= 70` alone let the reservations (a 16-column
+      // blocked-family tag on two families, plus route cells) leave less than
+      // BAR_MIN per bar, and the floor below then overrode the budget: two
+      // accounts blocked on both families drew 72 columns at W=70, which
+      // fitLine silently cut (#234).
+      const showBoth = W >= floor && roomFor(2);
+      const showFamily = showBoth && families > 0 && roomFor(2 + families);
+      const nbars = (showBoth && shortBar ? 2 : 1) + (showFamily ? families : 0);
+      // Backstop for the case no count of bars can fix: when even one bar at
+      // BAR_MIN overruns the row, the floor has to yield. A narrow bar reads
+      // worse than a wide one; a row cut mid-bar loses the reset countdown its
+      // tail carries, and does it without saying so.
+      const barRoom = (/** @type {number} */ reserved) => Math.floor((W - fixed - reserved - 6 * (nbars - 1)) / nbars);
+      const avail = barRoom(0);
+      let bw = avail < BAR_MIN
+        ? Math.max(1, avail)
+        : Math.min(barCap, avail);
+      // A pane gives names the columns before bars grow past the floor.
+      if (pane != null && avail >= BAR_MIN) {
+        const named = barRoom(nameWant);
+        bw = named >= PANE_BAR_FLOOR ? Math.min(barCap, named) : Math.min(PANE_BAR_FLOOR, avail);
+      }
+      const slack = Math.max(0, W - fixed - 6 * (nbars - 1) - nbars * bw);
+      const drawn = (shortBar ? 2 : 1) + families;
+      // The first step also holds what showBoth and showFamily test, so a
+      // width that reaches it draws every bar.
+      const s1 = Math.max(floor, span(2 + families, BAR_MIN), span(drawn, PANE_BAR_FLOOR));
+      const s2 = Math.max(s1, span(drawn, PANE_BAR_FLOOR) + nameWant);
+      const s3 = Math.max(s2, span(drawn, barCap) + nameWant);
+      return {
+        bw, showBoth, showFamily, anyFable, anySonnet, slack, shortBar,
+        complete: showBoth && (families === 0 || showFamily),
+        stages: [s1, s2, s3],
+      };
+    };
+    const budgetsWith = (/** @type {number} */ numW) => {
+      const out = new Map();
+      for (const a of accts) {
+        const cat = categoryOf(a);
+        if (!out.has(cat)) out.set(cat, budgetFor(cat, accts.filter(m => categoryOf(m) === cat), numW));
+      }
+      return out;
+    };
+    // The row number leads a row of the one-column list, and only while every
+    // bar still gets BAR_MIN beside it. A pane is sized to its columns, and at a
+    // narrow width the number would push the row's tags off its end, so there
+    // the row is drawn without it, exactly as it would be otherwise.
+    let numbered = pane == null;
+    let budgets = budgetsWith(numbered ? 4 : 0);
+    if (numbered && [...budgets.values()].some(b => b.bw < BAR_MIN)) {
+      numbered = false;
+      budgets = budgetsWith(0);
+    }
+    const all = [...budgets.values()];
+    const anyFable = all.some(b => b.anyFable);
+    const anySonnet = all.some(b => b.anySonnet);
+
+    // Whatever the chrome and the capped bars leave over goes to the name
+    // column, up to the longest name in the list, so a wide terminal shows
+    // whole addresses instead of `a-considerab`. The name column is one width
+    // for the whole list (it is the prefix every row shares), so it grows by
+    // the smallest slack any category has left: `fixed` already reserves
+    // NAME_MIN, so only the surplus past it is spent here, and no category's
+    // rows are pushed past the budget above.
+    const slack = Math.min(...all.map(b => b.slack));
+    const nameW = Math.max(NAME_MIN, Math.min(longestName, NAME_MIN + slack));
+
+    // The single account each secondary bucket currently routes to (null = none
+    // can serve it right now). Marked next to that account's F7/S7 bar — the
+    // secondary-quota analogue of ► marking the default route's current account.
+    const familyTarget = {
+      fable: anyFable && !measure && this.am.previewRouteIndex ? this.am.previewRouteIndex('claude-fable-5') : null,
+      sonnet: anySonnet && !measure && this.am.previewRouteIndex ? this.am.previewRouteIndex('claude-sonnet-4-6') : null,
+    };
+    return {
+      routes, genRoutes, budgets, nameW, familyTarget, compact: pane != null, width: W, numbered,
+      complete: all.every(b => b.complete),
+      stages: [0, 1, 2].map(k => Math.max(...all.map(b => b.stages[k]))),
+    };
+  }
+
+  /** Draw one row against a layout from _listLayout. */
+  _renderRow(/** @type {number} */ idx, /** @type {any} */ L, /** @type {Set<number>} */ current) {
+    const b = L.budgets.get(rowCategory(this.am.accounts[idx]));
+    return this._renderAcct(idx, b.bw, b.showBoth, L.routes, L.genRoutes, L.familyTarget, b.showFamily, L.nameW, { current, compact: L.compact, shortBar: b.shortBar, numbered: L.numbered });
+  }
+
+  /** The accounts of each provider present, in the order its rows are drawn. */
+  _providerGroups() {
+    /** @type {Map<string, number[]>} */
+    const groups = new Map();
+    for (const i of this._displayOrder()) {
+      const provider = providerOf(this.am.accounts[i]);
+      if (!groups.has(provider)) groups.set(provider, []);
+      groups.get(provider)?.push(i);
+    }
+    return [...groups].map(([provider, indices]) => ({ provider: /** @type {keyof typeof PROVIDERS} */ (provider), indices }));
+  }
+
+  /** Two pane layouts, or null when `W` cannot fit both. Width goes stage by stage,
+   *  both panes reaching one before either starts the next, a partial one shared pro rata. */
+  _splitLayout(/** @type {{ provider: string, indices: number[] }[]} */ groups, /** @type {number} */ W) {
+    const [a, b] = groups;
+    const avail = W - vw(PANE_GUTTER);
+    const size = (/** @type {{ provider: string, indices: number[] }} */ g) => this._listLayout(g.indices, avail, { pane: g.provider, measure: true });
+    const sa = size(a).stages;
+    const sb = size(b).stages;
+    if (sa[0] + sb[0] > avail) return null;
+    let leftW = sa[0];
+    let rightW = sb[0];
+    for (let k = 1; k < sa.length; k++) {
+      const wantA = sa[k] - leftW;
+      const wantB = sb[k] - rightW;
+      const room = avail - leftW - rightW;
+      if (room < wantA + wantB) {
+        const give = Math.round(room * wantA / (wantA + wantB));
+        leftW += give;
+        rightW += room - give;
+        break;
+      }
+      leftW += wantA;
+      rightW += wantB;
+    }
+    leftW += Math.floor((avail - leftW - rightW) / 2);
+    rightW = avail - leftW;
+    const left = this._listLayout(a.indices, leftW, { pane: a.provider });
+    const right = this._listLayout(b.indices, rightW, { pane: b.provider });
+    return left.complete && right.complete ? { leftW, rightW, left, right } : null;
+  }
+
+  /** Manager indices in the order the rows are drawn (_displayList).
+   *
+   *  Display only. `currentIndex`, session pins and route entries all stay
+   *  manager indices, and the cursor anchors the account object (_selected),
+   *  so nothing about selection or routing moves with the rows. Which is also
+   *  why the arrangement is a sort key rather than a permutation of
+   *  `am.accounts`: see _doMoveAccount.
+   */
   _displayOrder() {
     return this._displayList().map(a => this.am.accounts.indexOf(a));
   }
 
-  _renderAcct(idx, bw, showBoth, routes = this.am.getRoutes(), genRoutes = routes.filter(r => routeFamily(r) === null), familyTarget = {}, showFamily = true, nameW = NAME_MIN) {
+  /** Manager indices of the rows the operator can arrange, in drawn order.
+   *
+   *  Every account except the locally-served ones: _displayOrder pins those to
+   *  the end of the list whatever a number says, so they hold no position and
+   *  their array slots are simply stepped over.
+   */
+  _arrangeable() {
+    return this._displayOrder().filter((/** @type {number} */ i) => !isLocalUpstream(this.am.accounts[i]));
+  }
+
+  /** The rows that carry ►: the cursor, or in a mixed pool each provider's current
+   *  account, since `currentIndex` only names the pool that moved last. */
+  _currentRows() {
+    const providers = new Set(this.am.accounts.map((/** @type {any} */ a) => providerOf(a)));
+    if (providers.size < 2) return new Set([this.am.currentIndex]);
+    /** @type {Set<number>} */
+    const rows = new Set();
+    for (const provider of providers) {
+      const idx = this.am.currentIndexFor(provider);
+      if (idx != null) rows.add(idx);
+    }
+    return rows;
+  }
+
+  _renderAcct(idx, bw, showBoth, routes = this.am.getRoutes(), genRoutes = routes.filter(r => routeFamily(r) === null), familyTarget = {}, showFamily = true, nameW = NAME_MIN, { current = this._currentRows(), compact = false, shortBar = true, numbered = false } = {}) {
     const a = this.am.accounts[idx];
-    const isCur = idx === this.am.currentIndex;
+    const isCur = current.has(idx);
     const isSel = (this.mode === 'normal' || this.mode === 'select' || this.mode === 'order') && a === this._selected();
     const isMoving = this.mode === 'order' && a === this.orderAccount;
 
@@ -1975,8 +2792,9 @@ export class TUI {
     // The column before a family bar's marker: the cursor when it moved here, else the separator space.
     const famLead = fam => (cursorAt === fam ? cyan('>') : ' ');
 
-    // Row number identifies the current displayed order.
-    const num = gray(String(this._displayOrder().indexOf(idx) + 1).padStart(2) + '.');
+    // Row number identifies the current displayed order. It leads the row, ahead
+    // of the markers, when the layout has room for it (_listLayout decides).
+    const lead = numbered ? ` ${gray(String(this._displayOrder().indexOf(idx) + 1).padStart(2) + '.')} ` : ' ';
     // General-route markers use a stable column per route. Family routes are
     // rendered against their corresponding Sonnet/Fable quota bars below.
     const memberOf = route => (route.accounts || []).find(x => x.name === a.name);
@@ -2007,16 +2825,28 @@ export class TUI {
     // apart. `oauth` repeated down every row is what the column says instead, which the
     // operator already knew. Width follows the labels actually present, so nothing is
     // truncated and a single-provider pool keeps the column it has today.
-    /** @type {Set<keyof typeof PROVIDERS>} */
-    const pooled = new Set(this.am.accounts.map(providerOf));
-    const mixed = pooled.size > 1;
-    const typeW = mixed ? Math.max(...[...pooled].map(id => PROVIDERS[id].label.length)) : 7;
-    const type = gray((mixed ? PROVIDERS[providerOf(a)].label : a.type).padEnd(typeW));
+    // A pane draws no type cell: its title names the provider.
+    const { mixed, width: typeW } = typeColumn(this.am.accounts);
+    const type = compact ? '' : `${gray((mixed ? PROVIDERS[providerOf(a)].label : a.type).padEnd(typeW))} `;
 
-    // An explicitly disabled account is out of rotation regardless of quota state.
+    // Status — an explicitly disabled account is out of rotation regardless of
+    // its quota state. So is one rotation will not reach although its own status says active: the
+    // entitlement cooldown a 403 arms and the usage caps live beside the status,
+    // not in it, and a row reading `active` for an account that receives nothing
+    // sent operators looking at the wrong thing (#468). Live, the manager says;
+    // in attach mode the status payload carries the same reason.
+    const barred = typeof this.am.unavailableReason === 'function'
+      ? this.am.unavailableReason(a)
+      : (a.unavailable ?? null);
     let status;
     if (a.disabled || a.enabled === false) {
       status = gray('disabled');
+    } else if (barred === 'entitlement') {
+      const until = typeof a.entitlementDeniedUntil === 'string' ? Date.parse(a.entitlementDeniedUntil) : a.entitlementDeniedUntil;
+      const left = formatReset(until);
+      status = yellow(left ? `denied ${left}` : 'denied');
+    } else if (typeof barred === 'string' && /capped$/.test(barred)) {
+      status = yellow('capped');
     } else switch (a.status) {
       case 'active':    status = isCur ? green('active') : 'active'; break;
       case 'throttled': status = yellow('throttled'); break;
@@ -2029,7 +2859,7 @@ export class TUI {
     // Quota ratios — prefer unified (Claude Max), fall back to standard (API key)
     let r1 = null, r2 = null, l1 = 'Ses', l2 = 'Wk ', t1 = null, t2 = null, w1 = null, w2 = null;
 
-    if (rowCategory(q, a.type) === 'unified') {
+    if (rowCategory(a) === 'unified') {
       r1 = q.unified5h;
       r2 = q.unified7d;
       t1 = q.unified5hReset;
@@ -2050,9 +2880,11 @@ export class TUI {
     // The live routing threshold, so a bucket the rotation already refuses to
     // use reads red however healthy its pace looks.
     // Each bar reddens at ITS bucket's threshold (a per-bucket table may set
-    // the weekly one lower than the 5-hour one); the attach-mode manager
-    // mirrors thresholdFor, so both dashboards agree with the gate.
-    const thFor = (k) => (typeof this.am.thresholdFor === 'function' ? this.am.thresholdFor(k) : this.am.switchThreshold);
+    // the weekly one lower than the 5-hour one), further overridden by THIS
+    // account's own switchThreshold (#409) when it has one; the attach-mode
+    // manager mirrors thresholdFor(bucket, account), so both dashboards agree
+    // with the gate.
+    const thFor = (k) => (typeof this.am.thresholdFor === 'function' ? this.am.thresholdFor(k, a) : this.am.switchThreshold);
     // A per-account cap (accounts[].maxUsage) is the lower ceiling when it is
     // set, and it is the harder one — past it the account is sent nothing at
     // all. Reddening at the cap keeps the bar honest about where this account
@@ -2063,20 +2895,41 @@ export class TUI {
       const th = thFor(k);
       return cap == null ? th : (typeof th === 'number' ? Math.min(th, cap) : cap);
     };
-    const th1 = limFor(r1 === q.unified5h ? 'unified5h' : 'tokens');
+    let th1 = limFor(r1 === q.unified5h ? 'unified5h' : 'tokens');
     const th2 = limFor(r2 === q.unified7d ? 'unified7d' : 'requests');
 
-    let line = ` ${sel}${cur} ${num} ${startSlot}${name} ${type} ${status} ${l1} ${bar(r1, bw, t1, w1, th1)}`;
+    // A list with no five-hour window to draw (see _listLayout) starts the row
+    // at the weekly bar.
+    const weeklyFirst = !shortBar && rowCategory(a) === 'unified';
+    // A Codex row whose subscription meters no five-hour window draws only the
+    // weekly bar even while Claude rows on the same list keep Ses/Wk: a `Ses -`
+    // cell there said nothing. Keyed on the fact the reading left behind
+    // (`sessionWindowStated`, see _updateCodexQuota), never on `unified5h`
+    // being empty: the expiry sweep nulls that every five hours on a row that
+    // does have a session window, and the row would swing between the two
+    // shapes. An account that has not reported keeps both cells, so the row
+    // does not change shape at startup. The weekly bar takes the two cells'
+    // width (bar + `  Wk ` + bar) so the row still ends where its neighbours do.
+    const weeklyOnly = !weeklyFirst && showBoth && rowCategory(a) === 'unified'
+      && providerOf(a) === 'codex' && q.sessionWindowStated === false && q.unified7d != null;
+    if (weeklyFirst || weeklyOnly) [l1, r1, t1, w1, th1] = [l2, r2, t2, w2, th2];
+    const bw1 = weeklyOnly ? bw * 2 + 6 : bw;
+
+    // Keep the optional chaining: _renderAcct is called on instances built
+    // without a config, and it read none before this line existed.
+    const pctInBar = this.config?.quotaBarPercent !== false;
+
+    let line = `${lead}${sel}${cur} ${startSlot}${name} ${type}${status} ${l1} ${bar(r1, bw1, t1, w1, th1, pctInBar)}`;
     if (showBoth) {
-      line += `  ${l2} ${bar(r2, bw, t2, w2, th2)}`;
+      if (!weeklyFirst && !weeklyOnly) line += `  ${l2} ${bar(r2, bw, t2, w2, th2, pctInBar)}`;
       // Sonnet weekly bar — only shown when the usage probe has populated it. A
       // leading ► (in place of a padding space) marks a Sonnet route on this account.
       if (showFamily && q.unified7dSonnet != null) {
-        line += `${famLead('sonnet')}${familyMark('sonnet')}S7  ${bar(q.unified7dSonnet, bw, q.unified7dSonnetReset, SEVEN_DAY_MS, limFor('unified7dSonnet'))}`;
+        line += `${famLead('sonnet')}${familyMark('sonnet')}S7  ${bar(q.unified7dSonnet, bw, q.unified7dSonnetReset, SEVEN_DAY_MS, limFor('unified7dSonnet'), pctInBar)}`;
       }
       // Fable weekly bar — only shown when the usage probe has populated it.
       if (showFamily && q.unified7dFable != null) {
-        line += `${famLead('fable')}${familyMark('fable')}F7  ${bar(q.unified7dFable, bw, q.unified7dFableReset, SEVEN_DAY_MS, limFor('unified7dFable'))}`;
+        line += `${famLead('fable')}${familyMark('fable')}F7  ${bar(q.unified7dFable, bw, q.unified7dFableReset, SEVEN_DAY_MS, limFor('unified7dFable'), pctInBar)}`;
       }
     }
     // Explicit "disabled for these models" tag (issue #85): a family the account
@@ -2089,20 +2942,85 @@ export class TUI {
     // OWN configured threshold.
     const blocked = blockedFamilies(q, limFor);
     if (blocked.length) line += `  ${red('⊘ ' + blocked.join(' '))}`;
-    // Money tag last, so it sits at the end of the row where the eye lands after
-    // the bars. Red once real money has moved, yellow while it only could.
-    const money = spendTag(q);
-    if (money) line += `  ${(money === '$!' ? red : yellow)(money)}`;
+    // Rotation rank (`#1` is the most preferred), or `auto` for an unranked
+    // account while the order mode is open; the budget reserves it as rankW.
+    // Ahead of the money and later tags, which keep their order at the row's end.
     const rank = this._rankOf(a);
     if (rank != null) line += `  ${dim('#' + rank)}`;
     else if (this.mode === 'order') line += `  ${dim('auto')}`;
+    // Money tag last, so it sits at the end of the row where the eye lands after
+    // the bars. Red once real money has moved, yellow while it only could.
+    const money = spendTag(q, a.maxSpend);
+    // Red once real money has moved (the tag then carries an amount), yellow
+    // while it only could (a bare `$`, with or without its `/cap`).
+    if (money) line += `  ${(/\d/.test(money.split('/')[0]) ? red : yellow)(money)}`;
+    // Extra-usage fallback: allowed reads yellow like a bare `$`; serving on
+    // it is billing now, so red like a billed amount.
+    const xu = extraUsageTag(a.allowExtraUsage === true, this._onExtraUsage(a));
+    if (xu) line += `  ${(xu === 'xu!' ? red : yellow)(xu)}`;
+    // Free reset credits sit beside the money tag: both report what this
+    // account holds in reserve rather than what it is currently spending.
+    const credits = resetCreditTag(q);
+    if (credits) line += `  ${cyan(credits)}`;
+    // Switch-threshold tag (issue #409) trails everything else: it is a config
+    // fact about the account, not a live state like the two tags above it, and
+    // it is silent for the common case (no override, or one that just repeats
+    // the fleet's own numbers) — see switchThresholdTag.
+    const switchTag = switchThresholdTag(a, key => this.am.thresholdFor(key));
+    if (switchTag) line += `  ${cyan(switchTag)}`;
+    // Routing tag trails even that: where the account's traffic physically
+    // leaves the machine, when the operator pinned it to its own proxy.
+    const routeTag = routingTag(a);
+    if (routeTag) line += `  ${cyan(routeTag)}`;
     return line;
   }
 
+  /** Whether the account behind this row is serving on extra usage. Asked of
+   * the manager, which answers the same way in-process and attached.
+   * @param {{ index: number, onExtraUsage?: boolean }} a */
+  _onExtraUsage(a) {
+    return typeof this.am.onExtraUsage === 'function' ? this.am.onExtraUsage(a.index) : a.onExtraUsage === true;
+  }
+
+  /**
+   * The `viewH` lines of `body` to draw, scrolled so that line `sel` (the
+   * cursor row, or -1 for none) is on screen and never under the edge markers.
+   * A body that fits is returned as is. Otherwise the first and last visible
+   * lines become `↑ N more` / `↓ N more` markers whenever there is something
+   * past them, so the fold is never silent. The scroll position persists
+   * between frames (`setScroll`) and only moves when the cursor would leave
+   * the window, so paging with ↑↓ reads like a list, not a jump per keypress.
+   * @param {string[]} body
+   * @param {number} sel
+   * @param {number} viewH
+   */
+  _viewport(body, sel, viewH) {
+    const n = body.length;
+    if (n <= viewH || viewH < 3) { this.setScroll = 0; return body.slice(0, Math.max(0, viewH)); }
+    let top = Math.min(Math.max(0, this.setScroll || 0), n - viewH);
+    if (sel >= 0) {
+      // One line of margin at each edge is where a marker may be drawn; the
+      // cursor row must never be the line a marker replaces.
+      if (sel < top + 1) top = Math.max(0, sel - 1);
+      if (sel > top + viewH - 2) top = Math.min(n - viewH, sel - viewH + 2);
+    }
+    this.setScroll = top;
+    const out = body.slice(top, top + viewH);
+    if (top > 0) out[0] = dim(`  ↑ ${top} more`);
+    if (top + viewH < n) out[viewH - 1] = dim(`  ↓ ${n - top - viewH} more`);
+    return out;
+  }
+
+  /**
+   * Draws the settings screen into `lines`; returns the index in `lines` of the
+   * cursor row, or -1 when no row is selected (so the caller can keep it on screen).
+   * @param {string[]} lines
+   */
   _renderSettings(lines) {
     const fields = this._settingsFields();
     if (this.setIdx >= fields.length) this.setIdx = Math.max(0, fields.length - 1);
     const selId = fields[this.setIdx]?.id;
+    let selLine = -1;
     const byId = id => fields.find(f => f.id === id);
 
     // Render a navigable setting row with a BIOS-style highlight bar on the
@@ -2112,6 +3030,7 @@ export class TUI {
       const label = (field ? field.label : '').padEnd(16);
       const value = field ? field.value() : '';
       if (selected) {
+        selLine = lines.length;   // the row is pushed right after this returns
         const hint = field.hint ? `   ${dim(field.hint)}` : '';
         const inner = rpad(` ${label}  ${strip(value)} `, 34);
         return `  ${cyan('▸')}${REV}${inner}${RESET}${hint}`;
@@ -2125,10 +3044,17 @@ export class TUI {
     // ── Rotation
     lines.push(bold('  Rotation') + dim('  — switch accounts when quota crosses the threshold'));
     lines.push(row(byId('threshold')));
+    lines.push(row(byId('autoRedeemResets')));
+    lines.push(dim('  Spend a free Codex rate-limit reset credit when the whole pool'));
+    lines.push(dim('  is dry. Irreversible and scarce — off unless you say otherwise.'));
     lines.push('');
     // ── Quota probe
     lines.push(bold('  Quota probe') + dim('  — refresh idle accounts from the usage endpoint'));
     lines.push(row(byId('probe')));
+    lines.push('');
+    // ── Quota bars
+    lines.push(bold('  Quota bars') + dim('  — what the bar on each account row carries'));
+    lines.push(row(byId('quotaBarPercent')));
     lines.push('');
     // ── Activity log
     lines.push(bold('  Activity log') + dim('  — what to do with Claude Code\'s telemetry'));
@@ -2145,9 +3071,10 @@ export class TUI {
     lines.push(row(byId('blocklist')));
     lines.push('');
     // ── Accounts
-    lines.push(bold('  Accounts') + dim('  — add (import / API key) or remove an account'));
+    lines.push(bold('  Accounts') + dim('  — add (import / API key), remove, or set the order they list in'));
     lines.push(row(byId('addAccount')));
     if (byId('removeAccount')) lines.push(row(byId('removeAccount')));
+    if (byId('orderAccounts')) lines.push(row(byId('orderAccounts')));
     lines.push('');
     // ── Network
     // Drawn before the sx.org block, which returns early when sx is unavailable:
@@ -2155,13 +3082,18 @@ export class TUI {
     // not disappear along with an unrelated integration.
     lines.push(bold('  Network') + dim('  — how this machine reaches Anthropic'));
     lines.push(row(byId('upstreamProxy')));
+    if (byId('accountProxy')) lines.push(row(byId('accountProxy')));
     lines.push(dim('  Set when the machine has no direct route out (HTTPS_PROXY is'));
     lines.push(dim('  picked up automatically). Applies to requests, login and refresh.'));
+    if (byId('accountProxy')) {
+      lines.push(dim('  An account proxy carries ONE account instead, all of its traffic:'));
+      lines.push(dim('  socks5h://user:pass@host:1080 (also socks5, socks4a, socks4, http).'));
+    }
     lines.push('');
     // ── sx.org
     lines.push(bold('  sx.org proxy') + dim('  — route upstream via a residential IP (429 workaround)'));
     lines.push('');
-    if (!this.sx) { lines.push(yellow('  Unavailable in this build.')); return; }
+    if (!this.sx) { lines.push(yellow('  Unavailable in this build.')); return selLine; }
     const key = this.config.sx?.apiKey;
     const mode = this.sx.getMode();
     const p = this.sx.getProxy?.();
@@ -2186,6 +3118,7 @@ export class TUI {
       lines.push(dim('  No sx.org account yet? Signing up via https://sx.org/c/ufVrLW'));
       lines.push(dim('  costs nothing extra and supports TeamClaude development.'));
     }
+    return selLine;
   }
 
   // ── routes editor ──────────────────────────────────
@@ -2272,7 +3205,7 @@ export class TUI {
       selected: current,
       items: [
         { label: 'default', value: '' },
-        ...ROUTE_COLOR_NAMES.map(c => ({ label: c, value: c, paint: routeColorFn(c) })),
+        ...ROUTE_COLORS.map(c => ({ label: c, value: c, paint: routeColorFn(c) })),
       ],
       cb,
     });
@@ -2485,7 +3418,7 @@ export class TUI {
       case 'normal':
         return this.remote
           ? ` ${bold('s')}witch  ${bold('R')}eload  ${bold('q')}uit`
-          : ` ${dim('↑↓')} select  ${bold('s')}witch  ${bold('e')} enable/disable  ${bold('o')}rder  ${bold('d')}elete  ${bold('p')}robe quota  ${bold('R')}eload  ${bold('g')} settings  ${bold('q')}uit`;
+          : ` ${dim('↑↓')} select  ${bold('s')}witch  ${bold('e')} enable/disable  ${bold('o')}rder  ${bold('d')}elete  ${this.loginAccount ? `${bold('l')}ogin  ` : ''}${bold('p')}robe quota  ${bold('R')}eload  ${bold('g')} settings  ${bold('q')}uit`;
       case 'settings':
         return ` ${dim('↑↓')} navigate  ${dim('←→')} change  ${bold('Enter')} edit  ${bold('Esc')} back`;
       case 'routes':
@@ -2506,7 +3439,18 @@ export class TUI {
             : 'default';
           return ` ${dim('↑↓')} select  ${dim('←→')} target: ${target}  ${bold('Enter')} pin  ${bold('Esc')} cancel`;
         }
-        const act = this.selAction === 'toggle' ? 'enable/disable' : 'remove';
+        // Both keys leave, because each move is applied as it is made and written
+        // on the way out at the latest: there is no pending change for one to
+        // commit and the other to throw away, and
+        // offering "cancel" would promise an undo this screen does not have.
+        if (this.selAction === 'reorder') {
+          return ` ${dim('↑↓')} select  ${dim('←→')} move  ${bold('Enter')}/${bold('Esc')} done`;
+        }
+        if (this.selAction === 'login') {
+          return ` ${dim('↑↓')} select  ${bold('Enter')} sign in via browser  ${bold('Esc')} cancel`;
+        }
+        const act = this.selAction === 'toggle' ? 'enable/disable'
+          : this.selAction === 'routing' ? 'set its proxy' : 'remove';
         return ` ${dim('↑↓')} select  ${bold('Enter')} ${act}  ${bold('Esc')} cancel`;
       }
       case 'order':

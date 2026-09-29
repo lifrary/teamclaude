@@ -41,6 +41,9 @@ export class Warmer {
   /**
    * @param {import('./account-manager.js').AccountManager} accountManager
    * @param {WarmerOptions & import('./maintenance-coordinator.js').TimerOptions<T>} [opts]
+   *   `log` defaults to a call-time `console.log` — see below. Timers are
+   *   injected through `setTimeoutFn`/`clearTimeoutFn` and handed to the
+   *   coordinator as `timerOptions`.
    */
   constructor(accountManager, opts = {}) {
     const {
@@ -52,7 +55,15 @@ export class Warmer {
       prompt = 'hi',
       spawnFn = defaultSpawn,
       timeoutMs = 120_000,
-      log = console.log,
+      // Resolves the console per call rather than capturing it. A default
+      // parameter is evaluated when the constructor runs, and the server builds
+      // its warmer in the same tick as `server.listen()` — before the listen
+      // callback reaches `tui.start()`, which swaps `console.log` for the
+      // activity log. Only an interval or schedule set at startup is announced
+      // before that; a reload's reschedule and a sweep's deferral notice both
+      // come afterwards, and a captured `console.log` would put them on a
+      // terminal the alternate screen has already covered.
+      log = (/** @type {string} */ line) => console.log(line),
       nowFn = Date.now,
       coordinator, ownCoordinator = false,
     } = opts;

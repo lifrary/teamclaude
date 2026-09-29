@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
-import { TUI, blockedFamilies } from '../src/tui.js';
+import { TUI, blockedFamilies, switchThresholdTag, routingTag } from '../src/tui.js';
 
 // The account row is laid out against a width budget. The budget used to count
 // only the first two bars, so the S7/F7 bars a Fable/Sonnet fleet draws ran past
@@ -17,7 +17,7 @@ function oauth(name) {
 
 /** Render the dashboard at `width` and return the account rows, ANSI stripped,
  * exactly as _renderAcct produced them (before fitLine pads or truncates). */
-function renderRows(width, { fable = [], sonnet = [], accounts = 6, routes = [], apikey = [] } = {}) {
+function renderRows(width, { fable = [], sonnet = [], accounts = 6, routes = [], apikey = [], switchThreshold = [] } = {}) {
   const names = Array.from({ length: accounts }, (_, i) => `acct${i}@example.com`);
   const entries = names.map((name, i) => apikey.includes(i)
     ? { name, type: 'apikey', apiKey: `k-${i}` }
@@ -25,6 +25,10 @@ function renderRows(width, { fable = [], sonnet = [], accounts = 6, routes = [],
   const am = new AccountManager(entries, 0.98, routes.length ? { routes } : {});
   const h = 3600_000;
   am.accounts.forEach((a, i) => {
+    // Per-account switchThreshold override (#409), by index like fable/sonnet
+    // below — set directly on the live account the same way a config edit
+    // reaches it via sync-accounts, so the row draws off the real field.
+    if (switchThreshold[i] != null) a.switchThreshold = switchThreshold[i];
     if (apikey.includes(i)) {
       // A metered account: the row draws Tok/Req, never a family bar.
       a.quota.tokensLimit = 1_000_000; a.quota.tokensRemaining = 600_000;
@@ -134,6 +138,57 @@ test('blockedFamilies reports the families barred by their own weekly bucket', (
   assert.deepEqual(blockedFamilies({}, 0.98), []);
 });
 
+// ── switch-threshold tag (#409) ───────────────────────────────
+
+test('switchThresholdTag is silent with no override, or one that matches the fleet', () => {
+  const fleetFor = () => 0.98;
+  assert.equal(switchThresholdTag({}, fleetFor), '');
+  assert.equal(switchThresholdTag({ switchThreshold: null }, fleetFor), '');
+  assert.equal(switchThresholdTag({ switchThreshold: 0.98 }, fleetFor), '');
+  assert.equal(switchThresholdTag({ switchThreshold: { unified7d: 0.98 } }, fleetFor), '');
+});
+
+test('switchThresholdTag names a bare-number override "at", and a table by bucket', () => {
+  const fleetFor = () => 0.98;
+  assert.equal(switchThresholdTag({ switchThreshold: 1.0 }, fleetFor), 'switch at 100%');
+  assert.equal(switchThresholdTag({ switchThreshold: { unified7dFable: 0.8 } }, fleetFor), 'switch fable 80%');
+  // Several differing buckets join on one tag, in table order.
+  assert.equal(
+    switchThresholdTag({ switchThreshold: { unified7d: 0.9, unified7dFable: 0.8 } }, fleetFor),
+    'switch 7d 90%, fable 80%',
+  );
+});
+
+// ── routing tag ─────────────────────────────────────────────
+
+test('routingTag is silent on the fleet path, and masked in both shapes it can arrive', () => {
+  assert.equal(routingTag({}), '');
+  assert.equal(routingTag({ routing: null }), '');
+  // The live manager holds the parsed object...
+  assert.equal(
+    routingTag({ routing: { protocol: 'socks5h', host: 'proxy.example.com', port: 1080, username: 'alice', password: 's3cret' } }),
+    'via socks5h://alice:***@proxy.example.com:1080',
+  );
+  // ...an attached dashboard holds the payload's already-masked string.
+  assert.equal(routingTag({ routing: 'http://proxy.example.com:3128' }), 'via http://proxy.example.com:3128');
+});
+
+test('no account row overflows with a per-account switch-threshold tag', () => {
+  for (const w of WIDTHS) {
+    const rows = renderRows(w, { switchThreshold: [1.0, null, { unified7dFable: 0.5 }, null, 0.9, null] });
+    assert.ok(widest(rows) <= w, `W=${w}: widest row is ${widest(rows)} columns`);
+  }
+});
+
+test('the switch tag gets its own room rather than being cut off', () => {
+  for (const w of [80, 86, 100, 120]) {
+    const rows = renderRows(w, { switchThreshold: [1.0, null, { unified7dFable: 0.5 }, null, null, null] });
+    assert.ok(widest(rows) <= w, `W=${w}: widest row is ${widest(rows)} columns`);
+    assert.ok(rows.some(r => r.includes('switch at 100%')), `W=${w}: the bare-number tag survives intact`);
+    assert.ok(rows.some(r => r.includes('switch fable 50%')), `W=${w}: the per-bucket tag survives intact`);
+  }
+});
+
 // The `⊘ Sonnet Fable` tag is 16 columns, and until #234 nothing checked that
 // what the reservations left could still afford BAR_MIN per bar: `showBoth` was
 // a bare `W >= 70`, and the bar-width floor then overrode the budget. The
@@ -221,4 +276,37 @@ test('a blocked family on a subscription row does not shorten the API-key rows',
     const metered = rows.filter(isMetered);
     assert.ok(w - widest(metered) <= 3, `W=${w}: the tag cost the API-key rows ${w - widest(metered)} columns`);
   }
+});
+
+// Before its first reading an OAuth row drew the API-key Tok/Req pair, at the
+// metered rows' width.
+test('a subscription account with no reading yet draws its own bars, empty', () => {
+  const am = new AccountManager([
+    oauth('probed@example.com'),
+    oauth('fresh@example.com'),
+    { name: 'key@example.com', type: 'apikey', apiKey: 'k' },
+  ], 0.98);
+  Object.assign(am.accounts[0].quota, { unified5h: 0.4, unified5hReset: Date.now() + 3600_000, unified7d: 0.3, unified7dReset: Date.now() + 86400_000 });
+  const tui = new TUI({
+    accountManager: am, config: { proxy: { port: 1 }, accounts: [], routes: [] }, sx: null,
+    saveConfig: async () => {}, syncAccounts: async () => 0, onQuit: () => {}, probeQuota: () => {},
+  });
+  const cols = Object.getOwnPropertyDescriptor(process.stdout, 'columns');
+  Object.defineProperty(process.stdout, 'columns', { value: 120, configurable: true });
+  const drawn = [];
+  try {
+    const real = tui._renderAcct.bind(tui);
+    tui._renderAcct = (...args) => { const out = real(...args); drawn.push(strip(out)); return out; };
+    tui._paint = () => {};
+    tui.running = true;
+    tui.render(true);
+  } finally {
+    if (cols) Object.defineProperty(process.stdout, 'columns', cols);
+    else delete process.stdout.columns;
+  }
+  const [probed, fresh, key] = drawn;
+  assert.match(fresh, /Ses .*Wk /, fresh);
+  assert.doesNotMatch(fresh, /Tok|Req/);
+  assert.equal(fresh.indexOf('Wk '), probed.indexOf('Wk '), 'lined up with the probed subscription row');
+  assert.match(key, /Tok .*Req /, 'an API key keeps the metered pair');
 });

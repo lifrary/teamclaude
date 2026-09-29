@@ -12,8 +12,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { generateCertChain } from '../src/x509.js';
 import { createConnectHandler } from '../src/mitm.js';
+import { KEEP_ALIVE_TIMEOUT_MS } from '../src/server.js';
 import { allowLoopbackForward } from '../src/forward-target.js';
 import { AccountManager } from '../src/account-manager.js';
+import { conversationDigest, pinKeyFor } from '../src/conversation.js';
 
 // The MITM now TERMINATES the tunnel (real h2/h1 server) and forwards each
 // request with the shared buffering/retrying proxy listener — so these tests
@@ -280,8 +282,10 @@ test('MITM h2: routes advisor/session context once and sanitizes orphan tool pai
     assert.deepEqual(calls, { begin: 1, record: 1, end: 1 });
     assert.equal(am.sessionStats().known, 1);
     assert.equal(am.sessionStats().active, 1, 'recently completed session remains active within the TTL');
-    assert.equal(am.sessionTracker.pinnedAccount(sessionId, am._weeklyBucketFor('claude-opus-4-8')), 1);
-    assert.equal(am.sessionTracker.pinnedAccount(sessionId, am._weeklyBucketFor('claude-fable-5')), null,
+    // Pins are keyed per conversation since upstream #438 (taken in the 2026-09-29 merge), not by the bare session id.
+    const pinKey = pinKeyFor(sessionId, conversationDigest(Buffer.from(body)));
+    assert.equal(am.sessionTracker.pinnedAccount(pinKey, am._weeklyBucketFor('claude-opus-4-8')), 1);
+    assert.equal(am.sessionTracker.pinnedAccount(pinKey, am._weeklyBucketFor('claude-fable-5')), null,
       'routing the executor does not claim an advisor-family pin');
   } finally {
     tlsSock.destroy(); closeHard(proxy); closeHard(upstream);
@@ -573,4 +577,44 @@ test('MITM h2: a cancelled stream does not strand the request handler', { ...T, 
   assert.ok(got.returned,
     'a cancelled h2 stream left the request handler waiting on a drain or close that cannot arrive; '
     + `its activity entry never closed and the handler holds the event loop: ${JSON.stringify(got)}`);
+});
+
+// The base listener holds an idle keep-alive connection for KEEP_ALIVE_TIMEOUT_MS
+// so a client's pool is always the side that closes (see server-keepalive.test.js).
+// The MITM terminates a server of its own, and that one was left at whatever the
+// runtime defaults to: measured on node 24 it advertised no `Keep-Alive` header
+// at all while the base listener advertised `timeout=120`, and on node 26 the
+// same server closes an idle h1 connection after 6s. Half of one proxy answered
+// to a number nobody chose. Asserted on the header the client actually reads,
+// through a real tunnel, because that is what a connection pool schedules against.
+test('MITM h1: the terminating server holds an idle connection as long as the base listener', T, async () => {
+  const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
+  const upstream = makeUpstream(() => ({ status: 200, headers: { 'content-type': 'text/plain' }, body: 'ok' }));
+  const upPort = await listen(upstream);
+
+  const am = new AccountManager([oauthAccount('acct@x', 'REAL-TOKEN')], 0.98);
+  const proxy = makeProxy(am, upPort, { caCertPem, leafCertPem, leafKeyPem });
+  const proxyPort = await listen(proxy);
+
+  const tlsSock = await connectThroughProxy(proxyPort, `127.0.0.1:${upPort}`, caCertPem, ['http/1.1']);
+  try {
+    const res = await new Promise((resolve, reject) => {
+      const r = http.request({
+        createConnection: () => tlsSock, method: 'POST', path: '/v1/messages',
+        headers: { 'content-type': 'application/json', connection: 'keep-alive' },
+      }, (response) => {
+        response.resume();
+        response.on('end', () => resolve(response));
+      });
+      r.once('error', reject);
+      r.end('{"model":"x"}');
+    });
+    // Node derives this header from the server's keepAliveTimeout, so it is the
+    // client-visible proof the knob reached the internal HTTP/1 server that
+    // allowHTTP1 connections land on.
+    assert.equal(res.headers['keep-alive'], `timeout=${KEEP_ALIVE_TIMEOUT_MS / 1000}`,
+      'the MITM half of the proxy must not keep its own idle window');
+  } finally {
+    tlsSock.destroy(); closeHard(proxy); closeHard(upstream);
+  }
 });

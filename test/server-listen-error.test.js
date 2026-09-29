@@ -35,10 +35,13 @@ function runServer(configPath) {
   child.stderr.on('data', chunk => { stderr += chunk; });
 
   return new Promise((resolve, reject) => {
+    // A watchdog against a child that never exits, not a bound on how fast it
+    // does: startup on a loaded machine is nowhere near the runner's timeout,
+    // and this must not be either.
     const timer = setTimeout(() => {
       child.kill('SIGKILL');
       reject(new Error('server did not exit after listen error'));
-    }, 5000);
+    }, 60_000);
 
     child.on('error', err => {
       clearTimeout(timer);

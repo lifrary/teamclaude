@@ -317,7 +317,10 @@ test('proxy rejects an over-sized request body with 413 (bounded buffering)', as
   });
   assert.equal(res.status, 413);
 
+  upstream.closeAllConnections();
+
   upstream.close();
+  proxy.closeAllConnections();
   proxy.close();
 });
 
@@ -712,7 +715,10 @@ test('a keep-alive connection pins its sequential requests to one account (affin
   assert.ok(served.every(t => t === served[0]),
     'all turns on the keep-alive socket hit one account despite reeval re-prioritization');
 
+  upstream.closeAllConnections();
+
   upstream.close();
+  proxy.closeAllConnections();
   proxy.close();
 });
 
@@ -743,7 +749,10 @@ test('an account removed just before dispatch is not used; the request re-select
     `must not dispatch on the just-removed account; served=${served.join(',')}`);
   assert.equal(am.accounts.every(a => a.inflight === 0), true, 'no leaked slot after the reselect');
 
+  upstream.closeAllConnections();
+
   upstream.close();
+  proxy.closeAllConnections();
   proxy.close();
 });
 
@@ -781,7 +790,10 @@ test('a queued request cancelled by client disconnect never reaches upstream', a
   await new Promise(r => setTimeout(r, 150)); // window for any erroneous dispatch
   assert.equal(hits, 1, 'cancelled queued request must not reach upstream');
 
+  upstream.closeAllConnections();
+
   upstream.close();
+  proxy.closeAllConnections();
   proxy.close();
 });
 
@@ -815,7 +827,10 @@ test('a client disconnect during a stalled SSE stream releases the slot (no capa
   assert.ok(a, 'capacity recovered after the stalled-stream disconnect');
   am.releaseAccount(a);
 
+  upstream.closeAllConnections();
+
   upstream.close();
+  proxy.closeAllConnections();
   proxy.close();
 });
 
@@ -866,7 +881,9 @@ test('a 5xx overload backoff holds no account slot, and an abort stops the retry
   } finally {
     if (prevR === undefined) delete process.env.TEAMCLAUDE_OVERLOAD_RETRIES; else process.env.TEAMCLAUDE_OVERLOAD_RETRIES = prevR;
     if (prevB === undefined) delete process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS; else process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS = prevB;
+    upstream.closeAllConnections();
     upstream.close();
+    proxy.closeAllConnections();
     proxy.close();
   }
 });
@@ -911,7 +928,9 @@ test('a capped-but-healthy fleet reports its concurrency cap, not quota exhausti
     assert.equal(res.headers.get('retry-after'), '5',
       'a capped fleet must give clients a short, non-zero backoff');
   } finally {
+    proxy.closeAllConnections();
     proxy.close();
+    upstream.closeAllConnections();
     upstream.close();
   }
 });
@@ -962,7 +981,9 @@ test('a request in 5xx overload backoff frees capacity for a concurrent request'
   } finally {
     if (prevR === undefined) delete process.env.TEAMCLAUDE_OVERLOAD_RETRIES; else process.env.TEAMCLAUDE_OVERLOAD_RETRIES = prevR;
     if (prevB === undefined) delete process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS; else process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS = prevB;
+    upstream.closeAllConnections();
     upstream.close();
+    proxy.closeAllConnections();
     proxy.close();
   }
 });
@@ -986,7 +1007,10 @@ test('relayRaw enforces the body-size cap on /v1/oauth/token', async () => {
   });
   assert.equal(res.status, 413);
 
+  upstream.closeAllConnections();
+
   upstream.close();
+  proxy.closeAllConnections();
   proxy.close();
 });
 
@@ -1021,7 +1045,9 @@ test('a client disconnect during a hung /v1/oauth/token relay frees admission ca
 
   ac2.abort();
   await p2;
+  upstream.closeAllConnections();
   upstream.close();
+  proxy.closeAllConnections();
   proxy.close();
 });
 
@@ -1048,7 +1074,10 @@ test('global admission cap rejects past capacity before buffering (upstream unto
   await new Promise(r => setTimeout(r, 60));
   assert.equal(hits, 1, 'rejected request never reached upstream');
 
+  upstream.closeAllConnections();
+
   upstream.close();
+  proxy.closeAllConnections();
   proxy.close();
 });
 

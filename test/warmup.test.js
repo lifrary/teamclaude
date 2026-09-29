@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import net from 'node:net';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 
@@ -587,6 +588,82 @@ test('the first real request triggers a fan-out that measures the rest of the fl
 
   proxy.close();
   upstream.close();
+});
+
+// A no-auth SOCKS5 relay that records each CONNECT target and the credential
+// every tunnelled HTTP request carried, so a test can tell whose traffic crossed it.
+function socks5Relay(connects, auths) {
+  const tap = (bytes) => {
+    const m = /^authorization: *(.+?)\r?$/im.exec(bytes.toString('latin1'));
+    if (m) auths.push(m[1]);
+  };
+  return net.createServer((client) => {
+    let stage = 'greeting';
+    let buf = Buffer.alloc(0);
+    client.on('error', () => {});
+    client.on('data', (chunk) => {
+      if (stage === 'relay') { tap(chunk); return; }
+      buf = Buffer.concat([buf, chunk]);
+      if (stage === 'greeting') {
+        if (buf.length < 2 + (buf[1] || 0)) return;
+        buf = buf.subarray(2 + buf[1]);
+        stage = 'request';
+        client.write(Buffer.from([0x05, 0x00]));
+      }
+      if (stage === 'request') {
+        if (buf.length < 10) return;
+        const host = [...buf.subarray(4, 8)].join('.');
+        const port = buf.readUInt16BE(8);
+        buf = buf.subarray(10);
+        connects.push(`${host}:${port}`);
+        if (buf.length) tap(buf);
+        const up = net.connect(port, host, () => {
+          client.write(Buffer.from([0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
+          if (buf.length) up.write(buf);
+          up.pipe(client); client.pipe(up);
+        });
+        up.on('error', () => client.destroy());
+        stage = 'relay';
+      }
+    });
+  });
+}
+
+// A routed account's traffic never leaves by another path (accounts[].routing,
+// upstream #441), and a warm-up probe spends that account's credential exactly
+// as a client request does, so it goes through the same proxy.
+test('a routed account is warm-up probed through its own routing proxy', async () => {
+  const seen = [];
+  const upstream = recordingUpstream(seen);
+  const upstreamPort = await listen(upstream);
+  const connects = [];
+  const auths = [];
+  const socks = socks5Relay(connects, auths);
+  const socksPort = await listen(socks);
+
+  const [plain, routed] = makeAccounts(2);
+  const am = new AccountManager([plain, { ...routed, routing: `socks5://127.0.0.1:${socksPort}` }], 0.98, 0, 3);
+  const proxy = createProxyServer(am, { upstream: `http://127.0.0.1:${upstreamPort}`, warmupIntervalMs: 0 });
+  const port = await listen(proxy);
+  try {
+    // The real request lands on a0 (the warm-up cursor) and commits the template.
+    const r = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model: 'claude-x', system: 'You are Claude Code', messages: [{ role: 'user', content: 'real' }] }),
+    });
+    assert.equal(r.status, 200);
+    assert.ok(await waitFor(() => measured(am, 'a1')), 'the fan-out probed and measured the routed account');
+
+    const routedHits = seen.filter(s => s.auth === 'Bearer tok-1');
+    assert.equal(routedHits.length, 1);
+    assert.equal(JSON.parse(routedHits[0].body).messages?.[0]?.content, 'ping', 'the routed account was reached by the probe');
+    assert.deepEqual(auths, ['Bearer tok-1'], 'the probe carried the routed credential through its proxy, and nothing else did');
+    assert.deepEqual(connects, [`127.0.0.1:${upstreamPort}`]);
+  } finally {
+    proxy.close(); upstream.close(); socks.close();
+    proxy.closeAllConnections?.(); upstream.closeAllConnections?.();
+  }
 });
 
 // ── integration: periodic warm-up ──────────────────────────────────────────

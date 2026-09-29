@@ -21,6 +21,7 @@
 import http from 'node:http';
 import https from 'node:https';
 import { connectThroughProxy, handshakeOverTunnel } from './sx.js';
+import { envVar } from './brand.js';
 
 /**
  * Parse a proxy URL into the shape connectThroughProxy wants.
@@ -151,7 +152,7 @@ function isLoopbackHost(host) {
 export function localListener(config = {}, env = process.env) {
   const port = Number(config?.proxy?.port);
   if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
-  return { host: env.TEAMCLAUDE_HOST || config?.proxy?.host || '127.0.0.1', port };
+  return { host: envVar('HOST', env) || config?.proxy?.host || '127.0.0.1', port };
 }
 
 /** True when `proxy` addresses `listener` — sending through it comes straight back. */

@@ -17,6 +17,7 @@ import { exec } from 'node:child_process';
 import http from 'node:http';
 import { proxyFetch } from './upstream-fetch.js';
 import { tokenPairFromResponse } from './oauth.js';
+import { envVar } from './brand.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 export const DEFAULT_CODEX_CREDENTIALS_PATH = '~/.codex/auth.json';
@@ -73,6 +74,7 @@ export async function importCodexCredentials(filePath = DEFAULT_CODEX_CREDENTIAL
     accountId: auth.chatgpt_account_id || tokens.account_id,
     email: claims.email,
     planType: auth.chatgpt_plan_type,
+    userId: auth.chatgpt_user_id || auth.user_id,
   };
 }
 
@@ -83,9 +85,12 @@ export async function importCodexCredentials(filePath = DEFAULT_CODEX_CREDENTIAL
  * expiresAt }`) so the account manager can treat both the same. A rotated
  * refresh token is returned when the server issues one, and the old one is
  * kept when it does not.
+ * @param {string} refreshToken
+ * @param {string} [endpoint]
+ * @param {import('./account-routing.js').RoutingProxy|null} [routing] - the account's own egress proxy
  */
-export async function refreshCodexToken(refreshToken, endpoint = TOKEN_ENDPOINT) {
-  const timeoutMs = Number(process.env.TEAMCLAUDE_REFRESH_TIMEOUT_MS) || 30_000;
+export async function refreshCodexToken(refreshToken, endpoint = TOKEN_ENDPOINT, routing = null) {
+  const timeoutMs = Number(envVar('REFRESH_TIMEOUT_MS')) || 30_000;
   const res = await proxyFetch(endpoint, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
@@ -95,6 +100,7 @@ export async function refreshCodexToken(refreshToken, endpoint = TOKEN_ENDPOINT)
       client_id: CLIENT_ID,
     }),
     signal: AbortSignal.timeout(timeoutMs),
+    routing,
   });
 
   if (!res.ok) {
@@ -139,8 +145,10 @@ export function buildCodexAuthUrl({ state, codeChallenge, redirectUri = REDIRECT
   return url.toString();
 }
 
-/** Exchange an authorization code for tokens, completing the PKCE handshake. */
-export async function exchangeCodexCode({ code, codeVerifier, redirectUri = REDIRECT_URI }) {
+/** Exchange an authorization code for tokens, completing the PKCE handshake.
+ * @param {{ code: string, codeVerifier: string, redirectUri?: string, routing?: import('./account-routing.js').RoutingProxy|null }} args
+ */
+export async function exchangeCodexCode({ code, codeVerifier, redirectUri = REDIRECT_URI, routing = null }) {
   const res = await proxyFetch(TOKEN_ENDPOINT, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
@@ -151,6 +159,7 @@ export async function exchangeCodexCode({ code, codeVerifier, redirectUri = REDI
       redirect_uri: redirectUri,
       code_verifier: codeVerifier,
     }),
+    routing,
   });
   if (!res.ok) {
     throw new Error(`Codex token exchange failed (${res.status}): ${await res.text()}`);
@@ -170,6 +179,7 @@ export function credentialsFromTokenResponse(data) {
     accountId: auth.chatgpt_account_id,
     email: claims.email,
     planType: auth.chatgpt_plan_type,
+    userId: auth.chatgpt_user_id || auth.user_id,
   };
 }
 
@@ -179,7 +189,7 @@ function openBrowser(url) {
   const cmd = process.platform === 'darwin' ? 'open'
     : process.platform === 'win32' ? 'start ""'
       : 'xdg-open';
-  exec(`${cmd} ${JSON.stringify(url)}`, () => {});
+  exec(`${cmd} ${JSON.stringify(url)}`, err => { if (err) console.error(`Could not open a browser (${cmd}): ${err.message} — open the URL by hand or run \`teamclaude login\` on a machine with one`); });
 }
 
 /**
@@ -229,7 +239,13 @@ export function codexCallbackHandler(expectedState, { resolve, reject }) {
   };
 }
 
-export async function loginCodex({ noBrowser = false, timeoutMs = 120_000 } = {}) {
+/**
+ * @param {{ noBrowser?: boolean, timeoutMs?: number, showUrl?: boolean, routing?: import('./account-routing.js').RoutingProxy|null }} [opts]
+ * `routing` is the about-to-be-added account's own egress proxy (login --routing).
+ * `showUrl: false` skips the printed fallback URL, for a caller whose console
+ * is the TUI's one-line activity pane.
+ */
+export async function loginCodex({ noBrowser = false, timeoutMs = 120_000, showUrl = true, routing = null } = {}) {
   const codeVerifier = randomBytes(32).toString('base64url');
   const codeChallenge = createHash('sha256').update(codeVerifier).digest('base64url');
   const state = randomBytes(32).toString('base64url');
@@ -249,7 +265,9 @@ export async function loginCodex({ noBrowser = false, timeoutMs = 120_000 } = {}
       } else {
         console.log('Opening browser for OpenAI sign-in...');
         openBrowser(authUrl);
-        console.log(`If it did not open, visit:\n${authUrl}`);
+        // showUrl: false is for a caller whose console is the TUI's one-line
+        // activity pane, where a multi-line URL is noise it cannot act on.
+        if (showUrl) console.log(`If it did not open, visit:\n${authUrl}`);
       }
     });
 
@@ -259,5 +277,5 @@ export async function loginCodex({ noBrowser = false, timeoutMs = 120_000 } = {}
     // an authorization code, and nothing off this machine should reach it.
   }).finally(() => { server?.close(); });
 
-  return exchangeCodexCode({ code, codeVerifier });
+  return exchangeCodexCode({ code, codeVerifier, routing });
 }

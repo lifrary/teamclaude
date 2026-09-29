@@ -1,6 +1,5 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import net from 'node:net';
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { mkdtemp, writeFile } from 'node:fs/promises';
@@ -9,6 +8,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
+import { closedPort } from '../test-helpers/spawn-server.js';
 
 // `teamclaude switch` drives the real control endpoint, so these run the CLI
 // against a real proxy server rather than a stubbed one.
@@ -22,17 +22,6 @@ const ACCTS = [
 
 function listen(server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
-}
-
-// A port nothing is listening on: bind one, learn its number, give it back.
-function closedPort() {
-  return new Promise(resolve => {
-    const probe = net.createServer();
-    probe.listen(0, '127.0.0.1', () => {
-      const { port } = probe.address();
-      probe.close(() => resolve(port));
-    });
-  });
 }
 
 async function writeConfig(port) {

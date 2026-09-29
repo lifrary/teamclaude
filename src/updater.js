@@ -18,6 +18,7 @@ import { dirname, join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { getConfigPath } from './config.js';
 import { safeLine } from './safe-text.js';
+import { envVar } from './brand.js';
 
 export const PKG_NAME = '@karpeleslab/teamclaude';
 const REGISTRY = 'https://registry.npmjs.org';
@@ -274,7 +275,7 @@ export async function autoUpdate({
   check = checkForUpdate, kind = installKind, install = runUpdate,
 } = {}) {
   if (existsSync(join(root, '.git'))) return { skipped: 'git' }; // dev checkout — never touch
-  if (process.env.TEAMCLAUDE_DISABLE_AUTOUPDATE || config.autoUpdate === false) {
+  if (envVar('DISABLE_AUTOUPDATE') || config.autoUpdate === false) {
     return { skipped: 'disabled' };
   }
   if (uid === 0) {

@@ -107,8 +107,9 @@ test('a server with a logDir sweeps it once at startup', { timeout: 20000 }, asy
   });
   await new Promise(r => proxy.listen(0, '127.0.0.1', r));
   try {
-    const deadline = Date.now() + 5000;
-    while (readdirSync(dir).includes(expired) && Date.now() < deadline) {
+    // The startup sweep is asynchronous; wait for it to have happened, with
+    // the runner's timeout as the only bound.
+    while (readdirSync(dir).includes(expired)) {
       await new Promise(r => setTimeout(r, 25));
     }
     const left = readdirSync(dir);

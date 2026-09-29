@@ -187,11 +187,10 @@ test('new external credentials (updateAccountTokens) heal ANY error cause', asyn
 
 // ── race window: 401 landing on an already-parked account ───────────────────
 // A request dispatched while the account was healthy can come back 401 AFTER a
-// failed sweep refresh already parked the account as refresh-caused. If that
-// 401 arrived on a STILL-VALID token it is account-level rejection evidence,
-// and the label must be demoted so the next token-endpoint success does not
-// revive the account (adversarial-review round 2, HIGH). A 401 on an EXPIRED
-// token proves nothing beyond the expiry and must keep the label.
+// failed sweep refresh already parked the account as refresh-caused. That 401
+// only fails over: it leaves the refresh's own verdict and label alone, on a
+// still-valid token as on an expired one, so a later successful refresh can
+// still heal the account.
 
 import http from 'node:http';
 import { createProxyServer } from '../src/server.js';
@@ -243,11 +242,12 @@ async function run401RaceScenario(parkedTokenStillValid) {
   }
 }
 
-test('a 401 on a STILL-VALID token demotes a refresh-caused label (sweep must not revive)', async () => {
+test('a 401 on a STILL-VALID token keeps a refresh-caused label (the 401 only fails over)', async () => {
+  // Upstream's 401 fail-over-only rule (#439/#473), taken in the upstream merge, replaced 3b8a3c2's demotion.
   const a = await run401RaceScenario(true);
   assert.equal(a.status, 'error');
-  assert.equal(a._errorFromRefresh, false,
-    'valid-token 401 is account-level rejection evidence — label demoted');
+  assert.equal(a._errorFromRefresh, true,
+    'a refreshable account\'s 401 fails over and leaves the refresh verdict alone');
 });
 
 test('a 401 on an EXPIRED token keeps the refresh-caused label (expiry explains the 401)', async () => {

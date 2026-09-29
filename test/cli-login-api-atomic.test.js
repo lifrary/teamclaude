@@ -1,12 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import net from 'node:net';
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { mkdtemp, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { closedPort } from '../test-helpers/spawn-server.js';
 
 // `teamclaude login --api` loads the config, waits on the key prompt for as long
 // as the user takes, and then saves. A running server may rotate an OAuth
@@ -37,17 +37,6 @@ async function writeConfig(config) {
   const path = join(dir, 'config.json');
   await writeFile(path, JSON.stringify(config));
   return path;
-}
-
-// A port nothing is listening on: bind one, learn its number, give it back.
-function closedPort() {
-  return new Promise(resolve => {
-    const probe = net.createServer();
-    probe.listen(0, '127.0.0.1', () => {
-      const { port } = probe.address();
-      probe.close(() => resolve(port));
-    });
-  });
 }
 
 // A stand-in running server that records what the CLI posts to it.

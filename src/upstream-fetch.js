@@ -14,7 +14,9 @@ import https from 'node:https';
 import { ReadableStream } from 'node:stream/web';
 import { tunnelTls } from './sx.js';
 import { proxyForHost, proxyAgent } from './upstream-proxy.js';
+import { routingAgent } from './account-routing.js';
 import { AdmissionGate, DEFAULT_MAX_QUEUE, DEFAULT_QUEUE_TIMEOUT_MS } from './admission-gate.js';
+import { envVar } from './brand.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 // Pooled keep-alive agents for the direct (non-sx) path. Node's global fetch
@@ -29,7 +31,7 @@ import { AdmissionGate, DEFAULT_MAX_QUEUE, DEFAULT_QUEUE_TIMEOUT_MS } from './ad
 // per-origin and bounds the fan-out. Escape hatch:
 // TEAMCLAUDE_UPSTREAM_GLOBAL_FETCH=1 reverts to the old global-fetch path.
 export const DEFAULT_UPSTREAM_MAX_SOCKETS = 256;
-const MAX_SOCKETS = positiveInt(process.env.TEAMCLAUDE_UPSTREAM_MAX_SOCKETS, DEFAULT_UPSTREAM_MAX_SOCKETS);
+const MAX_SOCKETS = positiveInt(envVar('UPSTREAM_MAX_SOCKETS'), DEFAULT_UPSTREAM_MAX_SOCKETS);
 
 // Admission in front of the pool. Node's Agent queues a request past
 // maxSockets internally, without bound and without a deadline, and destroying
@@ -46,8 +48,8 @@ const MAX_SOCKETS = positiveInt(process.env.TEAMCLAUDE_UPSTREAM_MAX_SOCKETS, DEF
 // free (a permit is held until the response body ends or is dropped).
 export const DEFAULT_UPSTREAM_MAX_QUEUE = DEFAULT_MAX_QUEUE;
 export const DEFAULT_UPSTREAM_QUEUE_TIMEOUT_MS = DEFAULT_QUEUE_TIMEOUT_MS;
-const MAX_QUEUE = nonNegativeInt(process.env.TEAMCLAUDE_UPSTREAM_MAX_QUEUE, DEFAULT_UPSTREAM_MAX_QUEUE);
-const QUEUE_TIMEOUT_MS = positiveInt(process.env.TEAMCLAUDE_UPSTREAM_QUEUE_TIMEOUT_MS, DEFAULT_UPSTREAM_QUEUE_TIMEOUT_MS);
+const MAX_QUEUE = nonNegativeInt(envVar('UPSTREAM_MAX_QUEUE'), DEFAULT_UPSTREAM_MAX_QUEUE);
+const QUEUE_TIMEOUT_MS = positiveInt(envVar('UPSTREAM_QUEUE_TIMEOUT_MS'), DEFAULT_UPSTREAM_QUEUE_TIMEOUT_MS);
 const admissionByOrigin = new Map();
 
 // Counters only (no origins, no request data): for the status endpoint.
@@ -69,7 +71,7 @@ function nonNegativeInt(value, fallback) {
 }
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: MAX_SOCKETS });
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: MAX_SOCKETS });
-const USE_GLOBAL_FETCH = /^(1|true|yes|on)$/i.test(process.env.TEAMCLAUDE_UPSTREAM_GLOBAL_FETCH || '');
+const USE_GLOBAL_FETCH = /^(1|true|yes|on)$/i.test(envVar('UPSTREAM_GLOBAL_FETCH') || '');
 
 // Time to wait for RESPONSE HEADERS before treating the upstream socket as dead.
 // This is NOT a limit on the response body (SSE completions can stream for
@@ -101,14 +103,24 @@ const USE_GLOBAL_FETCH = /^(1|true|yes|on)$/i.test(process.env.TEAMCLAUDE_UPSTRE
 //
 // Default is generous (well above Claude's realistic first-byte, even when
 // queued or under load) so a slow-but-legitimate response is never mistaken for
-// a dead socket. Override with TEAMCLAUDE_UPSTREAM_HEADERS_TIMEOUT_MS (or
-// per-call opts).
-const DEFAULT_HEADERS_TIMEOUT_MS = 120_000;
+// a dead socket. It is the wait for a backend this module knows nothing about:
+// a caller that knows its own upstream is slower to the head says so with
+// `defaultHeadersTimeoutMs`, which is how the forward path applies the
+// provider's default (provider.js — a Codex response head is held open while
+// the model reasons). Order, most specific first: the per-call
+// `headersTimeoutMs`, then TEAMCLAUDE_UPSTREAM_HEADERS_TIMEOUT_MS (the
+// operator's fleet-wide override), then the caller's default, then this one.
+export const DEFAULT_HEADERS_TIMEOUT_MS = 120_000;
 
-function resolveHeadersTimeout(perCall) {
+/**
+ * @param {number|null|undefined} perCall
+ * @param {number|null|undefined} [fallbackMs]
+ * @returns {number}
+ */
+function resolveHeadersTimeout(perCall, fallbackMs) {
   if (perCall != null) return perCall;
-  const env = Number(process.env.TEAMCLAUDE_UPSTREAM_HEADERS_TIMEOUT_MS);
-  return env > 0 ? env : DEFAULT_HEADERS_TIMEOUT_MS;
+  const env = Number(envVar('UPSTREAM_HEADERS_TIMEOUT_MS'));
+  return env > 0 ? env : positiveInt(fallbackMs, DEFAULT_HEADERS_TIMEOUT_MS);
 }
 
 function headersTimeoutError(ms) {
@@ -122,12 +134,19 @@ function headersTimeoutError(ms) {
 // `useProxy` is decided by the caller (it varies per attempt — e.g. direct first,
 // then via sx after a 429). With it false, or sx unprovisioned, this is plain fetch
 // (plus the headers-timeout guard).
+//
+// `opts.routing` is one account's own egress proxy (account-routing.js). It
+// outranks BOTH sx and the fleet upstream proxy: the operator's contract for a
+// routed account is that its traffic never leaves by another path, so every
+// attempt — including a post-429 retry — goes through that account's proxy.
+/** @param {Record<string, any>} [opts] */
 export function upstreamFetch(url, opts = {}, sx = null, useProxy = false) {
-  const { headersTimeoutMs, queueTimeoutMs, ...fetchOpts } = opts;
-  const timeoutMs = resolveHeadersTimeout(headersTimeoutMs);
+  const { headersTimeoutMs, defaultHeadersTimeoutMs, queueTimeoutMs, routing, ...fetchOpts } = opts;
+  const timeoutMs = resolveHeadersTimeout(headersTimeoutMs, defaultHeadersTimeoutMs);
   // The admission wait is a per-call option of the node:http paths only; the
   // global-fetch escape hatch is not gated (it has no socket pool to protect).
   const nodeOpts = queueTimeoutMs == null ? fetchOpts : { ...fetchOpts, queueTimeoutMs };
+  if (routing) return pooledFetch(url, { ...nodeOpts, routing }, timeoutMs);
   if (sx && useProxy && sx.isProvisioned()) return proxiedFetch(url, nodeOpts, sx, timeoutMs);
   // The global-fetch escape hatch cannot speak CONNECT (that is why the tunnel
   // is hand-rolled at all), so an upstream proxy overrides it rather than being
@@ -146,9 +165,15 @@ export function upstreamFetch(url, opts = {}, sx = null, useProxy = false) {
  * whether an account can be added or kept alive at all. Leaving them direct
  * would mean `login` fails and every token refresh dies on a host that can only
  * reach the network through a proxy, which is precisely the reported setup.
+ *
+ * `opts.routing` pins the call to one account's own egress proxy, which — as on
+ * the forwarding path — outranks the fleet proxy for that account.
+ * @param {string} url
+ * @param {Record<string, any>} [opts]
  */
 export function proxyFetch(url, opts = {}) {
-  const { headersTimeoutMs, ...rest } = opts;
+  const { headersTimeoutMs, routing, ...rest } = opts;
+  if (routing) return pooledFetch(url, { ...rest, routing }, resolveHeadersTimeout(headersTimeoutMs));
   if (!proxyForHost(new URL(url).hostname)) return fetch(url, rest);
   return pooledFetch(url, rest, resolveHeadersTimeout(headersTimeoutMs));
 }
@@ -159,11 +184,16 @@ export function proxyFetch(url, opts = {}) {
 // "Direct" here means "not via sx". A configured upstream proxy (config
 // `upstreamProxy`, or HTTPS_PROXY — see upstream-proxy.js) still applies: on
 // those hosts there is no such thing as a direct socket to api.anthropic.com,
-// which is the whole of issue #155.
+// which is the whole of issue #155. A per-call `opts.routing` (one account's
+// own proxy) is checked FIRST and replaces the fleet proxy for this call.
 function pooledFetch(url, opts, timeoutMs) {
   const u = new URL(url);
   const isHttp = u.protocol === 'http:';
   const port = Number(u.port) || (isHttp ? 80 : 443);
+  if (opts.routing) {
+    const agent = routingAgent(opts.routing, { targetHost: u.hostname, targetPort: port, tls: !isHttp, tlsOptions: opts.tlsOptions || {} });
+    return nodeRequest(u, opts, timeoutMs, { transport: isHttp ? http : https, agent });
+  }
   const proxy = proxyForHost(u.hostname);
   if (proxy) {
     const agent = proxyAgent(proxy, { targetHost: u.hostname, targetPort: port, tls: !isHttp, tlsOptions: opts.tlsOptions || {} });
@@ -345,6 +375,7 @@ function makeResponse(res) {
   };
   return {
     status: res.statusCode,
+    statusText: res.statusMessage || '',
     ok: res.statusCode >= 200 && res.statusCode < 300,
     headers: makeHeaders(res.headers),
     body: web,

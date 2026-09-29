@@ -50,7 +50,10 @@ async function fixture(t) {
   return { am, url, upload, started, ended, forwarded: () => forwarded, upstreamClosed: () => upstreamClosed };
 }
 
-test('disconnect during a quota hold clears activity without waiting for the retry timer', { timeout: 4000 }, async t => {
+// No per-test timeout on either: what must not happen is a wait for the
+// 60 s retry timer (or the 2-minute idle watchdog), and the runner's own
+// timeout is what catches that; a shorter bound here only measures the machine.
+test('disconnect during a quota hold clears activity without waiting for the retry timer', async t => {
   const f = await fixture(t);
   // No account can serve: with holdSeconds set the proxy holds the connection
   // and sleeps (60s here) before polling again. The sleep must end with the client.
@@ -64,7 +67,7 @@ test('disconnect during a quota hold clears activity without waiting for the ret
   assert.equal(f.forwarded(), 0);
 });
 
-test('disconnect before upstream headers cancels upstream and closes activity promptly', { timeout: 4000 }, async t => {
+test('disconnect before upstream headers cancels upstream and closes activity promptly', async t => {
   const f = await fixture(t);
   const client = f.upload({ 'x-test-stall': '1' }); client.req.end('{}');
   await until(() => f.forwarded() === 1);

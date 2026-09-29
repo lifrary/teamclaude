@@ -1,11 +1,12 @@
 import { readFile, writeFile, mkdir, rm, chmod, open, rename, unlink, realpath } from 'node:fs/promises';
-import { openSync, writeSync, closeSync, readFileSync, statSync } from 'node:fs';
+import { openSync, writeSync, closeSync, readFileSync, statSync, existsSync } from 'node:fs';
 import { join, dirname, basename } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash, randomBytes } from 'node:crypto';
 import { accountId, accountIdKey, createIdentityRegistry, parseAccountIdKey } from './identity.js';
 import { resolveUpstreamProxy, setUpstreamProxy } from './upstream-proxy.js';
 import { ensureAccountIds } from './account-id.js';
+import { envVar, NAME, LEGACY_NAME } from './brand.js';
 
 /**
  * Credential-free state sections remain runtime-validated against the allowlists.
@@ -38,9 +39,15 @@ import { ensureAccountIds } from './account-id.js';
  */
 
 export function getConfigPath() {
-  if (process.env.TEAMCLAUDE_CONFIG) return process.env.TEAMCLAUDE_CONFIG;
+  const fromEnv = envVar('CONFIG');
+  if (fromEnv) return fromEnv;
   const configDir = process.env.XDG_CONFIG_HOME || join(homedir(), '.config');
-  return join(configDir, 'teamclaude.json');
+  // The renamed file is used when it exists; until then, and for a fresh
+  // install, the file keeps its current name (issue #72, phase 1). The state
+  // file, crash log and certificates sit beside whichever one this returns.
+  const renamed = join(configDir, `${NAME}.json`);
+  if (existsSync(renamed)) return renamed;
+  return join(configDir, `${LEGACY_NAME}.json`);
 }
 
 // Runtime state for the running server (pid/port), kept separate from volatile
@@ -197,15 +204,23 @@ const ACCOUNT_STATE_FIELDS = new Set(['quota', 'usage', 'throttle', 'convergence
 const PROFILE_FIELDS = new Set(['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro']);
 const ADAPTIVE_FIELDS = new Set(['burnRate', 'concCap']);
 const BURN_RATE_FIELDS = new Set(['burnRate', 'lastU', 'lastAt', 'burnAnchorU', 'burnAnchorAt']);
+// Every field account-manager's PERSISTED_QUOTA_FIELDS exports must be listed
+// here: exportCanonicalState copies each one (undefined included), and a key
+// this set lacks fails every canonical save, not just the one account's.
 const QUOTA_FIELDS = new Set([
   'tokensLimit', 'tokensRemaining', 'requestsLimit', 'requestsRemaining',
   'unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable',
   'unified5hReset', 'unified7dReset', 'unified7dSonnetReset', 'unified7dFableReset',
   'resetsAt', 'modelWeekly', 'scopedWeekly', 'unified7dSonnetSeenAt', 'unified7dFableSeenAt',
+  'unified5hSeenAt', 'unified7dSeenAt', 'resetCredits', 'sessionWindowStated',
 ]);
+const RESET_CREDITS_FIELDS = new Set(['available', 'applicable', 'seenAt']);
 const USAGE_FIELDS = new Set(['totalInputTokens', 'totalOutputTokens', 'totalRequests', 'lastUsed', 'totalCacheReadTokens', 'totalCacheCreationTokens', 'byBucket']);
 const BUCKET_USAGE_FIELDS = new Set(['inputTokens', 'outputTokens', 'requests', 'cacheReadTokens', 'cacheCreationTokens']);
-const CLIENT_USAGE_FIELDS = new Set(['requests', 'connections', 'inputTokens', 'outputTokens', 'lastUsed']);
+// `slots` is the 15-minute tally ClientUsageTracker.exportState() persists so
+// the 5h/24h usage windows resume across a restart: slot number -> counters.
+const CLIENT_USAGE_FIELDS = new Set(['requests', 'connections', 'inputTokens', 'outputTokens', 'lastUsed', 'slots']);
+const CLIENT_USAGE_SLOT_FIELDS = new Set(['requests', 'connections', 'inputTokens', 'outputTokens']);
 const THROTTLE_FIELDS = new Set(['until']);
 const CONVERGENCE_FIELDS = new Set(['attempts', 'lastAttemptAt', 'lastSuccessAt', 'status']);
 const RESET_FIELDS = new Set(['at', 'reason']);
@@ -277,7 +292,11 @@ function validateAccountState(value) {
   if (value.quota !== undefined) {
     assertAllowed(value.quota, QUOTA_FIELDS, 'quota');
     for (const [field, nested] of Object.entries(value.quota)) {
-      if (field !== 'modelWeekly' && field !== 'scopedWeekly') assertScalar(nested, `quota.${field}`);
+      if (field !== 'modelWeekly' && field !== 'scopedWeekly' && field !== 'resetCredits') assertScalar(nested, `quota.${field}`);
+    }
+    if (value.quota.resetCredits != null) {
+      assertAllowed(value.quota.resetCredits, RESET_CREDITS_FIELDS, 'quota.resetCredits');
+      for (const nested of Object.values(value.quota.resetCredits)) assertScalar(nested, 'quota.resetCredits');
     }
     if (value.quota.modelWeekly !== undefined) {
       if (!isObject(value.quota.modelWeekly)) throw new CanonicalStateError('validate quota.modelWeekly');
@@ -309,6 +328,25 @@ function validateCounterMap(value, fields, label) {
   for (const counters of Object.values(/** @type {Record<string, unknown>} */ (value))) {
     assertAllowed(counters, fields, label);
     for (const scalar of Object.values(counters)) assertScalar(scalar, label);
+  }
+}
+
+/** Client and usage-dimension rows: scalar counters plus an optional `slots` tally.
+ * @param {unknown} value @param {string} label */
+function validateClientUsageMap(value, label) {
+  if (!isObject(value)) throw new CanonicalStateError(`validate ${label}`);
+  for (const counters of Object.values(/** @type {Record<string, unknown>} */ (value))) {
+    assertAllowed(counters, CLIENT_USAGE_FIELDS, label);
+    for (const [field, nested] of Object.entries(counters)) {
+      if (field !== 'slots') { assertScalar(nested, label); continue; }
+      if (nested === undefined) continue;
+      if (!isObject(nested)) throw new CanonicalStateError(`validate ${label}.slots`);
+      for (const [slot, tally] of Object.entries(/** @type {Record<string, unknown>} */ (nested))) {
+        if (!/^-?\d+$/.test(slot)) throw new CanonicalStateError(`validate ${label}.slots`);
+        assertAllowed(tally, CLIENT_USAGE_SLOT_FIELDS, `${label}.slots`);
+        for (const scalar of Object.values(tally)) assertScalar(scalar, `${label}.slots`);
+      }
+    }
   }
 }
 
@@ -421,10 +459,10 @@ export function validateCanonicalState(state) {
   }
   if (state.activeAccountId !== null && !Object.hasOwn(state.accounts, state.activeAccountId)) throw new CanonicalStateError('validate');
   validateTemplate(state.template);
-  if (state.clients !== undefined) validateCounterMap(state.clients, CLIENT_USAGE_FIELDS, 'clients');
+  if (state.clients !== undefined) validateClientUsageMap(state.clients, 'clients');
   if (state.usageDimensions !== undefined) {
     if (!isObject(state.usageDimensions)) throw new CanonicalStateError('validate usageDimensions');
-    for (const entries of Object.values(state.usageDimensions)) validateCounterMap(entries, CLIENT_USAGE_FIELDS, 'usageDimensions');
+    for (const entries of Object.values(state.usageDimensions)) validateClientUsageMap(entries, 'usageDimensions');
   }
   return state;
 }
@@ -802,9 +840,15 @@ export function createDefaultConfig() {
     holdSeconds: 0,
     distributeSessions: false,
     sessionTitles: { enabled: false, width: 18 },
+    quotaBarPercent: true,
     eventLogging: 'hide',
     defaultClientMode: 'mitm',
+    // Written out rather than left absent, so a fresh config states the one
+    // setting whose default matters most: a redemption cannot be undone and the
+    // credits are scarce, so nothing spends one until this is switched on.
+    autoRedeemResets: false,
     blockedModels: [],
+    stripOverageHeaders: false,
     accounts: [],
   };
 }
@@ -969,6 +1013,14 @@ const LOCK_STALE_MS = 10_000;
 const LOCK_WAIT_MS = 2_000;
 const LOCK_POLL_MS = 25;
 
+/** The wait budget, read per acquisition: TEAMCLAUDE_CONFIG_LOCK_WAIT_MS
+ * overrides the 2 s for a deployment whose writers are known to hold the
+ * lock longer (and lets a test pick a budget its assertions do not race). */
+function lockWaitMs() {
+  const env = Number(envVar('CONFIG_LOCK_WAIT_MS'));
+  return env > 0 ? env : LOCK_WAIT_MS;
+}
+
 /** @param {string} lockPath */
 function lockIsStale(lockPath) {
   let pid, at;
@@ -989,7 +1041,8 @@ function lockIsStale(lockPath) {
  * @param {string} lockPath
  */
 async function acquireConfigLock(lockPath) {
-  const deadline = Date.now() + LOCK_WAIT_MS;
+  const waitMs = lockWaitMs();
+  const deadline = Date.now() + waitMs;
   for (;;) {
     try {
       const fd = openSync(lockPath, 'wx', 0o600);
@@ -1006,7 +1059,7 @@ async function acquireConfigLock(lockPath) {
       continue;
     }
     if (Date.now() >= deadline) {
-      console.error(`[TeamClaude] ${lockPath} is still held by another process after ${LOCK_WAIT_MS}ms; writing the config without it`);
+      console.error(`[TeamClaude] ${lockPath} is still held by another process after ${waitMs}ms; writing the config without it`);
       return false;
     }
     await new Promise(resolve => setTimeout(resolve, LOCK_POLL_MS));

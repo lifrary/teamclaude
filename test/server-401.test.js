@@ -104,7 +104,9 @@ test('401 with a rejected refresh errors the account and fails over', async () =
 });
 
 // Regression: the retry must be bounded. An upstream that 401s even a
-// freshly-minted token must surface the 401, not loop refreshing forever.
+// freshly-minted token must end the request, not loop refreshing forever. What
+// the client gets is the proxy's own error, never the account's 401: Claude
+// Code reads a 401 as its own login having died (#412).
 test('persistent 401 terminates instead of looping', async () => {
   const { server: upstream, seen } = revokingUpstream(new Set());   // nothing is ever accepted
   const upstreamPort = await listen(upstream);
@@ -119,17 +121,22 @@ test('persistent 401 terminates instead of looping', async () => {
   const proxyPort = await listen(proxy);
 
   try {
-    assert.equal(await post(proxyPort), 401);          // surfaced, not hung
+    assert.equal(await post(proxyPort), 502);          // ended, not hung, and not a relayed 401
     assert.equal(refreshes, 1);                        // one re-auth per account per request
     assert.equal(seen.length, 2);
+    // It holds a refresh token, so a later request may still repair it.
+    assert.notEqual(am.accounts[0].status, 'error');
   } finally {
     proxy.close();
     upstream.close();
   }
 });
 
-// An API-key account has no refresh token, so a 401 is a bad key — retrying it
-// would just burn a round trip. It must pass straight through.
+// An API-key account has no refresh token, so retrying a 401 at once would
+// just burn a round trip. Nothing here can repair the key, so the account also
+// leaves rotation instead of being picked again by the next request (#412) —
+// for a cooldown, not for good: a gateway answers 401 with a good key while
+// its own upstream is down, and `error` has no way back for an API key (#473).
 test('401 on an api-key account is not retried', async () => {
   const { server: upstream, seen } = revokingUpstream(new Set());
   const upstreamPort = await listen(upstream);
@@ -139,8 +146,13 @@ test('401 on an api-key account is not retried', async () => {
   const proxyPort = await listen(proxy);
 
   try {
-    assert.equal(await post(proxyPort), 401);
+    assert.equal(await post(proxyPort), 502);
     assert.equal(seen.length, 1);                      // no retry
+    assert.equal(am.accounts[0].status, 'active');
+    assert.equal(am.unavailableReason(am.accounts[0]), 'credential');
+    // Nor by the request after it: held, the account is asked nothing.
+    assert.notEqual(await post(proxyPort), 401);
+    assert.equal(seen.length, 1);
   } finally {
     proxy.close();
     upstream.close();
@@ -214,8 +226,8 @@ test('back-to-back 401 requests rotate the token family once', async () => {
   const proxyPort = await listen(proxy);
 
   try {
-    assert.equal(await post(proxyPort), 401);
-    assert.equal(await post(proxyPort), 401);
+    assert.equal(await post(proxyPort), 502);
+    assert.equal(await post(proxyPort), 502);
     assert.equal(refreshes, 1);                        // not once per request
   } finally {
     proxy.close();

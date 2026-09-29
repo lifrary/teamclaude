@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
-import { createProxyServer } from '../src/server.js';
+import { createProxyServer, formatWait } from '../src/server.js';
 
 function listen(server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
@@ -76,7 +76,9 @@ test('a fully throttled pool answers within the wait budget instead of going sil
     `must answer within the budget, took ${r.elapsedMs}ms (unbounded wait would be ~30s)`,
   );
   assert.ok(Number(r.retryAfter) > 0, `429 must carry a usable retry-after, got ${r.retryAfter}`);
-  assert.match(r.message, /Retry in/, 'the body must tell the client when to come back');
+  // The wording is upstream's exhaustedMessage now ("Quota resets in 30s."), which replaced the fork's "Retry in".
+  assert.ok(r.message.includes(` in ${formatWait(Number(r.retryAfter))}.`),
+    `the body must tell the client when to come back, and agree with retry-after ${r.retryAfter}: ${r.message}`);
   assert.equal(r.upstreamHits, 0, 'no account was available, so nothing may reach upstream');
 });
 

@@ -10,13 +10,20 @@ export const MAX_PROBE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
 function clampInterval(ms) { return ms > 0 ? Math.min(ms, MAX_PROBE_INTERVAL_MS) : 0; }
 
 export class Prober {
+  // `log` resolves the console per call rather than capturing it. A default
+  // parameter is evaluated when the constructor runs, and the server builds its
+  // prober in the same tick as `server.listen()` — before the listen callback
+  // reaches `tui.start()`, which swaps `console.log` for the activity log. The
+  // notices below are produced later still, by a reload that changes the probe
+  // interval, so a captured `console.log` would put them on a terminal the
+  // alternate screen has already covered.
   /**
    * @param {import('./account-manager.js').AccountManager} accountManager
    * @param {object} [options]
    * @param {number} [options.intervalMs]
-   * @param {typeof fetchUsage} [options.probeFn]
+   * @param {typeof fetchUsage} [options.probeFn] called as (credential, signal, routing)
    * @param {typeof fetchCodexUsage} [options.codexProbeFn]
-   * @param {typeof import('./oauth.js').fetchProfile | null} [options.profileFn]
+   * @param {typeof import('./oauth.js').fetchProfile | null} [options.profileFn] called as (credential, signal, routing)
    * @param {typeof fetchBackendQuota} [options.backendFn]
    * @param {number} [options.timeoutMs]
    * @param {(...args: any[]) => void} [options.log]
@@ -26,7 +33,7 @@ export class Prober {
   constructor(accountManager, {
     intervalMs = 0, probeFn = fetchUsage, codexProbeFn = fetchCodexUsage,
     profileFn = null, backendFn = fetchBackendQuota, timeoutMs = 10_000,
-    log = console.log, coordinator, ownCoordinator = false,
+    log = (/** @type {string} */ line) => console.log(line), coordinator, ownCoordinator = false,
   } = {}) {
     this.am = accountManager;
     this.intervalMs = clampInterval(intervalMs);
@@ -119,11 +126,15 @@ export class Prober {
         if (!account.disabled) await this.am.ensureTokenFresh(account);
         this._throwIfAborted(signal);
         if (!this._probeable(account)) throw new Error('quota probe requires a live credential');
+        // The account's own egress proxy rides third: the injected probe
+        // functions take the abort signal second (see oauth.js routingAndSignal).
         const read = probeSignal => this._isCodexProbeTarget(account)
           ? this.codexProbeFn(account, { timeoutMs: this.timeoutMs, signal: probeSignal })
-          : this.probeFn(account.credential, probeSignal);
+          : this.probeFn(account.credential, probeSignal, account.routing ?? null);
         reading = await this._withTimeout(read, signal);
         if (reading?.status === 401 && !account.disabled) {
+          // Token rejected: force refresh and retry once — unless the manager
+          // declined to renew a refresh token upstream already rejected.
           const refreshed = await this.am.ensureTokenFresh(account, true);
           this._throwIfAborted(signal);
           if (refreshed?.ok && !refreshed.suppressed && this._probeable(account)) reading = await this._withTimeout(read, signal);
@@ -142,7 +153,7 @@ export class Prober {
         const missingTier = !account.rateLimitTier && !account.seatTier
           && account.hasClaudeMax == null && account.hasClaudePro == null;
         if (missingTier && this.profileFn) {
-          const profile = await this._withTimeout(probeSignal => this.profileFn(account.credential, probeSignal), signal);
+          const profile = await this._withTimeout(probeSignal => this.profileFn(account.credential, probeSignal, account.routing ?? null), signal);
           this.am.applyProfileData(account, profile);
         }
       }

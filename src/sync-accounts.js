@@ -3,7 +3,10 @@ import { accountIdKey, sameIdentity, distinctAccounts, IdentityAmbiguityError } 
 import { providerOf } from './provider.js';
 import { resolveAccounts } from './resolve-accounts.js';
 import { safeLine } from './safe-text.js';
+import { removedAccountIds, addedAccountIds, configIndexFor } from './account-pairing.js';
 import { ensureAccountIds } from './account-id.js';
+import { accountSwitchThreshold, accountAllowsExtraUsage, accountRouting } from './account-manager.js';
+import { localListener } from './upstream-proxy.js';
 
 /**
  * @typedef {Parameters<typeof resolveAccounts>[0]} AccountsConfig
@@ -44,11 +47,13 @@ function claimAccount(accounts, disk, claimed) {
 }
 
 /** Reconcile disk entries without replacing live token lineage or identity in place.
+ * Returns { added, removed }: accounts picked up from disk, and running
+ * accounts dropped because their disk entry is gone.
  * @param {AccountsConfig} diskConfig
  * @param {AccountsConfig} memConfig
  * @param {AccountManager} accountManager
  * @param {SyncOptions} [options]
- * @returns {Promise<number>}
+ * @returns {Promise<{ added: number, removed: number }>}
  */
 export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager, { migration, template, rekey } = {}) {
   let added = 0;
@@ -58,7 +63,14 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
   const claimed = new Set();
   /** @type {Set<ConfigAccount>} */
   const configClaimed = new Set();
+  // The TUI's remove changes memory first and saves second. A reload landing
+  // between the two reads a row the save has not rewritten yet and would add
+  // it straight back. The ids are recorded for exactly that window (cleared
+  // once the save lands), so a row naming one is the removal itself (#422).
+  // Only an id the row carried on disk counts; a freshly minted one is not evidence.
+  const removedIds = removedAccountIds(memConfig);
   for (const disk of diskConfig.accounts) {
+    if (!withoutId.has(disk) && removedIds.has(disk.id)) continue;
     // A freshly minted ID is not pairing evidence. Repeated reloads of an
     // ID-less row must reuse its uniquely matched live ID, not admit a copy.
     const pairing = withoutId.has(disk) ? { ...disk, id: undefined } : disk;
@@ -121,6 +133,17 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     for (const field of /** @type {const} */ (['upstream', 'modelMap', 'stripRequestFields'])) manager[field] = disk[field] || null;
     manager.messageThreads = disk.messageThreads === true;
     manager.maxUsage = disk.maxUsage ?? null;
+    manager.maxSpend = disk.maxSpend ?? null;
+    // Per-account gates read live, each through the same check the constructor
+    // applies, so a value refused at startup is refused (and reported) on reload.
+    manager.switchThreshold = accountSwitchThreshold(disk);
+    manager.allowExtraUsage = accountAllowsExtraUsage(disk);
+    // memConfig's port is the one this server is bound to; a port edit on disk needs a restart.
+    accountManager.setRouting(manager.index, accountRouting(disk, localListener(memConfig)));
+    // Negative-only: only `false` exempts the account from autoRedeemResets.
+    manager.autoRedeemReset = disk.autoRedeemReset !== false;
+    // Display only; `null` puts an account whose field was deleted back among the unplaced.
+    manager.displayOrder = Number.isFinite(disk.displayOrder) ? disk.displayOrder : null;
     for (const field of /** @type {const} */ (['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro'])) {
       if (disk[field] != null) manager[field] = disk[field];
     }
@@ -129,7 +152,8 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     if (memory) {
       for (const field of ['name', 'accountUuid', 'orgUuid', 'orgName', 'accountId', 'provider',
         'priority', 'disabled', 'enabled', 'maxConcurrent', 'maxUsage', 'upstream', 'modelMap',
-        'stripRequestFields', 'messageThreads', 'organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro']) {
+        'stripRequestFields', 'messageThreads', 'organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro',
+        'maxSpend', 'switchThreshold', 'routing', 'displayOrder', 'allowExtraUsage', 'autoRedeemReset']) {
         const source = resolved || disk;
         if (Object.hasOwn(source, field)) memory[field] = source[field];
         else delete memory[field];
@@ -145,8 +169,28 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     } else if (resolved?.apiKey && manager.credential !== resolved.apiKey) {
       manager.credential = resolved.apiKey;
       if (manager.status === 'error') { manager.status = 'active'; Reflect.deleteProperty(manager, '_errorFromRefresh'); }
+      // A different key is a different credential: the 401 hold was about the old one.
+      accountManager.clearCredentialRejected(manager.index);
     }
   }
+  // Running accounts that no disk row claims any more were removed on disk (a
+  // `teamclaude remove` from another process, or a hand edit): drop them from
+  // the manager and the in-memory config, highest index first so the indices
+  // still to visit stay valid (#465). The TUI and the MCP endpoint add into
+  // memory first and save second; the ids recorded for that window are the
+  // addition itself, not a removal. The config row goes by id (configIndexFor),
+  // resolved before removeAccount renumbers the manager list.
+  const pendingAdds = addedAccountIds(memConfig);
+  let removed = 0;
+  for (let i = accountManager.accounts.length - 1; i >= 0; i--) {
+    const gone = accountManager.accounts[i];
+    if (claimed.has(gone) || pendingAdds.has(gone.id)) continue;
+    const cfgIdx = configIndexFor(memConfig.accounts, accountManager.accounts, i);
+    console.log(`[TeamClaude] Removed account "${safeLine(gone.name, 64)}": its config entry is gone from disk`);
+    accountManager.removeAccount(i);
+    if (cfgIdx >= 0) memConfig.accounts.splice(cfgIdx, 1);
+    removed++;
+  }
   accountManager._drainWaiters();
-  return added;
+  return { added, removed };
 }

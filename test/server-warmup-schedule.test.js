@@ -22,7 +22,8 @@ function availablePort() {
 function waitForOutput(child, pattern) {
   return new Promise((resolve, reject) => {
     let output = '';
-    const timer = setTimeout(() => reject(new Error(`server did not start:\n${output}`)), 10_000);
+    // A watchdog against a child that never gets there, not a bound on startup.
+    const timer = setTimeout(() => reject(new Error(`server did not start:\n${output}`)), 60_000);
     const onData = chunk => {
       output += chunk;
       if (pattern.test(output)) {

@@ -10,12 +10,14 @@
       { "name": "project", "header": "x-teamclaude-project" },
       { "name": "ref", "header": "x-teamclaude-ref" }
     ],
-    "sessionDetail": false
+    "sessionDetail": false,
+    "mcp": "off"
   },
   "upstream": "https://api.anthropic.com",
   "overloadFallbackModel": null,
   "transientRetries": 1,
   "switchThreshold": 0.98,
+  "stripOverageHeaders": false,
   "maxConcurrentPerAccount": 3,
   "sessionAffinity": true,
   "overflowQueueTimeoutMs": 15000,
@@ -25,11 +27,13 @@
   "tokenRefreshIntervalMs": 300000,
   "quotaProbeSeconds": 0,
   "autoUpdate": true,
+  "autoRedeemResets": false,
   "sx": {
     "apiKey": "your-sx-org-api-key",
     "mode": "429"
   },
   "distributeSessions": false,
+  "advisorEligibility": "strict",
   "expiryRouting": {
     "enabled": false,
     "tolerance": 1.5,
@@ -52,6 +56,13 @@
       "refreshToken": "sk-ant-ort01-your-refresh-token",
       "maxConcurrent": 5,
       "priority": 2
+    },
+    {
+      "name": "waffles@waffle.com",
+      "type": "oauth",
+      "accessToken": "sk-ant-oat01-your-access-token",
+      "refreshToken": "sk-ant-ort01-your-refresh-token",
+      "routing": "socks5h://alice:s3cret@proxy.example.com:1080"
     },
     {
       "name": "codex@example.com",

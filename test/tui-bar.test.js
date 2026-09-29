@@ -88,16 +88,85 @@ test('the threshold also overrides the windowless raw scale', () => {
   assert.match(bar(0.65, 10, undefined, undefined, 0.6), /\x1b\[41;97m/);
 });
 
+// ── the label overlaid on the bar ───────────────────────────────────────────
+
+// The label carries both the fill and the countdown when the bar is wide enough
+// to hold them — as the CLI's quota line always has — and the countdown alone
+// when it is not. At every width the row budget hands a bar, what must never
+// happen is a truncated countdown: `2h3` is a different number, not a shorter
+// one.
+
+const plain = (/** @type {string} */ s) => s.replace(/\x1b\[[0-9;]*m/g, '').trim();
+
+const H = 3600_000;
+/** 2h30m away. Five columns, which is as wide as formatReset gets on the
+ *  windows in play: the session bucket tops out at `4h59m` and a weekly one at
+ *  `6d23h`. */
+const inTwoAndAHalfHours = () => Date.now() + 2.5 * H;
+
+test('a wide bar carries the percentage and the countdown, separated by a dot', () => {
+  assert.equal(plain(bar(0.97, 20, inTwoAndAHalfHours())), '97% \u00b7 2h30m');
+});
+
+// The widest label this produces is 12 columns, so the widest bars are the ones
+// that show both — and a bar at the default width does not. That is the price
+// of the house separator, and it is the one the fallback exists to pay.
+test('a bar exactly wide enough for both keeps both', () => {
+  assert.equal(plain(bar(1, 12, inTwoAndAHalfHours())), '100% \u00b7 2h30m');
+});
+
+test('one column short, the percentage yields and the countdown stays whole', () => {
+  assert.equal(plain(bar(1, 11, inTwoAndAHalfHours())), '2h30m');
+  assert.equal(plain(bar(0.97, 10, inTwoAndAHalfHours())), '2h30m');
+});
+
+// Every width the row budget hands a bar, BAR_MIN through BAR_MAX. Whatever is
+// drawn is one of the two fields entire, never a prefix of one — the countdown
+// at its longest is exactly BAR_MIN columns, so the fallback always fits. Below
+// BAR_MIN the backstop can force a narrower bar still, and there the
+// pre-existing slice cuts whatever it is handed; that path is untouched.
+test('no width from BAR_MIN up produces a half-drawn countdown', () => {
+  for (let w = 5; w <= 20; w++) {
+    const label = plain(bar(0.97, w, inTwoAndAHalfHours()));
+    assert.ok(label === '97% \u00b7 2h30m' || label === '2h30m',
+      `width ${w} drew "${label}", which is neither field whole`);
+  }
+});
+
+// The percentage is the newer of the two fields, and the one an operator can
+// send back: `quotaBarPercent: false` restores the countdown-only label.
+test('the percentage can be turned off, leaving the countdown alone', () => {
+  assert.equal(plain(bar(0.97, 20, inTwoAndAHalfHours(), undefined, undefined, false)), '2h30m');
+});
+
+// With no countdown there is nothing else for the bar to say, so the switch
+// does not empty it.
+test('turning the percentage off leaves it on a bar with no countdown', () => {
+  assert.equal(plain(bar(0.45, 10, undefined, undefined, undefined, false)), '45%');
+});
+
+test('with no countdown to show, the percentage is the label', () => {
+  assert.equal(plain(bar(0.45, 10)), '45%');
+  assert.equal(plain(bar(0.45, 10, Date.now() - 60_000)), '45%');
+});
+
+test('a bar with no reading at all is unchanged', () => {
+  assert.equal(plain(bar(null, 10)), '-');
+  assert.equal(plain(bar(NaN, 10)), '-');
+  // No percentage exists to pair with the countdown, so it stands alone.
+  assert.equal(plain(bar(null, 10, inTwoAndAHalfHours())), '2h30m');
+});
+
 // The row renderer has to hand the live threshold to every bar it draws, or the
 // clamp above never reaches the screen. Rendered, not called directly: the
 // argument list is the thing under test.
-function renderRow(quota, threshold = 0.98) {
+function renderRow(quota, threshold = 0.98, config = {}) {
   const am = new AccountManager(
     [{ name: 'acct@example.com', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 }],
     threshold);
   Object.assign(am.accounts[0].quota, quota);
   const tui = new TUI({
-    accountManager: am, config: { proxy: { port: 1 }, accounts: [], routes: [] }, sx: null,
+    accountManager: am, config: { proxy: { port: 1 }, accounts: [], routes: [], ...config }, sx: null,
     saveConfig: async () => {}, syncAccounts: async () => 0, onQuit: () => {}, probeQuota: () => {},
   });
   const cols = Object.getOwnPropertyDescriptor(process.stdout, 'columns');
@@ -117,6 +186,23 @@ function renderRow(quota, threshold = 0.98) {
   }
   return drawn;
 }
+
+// The switch is read once per row and handed to every bar on it, so a row with
+// the family bars drawn has four call sites to get wrong.
+test('the row drops the percentage from every bar when the switch is off', () => {
+  const h = 3600_000;
+  const quota = {
+    unified5h: 0.42, unified5hReset: Date.now() + 2.5 * h,
+    unified7d: 0.31, unified7dReset: Date.now() + 3 * 24 * h,
+    unified7dSonnet: 0.22, unified7dSonnetReset: Date.now() + 3 * 24 * h,
+    unified7dFable: 0.11, unified7dFableReset: Date.now() + 3 * 24 * h,
+  };
+  assert.match(plain(renderRow(quota)), /31% \u00b7 3d/);
+  const off = plain(renderRow(quota, 0.98, { quotaBarPercent: false }));
+  assert.doesNotMatch(off, /%/);
+  // The countdowns stay: the percentage is the only field the switch removes.
+  assert.match(off, /2h30m/);
+});
 
 test('a spent session bucket renders red on the row, not just in bar()', () => {
   const h = 3600_000;

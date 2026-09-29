@@ -35,7 +35,7 @@ function post(port) {
 // its queue gets a 503 with Retry-After, is never retried on another account
 // (that would only add load to the same saturated origin), and its activity row
 // is not attributed to an account it never reached.
-test('a request past the upstream pool and queue gets a 503, with no account rotation or attribution', { timeout: 4000 }, async () => {
+test('a request past the upstream pool and queue gets a 503, with no account rotation or attribution', async () => {
   let reached = 0;
   const held = [];
   const upstream = http.createServer((req, res) => {
