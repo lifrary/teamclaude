@@ -2853,6 +2853,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         pinnedAccount: ctx.pinnedAccount,
         detour: ctx.detour,
         decision,
+        // Only a completion has a cache worth waiting for (see _waitingForHome).
+        homeWaitUntil: isCompletionPath(classificationPath(req.url)) ? undefined : null,
       },
     );
     if (decision.rolledOff) {
@@ -3007,9 +3009,11 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     return;
   }
 
-  // Track which account handles this request.
+  // Track which account handles this request. Only a completion pins: its cache
+  // is what the pin keeps warm, and a count_tokens sent wherever there was room
+  // would otherwise drag the session's next completion to an account without it.
   ctx.account = account.name;
-  accountManager.recordSession(ctx.sessionId, account, ctx.model);
+  if (isCompletionPath(classificationPath(req.url))) accountManager.recordSession(ctx.sessionId, account, ctx.model);
   hooks.onRequestRouted?.(reqId, { account: account.name });
 
   // Refresh OAuth token if needed. Stop waiting if the client disconnects (the

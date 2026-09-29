@@ -287,6 +287,7 @@ async function serverCommand() {
     maxConcurrent: Number.isFinite(config.maxConcurrentPerAccount) && config.maxConcurrentPerAccount >= 1 ? config.maxConcurrentPerAccount : 3,
     maxQueueDepth: Number.isFinite(config.overflowQueueMaxDepth) && config.overflowQueueMaxDepth >= 0 ? config.overflowQueueMaxDepth : QUEUE_DEPTH_CEILING,
     queueTimeoutMs: config.overflowQueueTimeoutMs === null ? null : Number.isFinite(config.overflowQueueTimeoutMs) ? Math.max(0, config.overflowQueueTimeoutMs) : 15_000,
+    sessionHomeWaitMs: Number.isFinite(config.sessionHomeWaitMs) && config.sessionHomeWaitMs >= 0 ? config.sessionHomeWaitMs : 30_000,
     routes: config.routes,
     stormRamp: config.stormRamp,
     ramp: config.stormRamp,

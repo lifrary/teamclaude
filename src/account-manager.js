@@ -115,6 +115,7 @@ function observeUnifiedBucket(quota, bucket, utilizationKey, resetKey, statusKey
  * @property {boolean} [revalidate]
  * @property {boolean} [detour]
  * @property {{rolledOff?: Set<number>}|null} [decision]
+ * @property {number|null} [homeWaitUntil] until when a busy session home is waited for (see _homeExemptions)
  */
 
 // Re-exported for callers that import these model helpers from here.
@@ -413,6 +414,7 @@ function sampleModelFor(route) {
  * @property {number} [maxConcurrent]
  * @property {number} [maxQueueDepth]
  * @property {number|null} [queueTimeoutMs]
+ * @property {number} [sessionHomeWaitMs]
  */
 export class AccountManager {
   /**
@@ -430,13 +432,15 @@ export class AccountManager {
       forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes,
       distributeSessions = false, adaptive, sessionTracker, expiryRouting,
       reevalIntervalMs = 5 * 60 * 1000, maxConcurrent = 3,
-      maxQueueDepth = QUEUE_DEPTH_CEILING, queueTimeoutMs = 0 } = opts;
+      maxQueueDepth = QUEUE_DEPTH_CEILING, queueTimeoutMs = 0, sessionHomeWaitMs = 0 } = opts;
     const ramp = opts.stormRamp || opts.ramp;
     this.maxConcurrentDefault = coerceMaxConcurrent(maxConcurrent, 3);
     const depth = Number.isFinite(maxQueueDepth) && maxQueueDepth >= 0 ? Math.floor(maxQueueDepth) : QUEUE_DEPTH_CEILING;
     this.maxQueueDepth = Math.min(QUEUE_DEPTH_CEILING, depth);
     if (depth > this.maxQueueDepth) console.log(`[TeamClaude] overflowQueueMaxDepth ${depth} exceeds the hard ceiling — using ${this.maxQueueDepth}`);
     this.queueTimeoutMs = queueTimeoutMs === null ? null : Number.isFinite(queueTimeoutMs) && queueTimeoutMs >= 0 ? Math.floor(queueTimeoutMs) : 0;
+    this.sessionHomeWaitMs = Number.isFinite(sessionHomeWaitMs) && sessionHomeWaitMs > 0 ? Math.floor(sessionHomeWaitMs) : 0;
+    this._sessionMoves = 0;
     /** @type {AccountWaiter[]} */
     this._waiters = [];
     this._admissionPrebuffered = 0;
@@ -1216,15 +1220,96 @@ export class AccountManager {
         this._noteHeldRollover(pinned, model, advisorModel, exclude);
         return pinned;
       }
-      // Mirror _select's priority preemption so an operator's priority order
-      // still wins over a session's stickiness.
-      const betterExists = this.accounts.some(a =>
-        this._isAvailable(a, model, advisorModel) && !exclude?.has(a.index) && this._priority(a) < this._priority(pinned));
-      if (!betterExists) return pinned;
+      if (!this._pinYieldsToPriority(pinned, model, advisorModel, exclude)) return pinned;
     }
     // No pin was usable, so this is a placement. Placing is aiming: it takes no
     // reading, and the next request to find the pin here takes it.
     return this._pickLeastLoaded(exclude, model, advisorModel);
+  }
+
+  /**
+   * Whether a usable session pin gives way to a better-priority account.
+   *
+   * Priority places a session; among subscription accounts it should not keep
+   * moving one. Every move lands the session on an account that holds none of
+   * its prompt cache, so its next request re-sends the whole context there as a
+   * cache write. This used to yield to any account ranked above the pin, which
+   * on a fleet where every account has its own rank moved a session whenever a
+   * better-ranked sibling had a free slot (28 of 107 account changes measured on
+   * 2026-09-29). A subscription is prepaid, so staying costs nothing and moving
+   * costs quota. So a pin yields only where staying has a price of its own:
+   * across the fork's tier line (an unranked pin, to an explicitly ranked
+   * account), or off a metered account, so a reserve ranked last still gives a
+   * session back as soon as a better-ranked account can take it.
+   * @param {LiveAccount} pinned
+   * @param {string|null} model
+   * @param {string|null} advisorModel
+   * @param {AccountExclusions|null} exclude
+   */
+  _pinYieldsToPriority(pinned, model, advisorModel, exclude) {
+    const rank = this._priority(pinned);
+    const ceiling = rank === Infinity ? Infinity : isSubscriptionAccount(pinned) ? -Infinity : rank;
+    return this.accounts.some(a => this._priority(a) < ceiling
+      && this._isAvailable(a, model, advisorModel) && !exclude?.has(a.index) && !exclude?.has(a));
+  }
+
+  /**
+   * The session pins a request may wait for, as account indices: while its home
+   * wait runs, _tryAcquire leaves these out of the capped set, so selection
+   * picks the pin by its own rules and the capacity check then queues the
+   * request instead of sending it to whichever account has a free slot.
+   *
+   * That spill used to be the norm on a saturated fleet, and recordSession then
+   * moved the pin to where the request landed. Measured on 2026-09-29, 152 of
+   * 230 consecutive requests of the same session changed account; 34 of those
+   * wrote the whole context (up to 0.8M tokens) as cache again, while none of
+   * the 78 that stayed did. A write costs 12.5 times a read, and over the two
+   * days before, whole-context rewrites within five minutes of a session's
+   * previous request were 57% of all cache-write tokens.
+   *
+   * Empty unless distribution is on, the request is a session's own (no route
+   * pin, pinned account or detour), and `homeWaitUntil` lies ahead. A pin the
+   * request already failed on is never waited for, nor one paused (rate limit)
+   * for longer than the wait could last.
+   * @param {AccountExclusions|null} exclude
+   * @param {RoutingContext} [routingContext]
+   * @param {number} [now]
+   * @returns {Set<number>}
+   */
+  _homeExemptions(exclude, routingContext = {}, now = Date.now()) {
+    const exempt = new Set();
+    const until = routingContext.homeWaitUntil;
+    const { sessionId, model = null, advisorModel = null } = routingContext;
+    if (!this.distributeSessions || !sessionId || typeof until !== 'number' || until <= now
+        || routingContext.pinnedAccount || routingContext.detour
+        || this._pinnedAccountForModel(model ?? null, advisorModel ?? null)) return exempt;
+    const excluded = new Set([...(exclude || [])]
+      .map(value => typeof value === 'number' ? value : this._resolveLive(value)?.index)
+      .filter(index => index != null));
+    for (const idx of this.sessionTracker.pinnedAccounts(sessionId)) {
+      const pin = this.accounts[idx];
+      if (!pin || excluded.has(idx) || !this._contextAvailable(pin, routingContext)) continue;
+      if (pin.pausedUntil && pin.pausedUntil > until) continue;
+      exempt.add(idx);
+    }
+    return exempt;
+  }
+
+  /**
+   * Stamp a request's home-wait deadline when it asks for an account. Once per
+   * acquire call: forwardRequest builds a fresh context each time, so only a
+   * re-acquire after its throttle sleep starts a second wait. At most half of a
+   * finite queue timeout, so a request that waited out its home still has time
+   * to be served elsewhere before the queue gives up on it.
+   * @param {RoutingContext} routingContext
+   * @param {number|null} timeoutMs
+   * @param {number} [now]
+   * @returns {RoutingContext}
+   */
+  _withHomeWait(routingContext, timeoutMs, now = Date.now()) {
+    if (!this.sessionHomeWaitMs || !routingContext.sessionId || routingContext.homeWaitUntil !== undefined) return routingContext;
+    const wait = Math.min(this.sessionHomeWaitMs, timeoutMs == null ? Infinity : timeoutMs / 2);
+    return wait > 0 ? { ...routingContext, homeWaitUntil: now + wait } : routingContext;
   }
 
   /** Where a new session goes, per the configured distribution mode. Adaptive
@@ -1433,6 +1518,11 @@ export class AccountManager {
     if (!account || this.accounts[account.index] !== account) return;
     accountIndex = account.index;
     const bucket = this._weeklyBucketFor(model);
+    // A pin moving to another account, per bucket and per routed attempt, so a
+    // failover hop counts too: the readout that shows whether sessions stay put
+    // (see _homeExemptions). Recorded with distribution off as well.
+    const previous = this.sessionTracker.pinnedAccount(sessionId, bucket);
+    if (previous != null && previous !== accountIndex) this._sessionMoves++;
     // The pin alone: this runs before the destination's token is refreshed and
     // long before the upstream fetch, so it names where the request is being
     // SENT, and being sent somewhere is not arriving there. The observation is
@@ -4276,7 +4366,8 @@ export class AccountManager {
       // operator reading status sees the configuration the router is using.
       expiryRouting: { ...this.expiryRouting },
       routes: this.getRoutes(),
-      sessions: { ...sessions, distribute: this.distributeSessions, mode: this.distributionMode, draining: this.drainingCount() },
+      sessions: { ...sessions, distribute: this.distributeSessions, mode: this.distributionMode, draining: this.drainingCount(),
+        homeWaitMs: this.sessionHomeWaitMs, moved: this._sessionMoves },
       // Empty outside adaptive mode, so the renderer needs no mode check of its
       // own and an older client simply sees nothing extra.
       adaptive: this._adaptiveStatsCached(),
@@ -4560,6 +4651,7 @@ export class AccountManager {
     }
 
     const capped = this._cappedSet(exclude, routingContext);
+    for (const idx of this._homeExemptions(exclude, routingContext)) capped.delete(idx);
     const eff = ((exclude && exclude.size) || capped.size)
       ? new Set([...(exclude || []), ...capped])
       : null;
@@ -4601,13 +4693,20 @@ export class AccountManager {
    */
   async acquireAccount(exclude = null, timeoutMs = this.queueTimeoutMs, signal = null, affinityKey = null, routingContext = {}) {
     if (signal?.aborted) return null;
+    routingContext = this._withHomeWait(routingContext, timeoutMs);
     const account = this._tryAcquire(exclude, affinityKey, routingContext);
     if (account) return account;
     // Queue only when the blockage is cap-saturation (a slot WILL free as
     // in-flight requests finish) AND the queue isn't already full. If no
     // available account exists at all, or the queue is at its depth cap, return
     // null and let the caller 429 — never grow the backlog without bound.
-    if ((timeoutMs !== null && timeoutMs <= 0) || !this.anyCapped(exclude, routingContext) || this.isQueueFull()) return null;
+    if ((timeoutMs !== null && timeoutMs <= 0) || !this.anyCapped(exclude, routingContext) || this.isQueueFull()) {
+      // Waiting for a session's home is a preference, never a refusal: a request
+      // that cannot queue goes wherever there is room now.
+      return this._homeExemptions(exclude, routingContext).size
+        ? this._tryAcquire(exclude, affinityKey, { ...routingContext, homeWaitUntil: null })
+        : null;
+    }
     return this._enqueue(exclude, timeoutMs, signal, affinityKey, routingContext);
   }
 
@@ -4719,7 +4818,7 @@ export class AccountManager {
       // Infinity means wait for capacity or disconnect, not a timer. Passing it
       // to setTimeout would overflow Node's timer range and expire after 1ms.
       if (typeof timeoutMs === 'number' && Number.isFinite(timeoutMs)) {
-        waiter.timer = setTimeout(() => this._settleWaiter(waiter, null), timeoutMs);
+        waiter.timer = setTimeout(() => this._expireWaiter(waiter), timeoutMs);
       }
       if (signal) {
         waiter.onAbort = () => this._settleWaiter(waiter, null);
@@ -4739,6 +4838,21 @@ export class AccountManager {
       this._drainTimer = null;
       this._drainWaiters();
     }, Math.max(1, delay));
+  }
+
+  /**
+   * A waiter's queue timeout. One that was holding out for its session's home
+   * gets a last try anywhere first: its home wait is at most half the timeout,
+   * but the drain poll that would have served it elsewhere can land after the
+   * timer when the timeout is only tens of milliseconds.
+   * @param {AccountWaiter} waiter
+   */
+  _expireWaiter(waiter) {
+    if (waiter.done) return;
+    const context = waiter.routingContext || {};
+    const late = typeof context.homeWaitUntil === 'number'
+      ? this._tryAcquire(waiter.exclude, waiter.affinityKey, { ...context, homeWaitUntil: null }) : null;
+    if (!this._settleWaiter(waiter, late) && late) late.inFlight--;
   }
 
   /** @param {AccountWaiter} waiter @param {LiveAccount|null} value */
@@ -4771,6 +4885,10 @@ export class AccountManager {
   }
 
   _drainWaiters() {
+    // Arrival order, with one exception _tryAcquire makes on its own: a waiter
+    // still inside its home wait declines any account but its home, so a freed
+    // slot passes to the next waiter that can take it. Nobody waits more than
+    // one home wait longer than plain arrival order would make them.
     for (let i = 0; i < this._waiters.length;) {
       const waiter = this._waiters[i];
       const account = this._tryAcquire(waiter.exclude, waiter.affinityKey, waiter.routingContext);
@@ -4800,7 +4918,9 @@ export class AccountManager {
         // usable (it re-checks capacity after selection, so it can decline while another
         // account is fine); all this removes is the case where the first call was simply
         // reading a stale clock.
-        const late = this._tryAcquire(waiter.exclude, waiter.affinityKey, waiter.routingContext);
+        // Without the home wait: the check above found nothing capped for this
+        // waiter, so there is no home left to hold out for.
+        const late = this._tryAcquire(waiter.exclude, waiter.affinityKey, { ...waiter.routingContext, homeWaitUntil: null });
         if (late) {
           if (!this._settleWaiter(waiter, late)) { late.inFlight--; i++; }
           continue;

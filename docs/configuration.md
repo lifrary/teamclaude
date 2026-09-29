@@ -57,6 +57,7 @@ While the config is being rewritten — by the server rotating a refresh token, 
 | `maxConcurrentPerAccount` | Per-account in-flight request cap, default `3`; `accounts[].maxConcurrent` overrides it. Storm ramp may temporarily impose a lower limit |
 | `overflowQueueTimeoutMs` | Capacity wait, default `15000` ms. `null` waits until capacity or client cancellation without the predispatch deadline; `0` fails fast. Does not bypass quota/auth gates |
 | `overflowQueueMaxDepth` | Bounded overflow depth, default and hard ceiling `16` |
+| `sessionHomeWaitMs` | With `distributeSessions` on, how long a completion request waits for its session's pinned account when that account is only at its concurrency cap, before it is served on another account, default `30000` ms; `0` sends it elsewhere at once. Capped at half a finite `overflowQueueTimeoutMs`, skipped for a home paused longer than the wait, and never a reason to refuse a request that could be served elsewhere. Restart to change. See [Session-aware routing](routing.md#session-aware-routing) |
 | `maxRequestBytes` | Buffered request-body limit, default 32 MiB; enforced on inference and client-credential relay paths |
 | `sessionAffinity` | Soft socket affinity for prompt-cache locality (default `true`), subject to eligibility and concurrency bounds |
 | `reevalIntervalMs` | Sticky-account priority re-evaluation, default five minutes; non-positive disables periodic re-evaluation, not hard availability or explicit preference changes |
