@@ -206,9 +206,13 @@ const ERROR_BODY_INSPECTION_LIMIT = 64 * 1024;
 // a request that fails in ~130ms with no upstream involvement. The Codex
 // sidecar is such a client — reqwest's pool_idle_timeout defaults to 90s and it
 // never overrides it — so outlive the longest pool and let the client always be
-// the one to close. headersTimeout bounds an in-progress request's headers, not
-// the idle gap between them (measured), so it is deliberately left alone.
-export const KEEP_ALIVE_TIMEOUT_MS = 120_000;
+// the one to close. Claude Code is the longest: its Bun fetch pool keeps an idle
+// socket for 300s (measured 2026-09-30, Bun 1.4), so a 120s value closed first
+// on every gap between 121s and 300s, and Claude Code printed "Connection
+// dropped (ECONNRESET)" for turns that happened to start at 122s. headersTimeout
+// bounds an in-progress request's headers, not the idle gap between them
+// (measured), so it is deliberately left alone.
+export const KEEP_ALIVE_TIMEOUT_MS = 600_000;
 
 // The `unavailableReason` verdicts a redeemed Codex reset credit actually
 // clears, and therefore the only ones worth spending one over. A redemption

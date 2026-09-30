@@ -2,6 +2,8 @@
 // selection. Kept dependency-free so the low-level h2/h1 relay can peek a
 // request's model without pulling in the account-manager graph.
 
+import { jsonStringEnd, endsInEscape } from './json-scan.js';
+
 // A request targets the Fable model family when its `model` id names Fable
 // (e.g. "claude-fable-5"). Account selection uses this to gate the Fable-only
 // weekly bucket: a Fable-exhausted account still serves every other model.
@@ -373,7 +375,15 @@ export class TopLevelFieldFinder {
   /** Feed a chunk (Buffer). Returns the found value so far (string) or null. */
   push(chunk) {
     if (this.done) return this.value;
-    for (let i = 0; i < chunk.length && !this.done; i++) this.#byte(chunk[i]);
+    for (let i = 0; i < chunk.length && !this.done; i++) {
+      // A string nobody reads ends where jsonStringEnd says; only its quote matters.
+      if (this.inStr && !this.esc && !this.readingKey && !this.readingValue) {
+        const end = jsonStringEnd(chunk, i);
+        if (end === -1) { this.esc = endsInEscape(chunk, i); return this.value; }
+        i = end;
+      }
+      this.#byte(chunk[i]);
+    }
     return this.value;
   }
 
@@ -494,7 +504,15 @@ export class AdvisorModelFinder {
   /** Feed a chunk (Buffer). Returns the found value so far (string) or null. */
   push(chunk) {
     if (this.done) return this.value;
-    for (let i = 0; i < chunk.length && !this.done; i++) this.#byte(chunk[i]);
+    for (let i = 0; i < chunk.length && !this.done; i++) {
+      // Same skip as TopLevelFieldFinder: only a string being read needs its bytes.
+      if (this.inStr && !this.esc && !this.reading) {
+        const end = jsonStringEnd(chunk, i);
+        if (end === -1) { this.esc = endsInEscape(chunk, i); return this.value; }
+        i = end;
+      }
+      this.#byte(chunk[i]);
+    }
     return this.value;
   }
 

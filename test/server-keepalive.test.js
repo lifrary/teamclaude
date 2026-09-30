@@ -8,7 +8,9 @@ import { createProxyServer } from '../src/server.js';
 // closed, and the request dies before it reaches an upstream — observed twice
 // as "error sending request" ~130ms in, from the Codex sidecar, whose reqwest
 // pool_idle_timeout defaults to 90s. The server has to outlive the pool so the
-// client is always the side that closes.
+// client is always the side that closes. Claude Code's Bun pool keeps an idle
+// socket for 300s (measured 2026-09-30), and at 120s its turns that began 122s
+// after the last one were reset.
 
 function oauth(name) {
   return { name, type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 };
@@ -20,6 +22,8 @@ test('the server outlives the longest client connection pool', () => {
   try {
     assert.ok(server.keepAliveTimeout > 90_000,
       `keepAliveTimeout ${server.keepAliveTimeout}ms must exceed reqwest's 90s default pool idle`);
+    assert.ok(server.keepAliveTimeout > 300_000,
+      `keepAliveTimeout ${server.keepAliveTimeout}ms must exceed Bun's 300s pool idle, which Claude Code uses`);
     assert.notEqual(server.keepAliveTimeout, 5000, 'the Node default is the bug');
   } finally {
     server.close();

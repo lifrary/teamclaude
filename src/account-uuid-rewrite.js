@@ -11,6 +11,8 @@
 // (same length → no content-length/flow-control changes). A stray `account_uuid`
 // elsewhere in the body (user content, tool results) is never touched.
 
+import { jsonStringEnd, endsInEscape } from './json-scan.js';
+
 // Byte sequence of `account_uuid":"` as it appears INSIDE the (escaped) user_id
 // string: account_uuid \ " : \ "
 const PREFIX = Buffer.from('account_uuid\\":\\"', 'latin1');
@@ -36,18 +38,29 @@ export class AccountUuidPatcher {
   }
 
   /**
-   * Feed a chunk; returns a same-length chunk (patched in place).
+   * Feed a chunk; returns it unchanged, or a same-length patched copy. The copy
+   * is taken only once a byte actually changes: most chunks change nothing, and
+   * copying every one put a whole body's worth of garbage on each forward.
    *
    * @param {Buffer|Uint8Array} chunk
    */
   push(chunk) {
     if (!this.newUuid || this.done) return chunk;
-    const out = Buffer.from(chunk);
-    for (let i = 0; i < out.length; i++) {
-      out[i] = this.#byte(out[i]);
+    /** @type {Buffer|null} */
+    let out = null;
+    for (let i = 0; i < chunk.length; i++) {
+      // Outside the target, a string's contents never change and never matter.
+      if (this.inStr && !this.esc && !this.readingKey && !this.target) {
+        const end = jsonStringEnd(chunk, i);
+        if (end === -1) { this.esc = endsInEscape(chunk, i); break; }
+        i = end;
+      }
+      const b = chunk[i];
+      const patched = this.#byte(b);
+      if (patched !== b) { out ??= Buffer.from(chunk); out[i] = patched; }
       if (this.done) break; // rest passes through unchanged
     }
-    return out;
+    return out ?? chunk;
   }
 
   #top() { return this.frames[this.frames.length - 1]; }
