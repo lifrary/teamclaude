@@ -26,6 +26,18 @@ function finishes(promise, ms = 2_000) {
   return Promise.race([promise.then(() => 'finished'), ceiling]).finally(() => clearTimeout(timer));
 }
 
+// The wait before an account whose probe was abandoned is tried again runs on
+// the prober's injected clock, so these tests decide when it has passed rather
+// than racing real time on a loaded machine. With timeoutMs 10 the deadline is
+// 120 ms and the wait is five deadlines.
+const RETRY_WAIT_MS = 10 * 12 * 5;
+function clock(start = Date.now()) {
+  let t = start;
+  const now = () => t;
+  now.advance = (/** @type {number} */ ms) => { t += ms; };
+  return now;
+}
+
 test('a probe that never settles, even when aborted, cannot freeze the prober', async () => {
   const am = new AccountManager([oauth('stuck'), oauth('fine')], 0.98);
   const calls = { stuck: 0, fine: 0 };
@@ -36,7 +48,7 @@ test('a probe that never settles, even when aborted, cannot freeze the prober', 
     return reading();
   };
   const lines = [];
-  const prober = new Prober(am, { intervalMs: 0, timeoutMs: 10, probeFn, log: line => lines.push(line), ownCoordinator: true });
+  const prober = new Prober(am, { intervalMs: 0, timeoutMs: 10, probeFn, log: line => lines.push(line), ownCoordinator: true, now: clock() });
 
   assert.equal(await finishes(prober.probeAll()), 'finished', 'the run ends although one read never does');
   assert.equal(am.accounts[0].inflight, 0, 'the stuck account gets its slot back');
@@ -123,5 +135,113 @@ test('an account whose maintenance lane other work holds cannot freeze the run',
   assert.equal(calls, 1, 'the free account was probed');
   assert.equal(prober.getStatus().running, false);
   assert.equal(await finishes(prober.probeAll()), 'finished', 'and the next run ends too');
+  prober.stop();
+});
+
+// 2026-10-06, live: the reads of all ten accounts hung past their abort and never
+// came back. Each account waited for its stuck read before sending another, so
+// none was probed for 33 hours, although fresh reads worked at once.
+
+test('a probe that never comes back is tried again after a wait, so one hung read cannot blind the account for good', async () => {
+  const am = new AccountManager([oauth('hung')], 0.98);
+  let calls = 0;
+  const probeFn = async () => { calls++; return calls === 1 ? new Promise(() => {}) : reading(); };
+  const now = clock();
+  const prober = new Prober(am, { intervalMs: 0, timeoutMs: 10, probeFn, log: () => {}, ownCoordinator: true, now });
+
+  assert.equal(await finishes(prober.probeAll()), 'finished');
+  assert.equal(prober.getStatus().accounts[0].status, 'timeout');
+  assert.equal(await finishes(prober.probeAll()), 'finished');
+  assert.equal(calls, 1, 'not straight away');
+  assert.match(prober.getStatus().accounts[0].error, /has not come back; next try after/);
+  now.advance(RETRY_WAIT_MS);
+  assert.equal(await finishes(prober.probeAll()), 'finished');
+  assert.equal(calls, 2, 'but after the wait, although the first read is still out');
+  assert.equal(prober.getStatus().accounts[0].status, 'ok');
+  prober.stop();
+});
+
+test('three probes abandoned in a row, all still out, skip the account', async () => {
+  const am = new AccountManager([oauth('dead')], 0.98);
+  let calls = 0;
+  const probeFn = () => { calls++; return new Promise(() => {}); };
+  const now = clock();
+  const prober = new Prober(am, { intervalMs: 0, timeoutMs: 10, probeFn, log: () => {}, ownCoordinator: true, now });
+
+  for (let i = 0; i < 3; i++) {
+    assert.equal(await finishes(prober.probeAll()), 'finished');
+    now.advance(RETRY_WAIT_MS);
+  }
+  assert.equal(calls, 3);
+  assert.equal(await finishes(prober.probeAll()), 'finished');
+  assert.equal(calls, 3, 'no fourth read while three are out');
+  const status = prober.getStatus().accounts[0];
+  assert.equal(status.status, 'stalled');
+  assert.match(status.error, /3 probes in a row were abandoned since .* and have not come back/);
+  prober.stop();
+});
+
+test('reads that never came back stop counting once a later probe settles in time', async () => {
+  // A review found the count spanning the account's whole life: three hangs days
+  // apart, with healthy probes between them, skipped it until a restart.
+  const am = new AccountManager([oauth('flaky')], 0.98);
+  let calls = 0;
+  const probeFn = () => { calls++; return calls % 2 === 1 ? new Promise(() => {}) : Promise.resolve(reading()); };
+  const now = clock();
+  const prober = new Prober(am, { intervalMs: 0, timeoutMs: 10, probeFn, log: () => {}, ownCoordinator: true, now });
+
+  for (let run = 0; run < 6; run++) {
+    assert.equal(await finishes(prober.probeAll()), 'finished');
+    now.advance(RETRY_WAIT_MS);
+  }
+  assert.equal(calls, 6, 'three hangs, each followed by a probe that settled');
+  assert.equal(prober.getStatus().accounts[0].status, 'ok');
+  prober.stop();
+});
+
+test('an abandoned probe that comes back after a newer one cannot overwrite its record', async () => {
+  const am = new AccountManager([oauth('late')], 0.98);
+  let release;
+  let calls = 0;
+  const probeFn = async () => {
+    calls++;
+    if (calls === 1) return new Promise(resolve => { release = () => resolve(reading()); });
+    return reading();
+  };
+  const now = clock();
+  const prober = new Prober(am, { intervalMs: 0, timeoutMs: 10, probeFn, log: () => {}, ownCoordinator: true, now });
+
+  assert.equal(await finishes(prober.probeAll()), 'finished');
+  now.advance(RETRY_WAIT_MS);
+  assert.equal(await finishes(prober.probeAll()), 'finished');
+  assert.equal(prober.getStatus().accounts[0].status, 'ok');
+  release();
+  await sleep(10);
+  assert.equal(prober.getStatus().accounts[0].status, 'ok', 'the first probe came back late and was ignored');
+  prober.stop();
+});
+
+test('a probe that comes back while a newer one is out stops counting against the account', async () => {
+  const am = new AccountManager([oauth('mixed')], 0.98);
+  let release;
+  let calls = 0;
+  const probeFn = () => {
+    calls++;
+    if (calls === 1) return new Promise(resolve => { release = () => resolve(reading()); });
+    // The first read comes back while the second is out; the second never does.
+    if (calls === 2) { setTimeout(() => release(), 20); return new Promise(() => {}); }
+    if (calls === 3) return new Promise(() => {});
+    return Promise.resolve(reading());
+  };
+  const now = clock();
+  const prober = new Prober(am, { intervalMs: 0, timeoutMs: 10, probeFn, log: () => {}, ownCoordinator: true, now });
+
+  for (let i = 0; i < 3; i++) {
+    assert.equal(await finishes(prober.probeAll()), 'finished');
+    now.advance(RETRY_WAIT_MS);
+  }
+  assert.equal(await finishes(prober.probeAll()), 'finished');
+  assert.equal(calls, 4, 'two reads are out, not three');
+  assert.equal(prober.getStatus().accounts[0].status, 'ok');
   prober.stop();
 });

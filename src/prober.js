@@ -18,6 +18,18 @@ function clampInterval(ms) { return ms > 0 ? Math.min(ms, MAX_PROBE_INTERVAL_MS)
 // hours. Twelve leaves room for the slowest healthy probe (a read, a 30 s forced
 // refresh, a re-read and a profile read) plus event-loop stalls.
 const PROBE_DEADLINE_TIMEOUTS = 12;
+// An abandoned probe is not waited for forever: a read whose transport ignored
+// its abort may never settle at all. On 2026-10-06 the reads of all ten accounts
+// hung that way, and because each account waited for its stuck read to come back
+// before sending another, none was probed for 33 hours, although fresh reads
+// worked at once (the restart that ended it probed all ten in under five
+// seconds). So an account is tried again this many deadlines after its latest
+// abandonment, and is left alone only once this many probes in a row were
+// abandoned and are still out, which bounds what one stretch of a transport that
+// never settles can leak. A probe that settles within its deadline ends the
+// stretch.
+const ABANDONED_RETRY_DEADLINES = 5;
+const MAX_ABANDONED_PROBES = 3;
 const ABANDONED = Symbol('abandoned');
 
 /**
@@ -58,11 +70,13 @@ export class Prober {
    * @param {(...args: any[]) => void} [options.log]
    * @param {MaintenanceCoordinator} [options.coordinator]
    * @param {boolean} [options.ownCoordinator]
+   * @param {() => number} [options.now] clock for the wait before an account whose probe was abandoned is tried again
    */
   constructor(accountManager, {
     intervalMs = 0, probeFn = fetchUsage, codexProbeFn = fetchCodexUsage,
     profileFn = null, backendFn = fetchBackendQuota, timeoutMs = 10_000,
     log = (/** @type {string} */ line) => console.log(line), coordinator, ownCoordinator = false,
+    now = () => Date.now(),
   } = {}) {
     this.am = accountManager;
     this.intervalMs = clampInterval(intervalMs);
@@ -72,6 +86,7 @@ export class Prober {
     this.backendFn = backendFn;
     this.timeoutMs = timeoutMs;
     this.log = log;
+    this._now = now;
     if (!coordinator && !ownCoordinator) throw new Error('Prober requires a MaintenanceCoordinator');
     this.ownsCoordinator = !coordinator;
     this.coordinator = coordinator || new MaintenanceCoordinator(accountManager, { log });
@@ -81,8 +96,11 @@ export class Prober {
     this.lastRunFinishedAt = null;
     this.nextRunAt = this.intervalMs > 0 ? Date.now() + this.intervalMs : null;
     this.accountStatus = new Map();
-    /** @type {Map<object, number>} account -> when its still-outstanding probe was abandoned */
+    /** @type {Map<object, { at: number }[]>} account -> when each probe of its current stretch of abandonments was abandoned, oldest first, while that probe is still out */
     this._abandoned = new Map();
+    // Orders an account's probes, so one abandoned earlier that settles after a
+    // newer probe has started cannot overwrite the newer probe's record.
+    this._probeSeq = 0;
   }
 
   start() { if (this.intervalMs > 0) this.reschedule(this.intervalMs, { immediate: true }); }
@@ -152,26 +170,53 @@ export class Prober {
 
   /**
    * probeAccount, abandoned once it outlives its deadline so the account's lane
-   * and slot come back. The abandoned probe is left to settle on its own; until
-   * it does, this account is not probed again, so at most one stuck read per
-   * account is ever out, and each skipped run says so in the account's status
-   * rather than leaving an old result to age in silence.
+   * and slot come back. The abandoned probe is left to settle on its own. The
+   * account is tried again ABANDONED_RETRY_DEADLINES deadlines after its latest
+   * abandonment whether or not that probe ever comes back, and is skipped
+   * outright only once MAX_ABANDONED_PROBES probes in a row were abandoned and
+   * are still out, so a read that never settles costs a bounded number of leaked
+   * reads per stretch, never the account's monitoring for good. A probe that
+   * settles within its deadline ends the stretch: the transport works again,
+   * and reads abandoned before it stop counting. A probe abandoned in its token
+   * refresh leaves the account's shared refresh pending, so a retry joins that
+   * refresh and gets no further: it sends no read of its own when the token had
+   * expired, and one read first when the hung refresh was forced by a 401. Three
+   * such retries skip the account like any other stretch. Each skipped run says so
+   * in the account's status rather than leaving an old result to age in silence.
    * @param {import('./account-manager.js').AccountManager['accounts'][number]} account
    * @param {AbortSignal} signal
    */
   async _probeWithDeadline(account, signal) {
-    const abandonedAt = this._abandoned.get(account);
-    if (abandonedAt != null) {
+    const outstanding = this._abandoned.get(account) || [];
+    if (outstanding.length >= MAX_ABANDONED_PROBES) {
       this._recordAccount(account, { status: 'stalled',
-        error: `a probe abandoned at ${iso(abandonedAt)} has not come back; skipped until it does or the proxy restarts` });
+        error: `${outstanding.length} probes in a row were abandoned since ${iso(outstanding[0].at)} and have not come back; skipped until one does or the proxy restarts` });
+      return false;
+    }
+    const latest = outstanding[outstanding.length - 1];
+    const retryAt = latest ? latest.at + this._deadlineMs() * ABANDONED_RETRY_DEADLINES : 0;
+    if (this._now() < retryAt) {
+      this._recordAccount(account, { status: 'stalled',
+        error: `a probe abandoned at ${iso(latest.at)} has not come back; next try after ${iso(retryAt)}` });
       return false;
     }
     const probe = this.probeAccount(account, signal);
     const outcome = await settleWithin(probe, this._deadlineMs(), ABANDONED);
-    if (outcome !== ABANDONED) return outcome;
+    if (outcome !== ABANDONED) {
+      // Back in time, so the transport works: reads abandoned before this one
+      // settle or leak on their own and no longer hold the account.
+      this._abandoned.delete(account);
+      return outcome;
+    }
     const finishedAt = Date.now();
-    this._abandoned.set(account, finishedAt);
-    const settled = () => { this._abandoned.delete(account); };
+    const entry = { at: this._now() };
+    // Re-read: an older abandoned probe may have settled during this one.
+    this._abandoned.set(account, [...(this._abandoned.get(account) || []), entry]);
+    const settled = () => {
+      const left = (this._abandoned.get(account) || []).filter(other => other !== entry);
+      if (left.length) this._abandoned.set(account, left);
+      else this._abandoned.delete(account);
+    };
     probe.then(settled, settled);
     const { startedAt, phase } = this.accountStatus.get(account) || {};
     const durationMs = startedAt ? finishedAt - startedAt : null;
@@ -189,15 +234,17 @@ export class Prober {
   async probeAccount(account, signal) {
     if (!this._probeable(account) || !this._isTarget(account)) return false;
     const startedAt = Date.now();
-    this._recordAccount(account, { status: 'running', startedAt, phase: 'start' });
+    const seq = ++this._probeSeq;
+    const record = (/** @type {Record<string, any>} */ status) => this._recordAccount(account, { ...status, seq });
+    record({ status: 'running', startedAt, phase: 'start' });
     try {
       this._throwIfAborted(signal);
       let reading;
       if (this._isBackendTarget(account)) {
-        this._recordAccount(account, { phase: 'usage read' });
+        record({ phase: 'usage read' });
         reading = await this._withTimeout(probeSignal => this.backendFn(account, { timeoutMs: this.timeoutMs, signal: probeSignal }), signal);
       } else {
-        this._recordAccount(account, { phase: 'token refresh' });
+        record({ phase: 'token refresh' });
         if (!account.disabled) await this.am.ensureTokenFresh(account);
         this._throwIfAborted(signal);
         if (!this._probeable(account)) throw new Error('quota probe requires a live credential');
@@ -206,22 +253,22 @@ export class Prober {
         const read = probeSignal => this._isCodexProbeTarget(account)
           ? this.codexProbeFn(account, { timeoutMs: this.timeoutMs, signal: probeSignal })
           : this.probeFn(account.credential, probeSignal, account.routing ?? null);
-        this._recordAccount(account, { phase: 'usage read' });
+        record({ phase: 'usage read' });
         reading = await this._withTimeout(read, signal);
         if (reading?.status === 401 && !account.disabled) {
           // Token rejected: force refresh and retry once — unless the manager
           // declined to renew a refresh token upstream already rejected.
-          this._recordAccount(account, { phase: 'token refresh' });
+          record({ phase: 'token refresh' });
           const refreshed = await this.am.ensureTokenFresh(account, true);
           this._throwIfAborted(signal);
-          this._recordAccount(account, { phase: 'usage read' });
+          record({ phase: 'usage read' });
           if (refreshed?.ok && !refreshed.suppressed && this._probeable(account)) reading = await this._withTimeout(read, signal);
         }
       }
       this._throwIfAborted(signal);
       if (!reading || reading.error) {
         const finishedAt = Date.now();
-        this._recordAccount(account, { status: reading?.error ? 'error' : 'timeout', error: reading?.error || 'probe timed out', startedAt, finishedAt, durationMs: finishedAt - startedAt });
+        record({ status: reading?.error ? 'error' : 'timeout', error: reading?.error || 'probe timed out', startedAt, finishedAt, durationMs: finishedAt - startedAt });
         return false;
       }
       if (this._isBackendTarget(account)) this.am.applyBackendQuota(account, reading);
@@ -231,17 +278,17 @@ export class Prober {
         const missingTier = !account.rateLimitTier && !account.seatTier
           && account.hasClaudeMax == null && account.hasClaudePro == null;
         if (missingTier && this.profileFn) {
-          this._recordAccount(account, { phase: 'profile read' });
+          record({ phase: 'profile read' });
           const profile = await this._withTimeout(probeSignal => this.profileFn(account.credential, probeSignal, account.routing ?? null), signal);
           this.am.applyProfileData(account, profile);
         }
       }
       const finishedAt = Date.now();
-      this._recordAccount(account, { status: 'ok', error: null, startedAt, finishedAt, durationMs: finishedAt - startedAt });
+      record({ status: 'ok', error: null, startedAt, finishedAt, durationMs: finishedAt - startedAt });
       return true;
     } catch (err) {
       const finishedAt = Date.now();
-      this._recordAccount(account, { status: signal?.aborted ? 'cancelled' : 'error', error: signal?.aborted ? null : err?.message || String(err), startedAt, finishedAt, durationMs: finishedAt - startedAt });
+      record({ status: signal?.aborted ? 'cancelled' : 'error', error: signal?.aborted ? null : err?.message || String(err), startedAt, finishedAt, durationMs: finishedAt - startedAt });
       return false;
     }
   }
@@ -255,7 +302,13 @@ export class Prober {
       }) };
   }
 
-  _recordAccount(account, status) { this.accountStatus.set(account, { ...(this.accountStatus.get(account) || {}), ...status }); }
+  // A write from an older probe of the account is dropped: one abandoned earlier
+  // that settles after a newer probe started must not overwrite that record.
+  _recordAccount(account, status) {
+    const current = this.accountStatus.get(account);
+    if (status.seq != null && current?.seq != null && status.seq < current.seq) return;
+    this.accountStatus.set(account, { ...(current || {}), ...status });
+  }
   _throwIfAborted(signal) { if (signal?.aborted) throw signal.reason || new Error('quota probe aborted'); }
 
   async _withTimeout(probe, parentSignal) {
