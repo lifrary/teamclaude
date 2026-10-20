@@ -3849,10 +3849,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // actually block each candidate (computeRetryAfter), so a pool whose quota is
     // spent answers with its real reset rather than a 60s default the client would
     // obey forever. A merely capped fleet keeps its short wait: a slot frees as
-    // soon as any in-flight request finishes.
+    // soon as any in-flight request finishes. A long wait is spread per refusal
+    // (spreadRetryAfter), so the clients a spent pool refused do not all return
+    // in the second it resets.
     const candidates = candidateAccounts(accountManager, ctx.model, ctx.provider);
     const retryAfter = merelyCapped ? CAPPED_RETRY_AFTER_SECONDS
-      : computeRetryAfter(accountManager, candidates, ctx.model);
+      : spreadRetryAfter(computeRetryAfter(accountManager, candidates, ctx.model));
     res.writeHead(429, {
       'Content-Type': 'application/json',
       'retry-after': String(retryAfter),
@@ -5421,6 +5423,38 @@ export function computeRetryAfter(accountManager, candidates, model = null, now 
   return soonest === Infinity
     ? UNTIMED_RETRY_AFTER_SECONDS
     : Math.max(1, Math.ceil(soonest / 1000));
+}
+
+// spreadRetryAfter leaves waits shorter than this exact, and spreads a long one
+// by a tenth of it, never more than the cap.
+const RETRY_AFTER_SPREAD_FROM_SECONDS = 600;
+const RETRY_AFTER_SPREAD_MAX_SECONDS = 180;
+
+/**
+ * A reset-derived wait made later by a random amount drawn per refusal, so the
+ * clients one spent pool refused do not all come back in the same second.
+ *
+ * Every client refused while the pool is spent is told the same reset, and
+ * Claude Code sleeps to it exactly. On 2026-10-20 the sessions refused between
+ * 11:27 and 11:35 KST all sent their next request at 12:00:00, when four 5-hour
+ * windows reset; the tool calls they resumed with took the client machine to a
+ * 1-minute load of 385 on 12 cores for about twenty minutes, every session on it
+ * stalled. A tenth of the wait (at most three minutes) spreads those returns
+ * over the window's first minutes instead.
+ *
+ * Only later, never sooner: a client that wakes before the reset is refused
+ * again. Waits under ten minutes stay exact — throttles, cooldowns and the
+ * untimed default, where the number itself is what the client needs and few
+ * clients share it. Exported for tests.
+ *
+ * @param {number} seconds computeRetryAfter's answer
+ * @param {() => number} [random] uniform in [0, 1), for tests
+ * @returns {number}
+ */
+export function spreadRetryAfter(seconds, random = Math.random) {
+  if (!(seconds >= RETRY_AFTER_SPREAD_FROM_SECONDS)) return seconds;
+  const spread = Math.min(RETRY_AFTER_SPREAD_MAX_SECONDS, Math.floor(seconds / 10));
+  return seconds + Math.floor(random() * (spread + 1));
 }
 
 function createUpgradeProxyAgent(target, proxy, sx) {
