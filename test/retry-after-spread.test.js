@@ -6,8 +6,8 @@ import { createProxyServer, spreadRetryAfter } from '../src/server.js';
 
 // Incident 2026-10-20: every account's 5-hour window was spent from 11:28 to
 // 12:00 KST. Each refused session was told the same reset and slept to it to the
-// second, so about forty of them sent their next request at 12:00:00 and resumed
-// their tool calls together; the client Mac sat at a 1-minute load near 385 on
+// second, so 20 of the 23 refused sent their next request between 12:00:00 and
+// 12:00:02 and resumed their tool calls together; the client Mac sat at a 1-minute load near 385 on
 // 12 cores for about twenty minutes. The answer to one spent pool must not be the
 // same second for every client it refuses.
 

@@ -5435,11 +5435,11 @@ const RETRY_AFTER_SPREAD_MAX_SECONDS = 180;
  * clients one spent pool refused do not all come back in the same second.
  *
  * Every client refused while the pool is spent is told the same reset, and
- * Claude Code sleeps to it exactly. On 2026-10-20 the sessions refused between
- * 11:27 and 11:35 KST all sent their next request at 12:00:00, when four 5-hour
- * windows reset; the tool calls they resumed with took the client machine to a
- * 1-minute load of 385 on 12 cores for about twenty minutes, every session on it
- * stalled. A tenth of the wait (at most three minutes) spreads those returns
+ * Claude Code sleeps to it exactly. On 2026-10-20, 20 of the 23 sessions refused
+ * between 11:20 and 12:00 KST sent their next request between 12:00:00 and
+ * 12:00:02, when the pool's windows reset; the tool calls they resumed with took
+ * the client machine to a 1-minute load of 385 on 12 cores for about twenty
+ * minutes, every session on it stalled. A tenth of the wait (at most three minutes) spreads those returns
  * over the window's first minutes instead.
  *
  * Only later, never sooner: a client that wakes before the reset is refused
