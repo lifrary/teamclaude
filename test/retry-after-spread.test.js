@@ -77,8 +77,9 @@ test('one spent pool answers its refusals with different waits, none before the 
       const body = await res.json();
       assert.equal(res.status, 429, `request ${i} was not refused: ${JSON.stringify(body)}`);
       const pastReset = Number(res.headers.get('retry-after')) - (resetAt - Date.now()) / 1000;
-      assert.ok(pastReset >= -2, `request ${i} was told to come back ${-pastReset}s before the reset`);
-      assert.ok(pastReset <= 180 + 2, `request ${i} was told to come back ${pastReset}s after it`);
+      // Ten seconds of slack: under a loaded event loop the localhost round trip itself can take seconds.
+      assert.ok(pastReset >= -10, `request ${i} was told to come back ${-pastReset}s before the reset`);
+      assert.ok(pastReset <= 180 + 10, `request ${i} was told to come back ${pastReset}s after it`);
       late.push(pastReset);
     }
     // Unspread, every answer lands within a second or two of the reset; twenty

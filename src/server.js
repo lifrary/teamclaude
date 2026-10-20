@@ -3854,7 +3854,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // in the second it resets.
     const candidates = candidateAccounts(accountManager, ctx.model, ctx.provider);
     const retryAfter = merelyCapped ? CAPPED_RETRY_AFTER_SECONDS
-      : spreadRetryAfter(computeRetryAfter(accountManager, candidates, ctx.model));
+      : clientRetryAfter(accountManager, candidates, ctx.model);
     res.writeHead(429, {
       'Content-Type': 'application/json',
       'retry-after': String(retryAfter),
@@ -4346,7 +4346,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         if (res.destroyed) return;
         if (retryCount >= maxRetries) {
           ctx.status = 429;
-          const ra = computeRetryAfter(accountManager, candidateAccounts(accountManager, ctx.model, ctx.provider), ctx.model);
+          const ra = clientRetryAfter(accountManager, candidateAccounts(accountManager, ctx.model, ctx.provider), ctx.model);
           if (!res.headersSent) {
             res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': String(ra) });
             res.end(JSON.stringify({
@@ -5455,6 +5455,21 @@ export function spreadRetryAfter(seconds, random = Math.random) {
   if (!(seconds >= RETRY_AFTER_SPREAD_FROM_SECONDS)) return seconds;
   const spread = Math.min(RETRY_AFTER_SPREAD_MAX_SECONDS, Math.floor(seconds / 10));
   return seconds + Math.floor(random() * (spread + 1));
+}
+
+/**
+ * The reset-derived wait every 429 this proxy writes from its own accounting
+ * hands a client: computeRetryAfter, spread. One helper so no answer path can
+ * send the bare reset second again; the all-accounts-throttled answer after a
+ * request spent its retries on account-quota 429s did, until 2026-10-20.
+ *
+ * @param {import('./account-manager.js').AccountManager} accountManager
+ * @param {Record<string, any>[]} candidates
+ * @param {string|null|undefined} [model]
+ * @returns {number}
+ */
+function clientRetryAfter(accountManager, candidates, model) {
+  return spreadRetryAfter(computeRetryAfter(accountManager, candidates, model));
 }
 
 function createUpgradeProxyAgent(target, proxy, sx) {
