@@ -311,7 +311,8 @@ test('family layout renders the F7 bar and hides it when the width budget exclud
     'anthropic-ratelimit-unified-7d_oi-utilization': '0.94',
     'anthropic-ratelimit-unified-7d_oi-reset': String(Math.floor((now + 86400_000) / 1000)),
   });
-  const tui = new TUI({ accountManager: am, config: { accounts: [] }, saveConfig: async () => {}, syncAccounts: async () => 0, onQuit: () => {} });
+  // The percentage is opt-in (#514), and the assertions read it.
+  const tui = new TUI({ accountManager: am, config: { accounts: [], quotaBarPercent: true }, saveConfig: async () => {}, syncAccounts: async () => 0, onQuit: () => {} });
 
   const wide = stripAnsi(tui._renderAcct(0, 10, true, [], [], {}, true));
   assert.match(wide, /Ses .*Wk .*F7 .*94%/s, 'family bar shows the 7d_oi utilization');
@@ -331,7 +332,8 @@ test('the F7 bar prefers the 7d_oi window when multiple model windows exist', ()
   // Insert an unknown window FIRST, then 7d_oi — the bar must still show 7d_oi.
   am.accounts[0].quota.modelWeekly['7d_xx'] = { utilization: 0.11, reset: Date.now() + 86400_000 };
   am.accounts[0].quota.modelWeekly['7d_oi'] = { utilization: 0.94, reset: Date.now() + 86400_000 };
-  const tui = new TUI({ accountManager: am, config: { accounts: [] }, saveConfig: async () => {}, syncAccounts: async () => 0, onQuit: () => {} });
+  // The percentage is opt-in (#514); without it `doesNotMatch(/11%/)` could not fail.
+  const tui = new TUI({ accountManager: am, config: { accounts: [], quotaBarPercent: true }, saveConfig: async () => {}, syncAccounts: async () => 0, onQuit: () => {} });
   const row = stripAnsi(tui._renderAcct(0, 10, true, [], [], {}, true));
   assert.match(row, /F7 .*94%/s, '7d_oi (94%) shown, not the first-inserted window (11%)');
   assert.doesNotMatch(row, /11%/);

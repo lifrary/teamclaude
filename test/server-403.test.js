@@ -2,7 +2,12 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
-import { createProxyServer, refusalCooldown, REFUSAL_BASE_SECONDS, REFUSAL_MAX_SECONDS } from '../src/server.js';
+import { createProxyServer, oauthVerificationHold, refusalCooldown, REFUSAL_BASE_SECONDS, REFUSAL_MAX_SECONDS } from '../src/server.js';
+import { setUpstreamProxy, resolveUpstreamProxy, resetUpstreamProxy } from '../src/upstream-proxy.js';
+
+// One test below breaks an upstream body off mid-response (see test/README.md).
+test.beforeEach(() => setUpstreamProxy(resolveUpstreamProxy({ upstreamProxy: false }, {})));
+test.afterEach(() => resetUpstreamProxy());
 
 function listen(server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
@@ -591,6 +596,91 @@ test('an OAuth entitlement denial quarantines the account across requests', asyn
   }
 });
 
+test('an entitlement denial is kept with upstream\'s message until a completion is served', async () => {
+  let mode = 'deny';
+  const upstream = http.createServer((req, res) => {
+    const token = (req.headers.authorization || '').replace(/^Bearer /, '');
+    if (token === 'a-token' && mode === 'deny') {
+      res.writeHead(403, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(entitlementError()));
+      return;
+    }
+    if (token === 'a-token' && mode === 'broken') {
+      res.writeHead(200, { 'content-type': 'application/json', 'content-length': '100' });
+      res.write('{"ok"', () => res.destroy());
+      return;
+    }
+    if (token === 'a-token' && mode === 'redirect') {
+      res.writeHead(302, { location: '/login' });
+      res.end();
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(twoAccounts(), 0.98);
+  const proxy = createProxyServer(am, {
+    activeWarmup: false, proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+  });
+  const proxyPort = await listen(proxy);
+  const readmit = () => { am.accounts[0].entitlementDeniedUntil = Date.now() - 1; am.currentIndex = 0; };
+
+  try {
+    assert.equal((await postUpstream(proxyPort)).status, 200);
+    let denial = am.getStatus().accounts[0].entitlementDenial;
+    assert.equal(denial.detail, 'OAuth authentication is currently not allowed for this organization.');
+    assert.equal(denial.count, 1);
+
+    readmit();
+    const sentAt = Date.now();
+    assert.equal((await postUpstream(proxyPort)).status, 200);
+    denial = am.getStatus().accounts[0].entitlementDenial;
+    assert.equal(denial.count, 2);
+    // The second denial waits the second step (15 minutes) from when it landed,
+    // which is no earlier than when the request was sent.
+    assert.ok(am.accounts[0].entitlementDeniedUntil >= sentAt + 15 * 60_000);
+
+    // Neither a redirect nor a served side endpoint shows the organization
+    // allows OAuth inference again.
+    mode = 'redirect';
+    readmit();
+    const redirected = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST', redirect: 'manual',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+    });
+    assert.equal(redirected.status, 302);
+    mode = 'serve';
+    readmit();
+    assert.equal((await postUpstream(proxyPort, '/v1/messages/count_tokens')).status, 200);
+    assert.equal(am.getStatus().accounts[0].entitlementDenial.count, 2);
+    // Nor do headers whose body never arrives.
+    mode = 'broken';
+    readmit();
+    await postUpstream(proxyPort).catch(() => null);
+    assert.equal(am.getStatus().accounts[0].entitlementDenial.count, 2);
+    mode = 'serve';
+
+    // A completion spelled the way the proxy normalises before sending counts.
+    readmit();
+    const served = await new Promise((resolve, reject) => {
+      const req = http.request({ host: '127.0.0.1', port: proxyPort, method: 'POST', path: '/v1\\messages', headers: { 'content-type': 'application/json' } }, (r) => {
+        r.resume();
+        r.on('end', () => resolve(r.statusCode));
+      });
+      req.on('error', reject);
+      req.end(JSON.stringify({ model: 'x', messages: [] }));
+    });
+    assert.equal(served, 200);
+    assert.equal(am.getStatus().accounts[0].entitlementDenial, null);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
 test('a generic 403 gets only the local refusal cooldown, not entitlement quarantine', async () => {
   const seen = [];
   const upstream = http.createServer((req, res) => {
@@ -795,4 +885,58 @@ test('a caller-pinned request goes to exactly the account it targeted', async ()
     proxy.close();
     upstream.close();
   }
+});
+
+// Upstream's identity-verification hold answers 403 while the token stays valid,
+// and the portal link exists only in that response body. Telling the operator to
+// re-add the account sends them to a remedy that cannot work.
+test('a verification hold reports the portal link instead of a re-login', async () => {
+  const portal = 'https://portal.anthropic.com/verify?org=test-org';
+  const upstream = http.createServer((req, res) => {
+    res.writeHead(403, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      type: 'error',
+      error: {
+        type: 'permission_error',
+        message: "Your account can't receive replies from Claude right now.",
+        details: { error_code: 'verification_required', remediation_url: portal, capability: 'avocado' },
+      },
+      request_id: 'req_test',
+    }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(
+    [{ name: 'a', type: 'oauth', accessToken: 'ta', refreshToken: 'ra', expiresAt: Date.now() + HOUR }],
+    0.98,
+    { refreshFn: async () => { throw new Error('must not refresh on a 403'); } },
+  );
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const { status, body } = await postUpstream(proxyPort);
+    // This fork answers a refused fleet with the local retryable shortage, not
+    // upstream's 502 (see the first tests in this file); what #619 adds is the
+    // reason it names.
+    assert.equal(status, 429);
+    assert.match(body, /identity verification/);
+    assert.ok(body.includes(portal), 'the portal link has to reach the operator');
+    assert.doesNotMatch(body, /teamclaude login/, 'a re-login cannot clear a verification hold');
+    assert.equal(am.accounts[0].entitlementDeniedUntil, null, 'not an entitlement quarantine');
+    assert.notEqual(am.accounts[0].status, 'error', 'a refusal never parks an account');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('a verification hold keeps only an https remediation link', () => {
+  const hold = (/** @type {any} */ url) => oauthVerificationHold(Buffer.from(JSON.stringify({
+    error: { details: { error_code: 'verification_required', remediation_url: url } },
+  })));
+  assert.deepEqual(hold('https://portal.anthropic.com/verify?org=x'), { url: 'https://portal.anthropic.com/verify?org=x' });
+  assert.deepEqual(hold('javascript:alert(1)'), { url: null });
+  assert.deepEqual(hold('http://portal.anthropic.com/verify'), { url: null });
+  assert.deepEqual(hold('not a url\nforged log line'), { url: null });
+  assert.deepEqual(hold(42), { url: null });
 });

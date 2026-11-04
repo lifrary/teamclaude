@@ -15,7 +15,7 @@
 // operator/OAuth-derived, but they still never reach innerHTML.
 
 import { createHash } from 'node:crypto';
-import { UNAVAILABLE_TEXT, RESET_CREDIT_MAX_AGE_MS } from './status-renderer.js';
+import { UNAVAILABLE_TEXT, RESET_CREDIT_MAX_AGE_MS, outsideSpendText, forecastText, fleetForecastText, showSessionRow, showWeeklyRow } from './status-renderer.js';
 import { USAGE_WINDOWS } from './client-usage.js';
 
 export function renderDashboardHtml() {
@@ -94,6 +94,28 @@ export function scopedWeeklyRows(quota) {
   return rows;
 }
 
+// The rows a third-party backend's own reading draws on its card (#530). The
+// probe stores it as `quota.backend` (backend-quota.js): per-window fractions
+// when the provider reports distinct windows, else one fraction, else text
+// alone. A window past its reset is left out — the reading predates the reset,
+// so its fraction no longer describes anything. `text` is what is left to say
+// when no bar can be drawn: a balance has no fraction to fill a bar with.
+/** @param {any} backend @param {number} [now] */
+export function backendQuotaRows(backend, now) {
+  var b = backend || {};
+  var at = now == null ? Date.now() : now;
+  var w = b.windows || {};
+  var rows = [];
+  [{ key: 'fiveHour', label: 'Session' }, { key: 'weekly', label: 'Weekly' }, { key: 'monthly', label: 'Monthly' }].forEach(function (d) {
+    var win = w[d.key];
+    if (!win || win.utilization == null) return;
+    if (win.resetAt != null && win.resetAt <= at) return;
+    rows.push({ label: d.label, utilization: win.utilization, resetAt: win.resetAt == null ? null : win.resetAt });
+  });
+  if (!rows.length && b.utilization != null) rows.push({ label: b.label || 'Quota', utilization: b.utilization, resetAt: null });
+  return { rows: rows, text: !rows.length && b.text ? (b.label || 'Quota') + ': ' + b.text : null };
+}
+
 // What an account has spent, cache included. `totalInputTokens` counts uncached
 // input only, which on Claude Code traffic is ~0.05% of the input side — a
 // total without the cache fields understates the account by orders of magnitude.
@@ -103,10 +125,70 @@ export function accountTokens(usage) {
     + (u.totalCacheReadTokens || 0) + (u.totalCacheCreationTokens || 0);
 }
 
+// A model id as a person would say it: claude-opus-5-5 -> "Opus 5.5",
+// claude-haiku-4-5-20251001 -> "Haiku 4.5", gpt-6.1-sol -> "GPT 6.1 Sol".
+// A context suffix ("[1m]") is dropped; any other shape is shown as sent.
+export function modelLabel(/** @type {string} */ id) {
+  var s = String(id);
+  var br = s.indexOf('[');
+  if (br > 0) s = s.slice(0, br);
+  var parts = s.split('-');
+  var isNum = function (/** @type {string} */ p) { return p !== '' && !isNaN(Number(p)); };
+  var cap = function (/** @type {string} */ w) { return w.charAt(0).toUpperCase() + w.slice(1); };
+  if (parts[0] === 'claude' && parts.length >= 3) {
+    // Date stamps (8 digits) are a snapshot id, not part of the version.
+    var nums = parts.slice(2).filter(function (p) { return isNum(p) && p.length < 8; });
+    if (nums.length) return cap(parts[1]) + ' ' + nums.slice(0, 2).join('.');
+  }
+  if (parts[0] === 'gpt' && parts.length >= 2) {
+    return 'GPT ' + parts[1] + (parts.length > 2 ? ' ' + parts.slice(2).map(cap).join(' ') : '');
+  }
+  return s;
+}
+
+// The models an account served in the last 15 minutes, newest first, at most
+// three. Haiku is what Claude Code uses for side requests (titles, summaries),
+// so it is listed only when nothing else ran — otherwise it would crowd out
+// the model the sessions on that account are actually working with.
+export function recentModelLabels(/** @type {any} */ usage, /** @type {number} */ now) {
+  /** @type {Record<string, number>} */
+  var seen = (usage && usage.recentModels) || {};
+  var at = now == null ? Date.now() : now;
+  var ids = Object.keys(seen).filter(function (k) { return at - seen[k] < 15 * 60 * 1000; })
+    .sort(function (x, y) { return seen[y] - seen[x]; });
+  var main = ids.filter(function (k) { return k.toLowerCase().indexOf('haiku') < 0; });
+  return (main.length ? main : ids).slice(0, 3).map(modelLabel);
+}
+
 export function providerLabel(provider) {
   if (provider === 'codex') return 'Codex';
   if (provider === 'anthropic') return 'Claude';
   return provider || 'Unknown';
+}
+
+/**
+ * The account cards split by provider, for a fleet that mixes them. Claude
+ * accounts come first, then each other provider in the order its first account
+ * appears; within a group the payload's order is kept, since that is the
+ * rotation order. An account with no provider is an Anthropic one, as the
+ * server treats it. A single-provider fleet is one group the page draws without
+ * a heading, so it looks as it did.
+ * @param {Array<Record<string, any>>|null|undefined} accounts
+ * @returns {{ provider: string, label: string, accounts: Array<Record<string, any>> }[]}
+ */
+export function accountGroups(accounts) {
+  /** @type {Record<string, Array<Record<string, any>>>} */
+  var by = Object.create(null);
+  /** @type {string[]} */
+  var order = [];
+  (accounts || []).forEach(function (a) {
+    var p = (a && a.provider) || 'anthropic';
+    if (!by[p]) { by[p] = []; order.push(p); }
+    by[p].push(a);
+  });
+  var first = order.indexOf('anthropic');
+  if (first > 0) { order.splice(first, 1); order.unshift('anthropic'); }
+  return order.map(function (p) { return { provider: p, label: providerLabel(p), accounts: by[p] }; });
 }
 
 // Every bucket switchThreshold can be keyed by, plus the short names the
@@ -219,9 +301,16 @@ export function accountBadges(account, current, currentAccounts, now, fleetThres
   // one may describe a credit that has since been redeemed or has expired.
   var reading = (a.quota || {}).resetCredits || {};
   var credits = reading.available;
-  var stale = Number.isFinite(reading.seenAt) && (now == null ? Date.now() : now) - reading.seenAt > RESET_CREDIT_MAX_AGE_MS;
-  if (Number.isFinite(credits) && credits > 0 && !stale) {
-    badges.push({ cls: 'meta', text: credits + ' reset credit' + (credits === 1 ? '' : 's') });
+  var at = now == null ? Date.now() : now;
+  var stale = Number.isFinite(reading.seenAt) && at - reading.seenAt > RESET_CREDIT_MAX_AGE_MS;
+  // A Claude banked reset states when it lapses: drop it past then, and say
+  // the date while it stands (the claude.ai Resets page names it the same way).
+  var expired = Number.isFinite(reading.expiresAt) && reading.expiresAt <= at;
+  if (Number.isFinite(credits) && credits > 0 && !stale && !expired) {
+    var expires = Number.isFinite(reading.expiresAt)
+      ? ' \u00b7 expires ' + new Date(reading.expiresAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+      : '';
+    badges.push({ cls: 'meta', text: credits + ' reset credit' + (credits === 1 ? '' : 's') + expires });
   }
   // Arguments 5/6 are optional (the pre-#409 unit test above omits them): with
   // no account switchThreshold at all — the common case — thresholdBadgeText
@@ -239,6 +328,9 @@ export function accountBadges(account, current, currentAccounts, now, fleetThres
   // password-masked (describeRouting), and absent for an account on the fleet
   // path, which is the default and earns no badge.
   if (typeof a.routing === 'string' && a.routing) badges.push({ cls: 'meta routing', text: 'via ' + a.routing });
+  // Stays past the entitlement cooldown, until the account serves again.
+  var denial = a.entitlementDenial;
+  if (denial) badges.push({ cls: 'throttled', text: 'OAuth denied' + (denial.count > 1 ? ' \u00d7' + denial.count : '') });
   return badges;
 }
 
@@ -287,6 +379,14 @@ export function sessionRows(sessions) {
     row.total = row.cacheRead + row.cacheCreation + row.input + row.output;
     return row;
   });
+}
+
+// "pinned: 3f2a1b9c → api-1, 9d0e4c11 → work" — the sessions an operator held
+// on one account (`teamclaude switch --session`), or '' when there are none.
+/** @param {any} pins */
+export function sessionPinsText(pins) {
+  if (!Array.isArray(pins) || !pins.length) return '';
+  return 'pinned: ' + pins.map(function (p) { return (p && p.session || '?') + ' \u2192 ' + (p && p.account || '?'); }).join(', ');
 }
 
 export function filterSessionRows(rows, filters) {
@@ -422,6 +522,54 @@ export function accountControlOutcome(res, spec) {
     return { kind: 'ok', text: (res.disabled ? 'disabled ' : 'enabled ') + res.name };
   }
   return { kind: 'ok', text: res.name + ' priority ' + res.priority };
+}
+
+/**
+ * Whether the caller may use the control behind `path`. A status without the
+ * `caller` field keeps every control: the server still refuses what it must.
+ *
+ * @param {any} caller  status.caller
+ * @param {string} path
+ */
+export function callerCan(caller, path) {
+  var refused = caller && caller.refused;
+  return !Array.isArray(refused) || refused.indexOf(path) < 0;
+}
+
+/**
+ * The one line that explains the hidden controls, or null when nothing is
+ * hidden. Said once at the top instead of on every card.
+ *
+ * @param {any} caller  status.caller
+ */
+export function callerNotice(caller) {
+  if (!caller || !Array.isArray(caller.refused) || !caller.refused.length) return null;
+  return 'Signed in with the client key "' + caller.client + '". Changes to accounts and settings need the proxy key (proxy.apiKey), or the page opened without a key on the proxy\'s own machine, so those controls are hidden.';
+}
+
+/**
+ * Which card a note belongs to. One email can hold accounts in several orgs,
+ * and providers may reuse a name, so the name alone can match two cards.
+ *
+ * @param {any} account  one entry of status.accounts
+ */
+export function cardNoteKey(account) {
+  return [account.name, account.orgName || '', account.provider || ''].join('\n');
+}
+
+/**
+ * The result of the last action on one account card, while it is recent
+ * enough to show. Kept outside the card, which the poll rebuilds every few
+ * seconds.
+ *
+ * @param {any} notes  { [cardNoteKey]: { kind, text, at } }
+ * @param {string} key  cardNoteKey of the card
+ * @param {number} now
+ */
+export function cardNoteFor(notes, key, now) {
+  var n = notes && Object.prototype.hasOwnProperty.call(notes, key) ? notes[key] : null;
+  if (!n || now - n.at > CARD_NOTE_MAX_AGE_MS) return null;
+  return n;
 }
 
 export function switchOutcome(res) {
@@ -567,12 +715,16 @@ export function problems(status) {
   }
 
   // Only the two states that do not clear themselves. `entitlement` is a
-  // five-minute cooldown and `upstream-rejected` is upstream's way of saying a
+  // cooldown of at most an hour and `upstream-rejected` is upstream's way of saying a
   // shared bucket is spent — both expire on their own, like `quota` and
   // `throttled`, and none of them wants a person.
   var ATTENTION = { error: 'needs a re-login', disabled: 'is disabled' };
   (s.accounts || []).forEach(function (a) {
-    var why = ATTENTION[a.unavailable];
+    // A refusal from upstream (account-refusal.js) is not cured by a re-login
+    // alone; any error code other than the two dead-token ones is one.
+    var code = a.errorReason && a.errorReason.code;
+    var refused = a.unavailable === 'error' && code && code !== 'refresh_rejected' && code !== 'credential_rejected';
+    var why = refused ? 'was refused by upstream' : ATTENTION[a.unavailable];
     if (why) out.push({ severity: 'warn', kind: 'account', text: 'Account ' + a.name + ' ' + why + '.' });
   });
 
@@ -608,9 +760,13 @@ export function usageFor(entry, view) {
   };
 }
 
+/** How long an action's result stays above its account card. */
+export const CARD_NOTE_MAX_AGE_MS = 60 * 1000;
+
 const SHARED_HELPERS = [
-  scopedWeeklyRows, accountTokens, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
+  scopedWeeklyRows, accountTokens, modelLabel, recentModelLabels, providerLabel, accountGroups, thresholdBadgeText, accountBadges, sessionRows, sessionPinsText, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
+  outsideSpendText, forecastText, fleetForecastText, showSessionRow, showWeeklyRow, callerCan, callerNotice, cardNoteKey, cardNoteFor, backendQuotaRows,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -625,6 +781,7 @@ const SHARED_CONSTS = [
   `var THRESHOLD_BUCKET_KEYS = ${JSON.stringify(THRESHOLD_BUCKET_KEYS)};`,
   `var THRESHOLD_BUCKET_LABELS = ${JSON.stringify(THRESHOLD_BUCKET_LABELS)};`,
   `var USAGE_VIEWS = ${JSON.stringify(USAGE_VIEWS)};`,
+  `var CARD_NOTE_MAX_AGE_MS = ${CARD_NOTE_MAX_AGE_MS};`,
 ].join('\n');
 
 const PAGE = `<!doctype html>
@@ -685,6 +842,8 @@ const PAGE = `<!doctype html>
   .quota { display: grid; grid-template-columns: 64px 1fr 170px; gap: 8px; align-items: center; margin-top: 6px; }
   .quota .lbl { color: var(--dim); font-size: 12px; }
   .quota .val { color: var(--dim); font-size: 12px; text-align: right; font-variant-numeric: tabular-nums; }
+  .quota.models .names { grid-column: 2 / 4; display: flex; flex-wrap: wrap; gap: 6px; }
+  .badge.model { color: var(--accent); border-color: var(--accent); }
   .bar { height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; }
   .bar i { display: block; height: 100%; border-radius: 4px; background: var(--ok); }
   .bar i.warn { background: var(--warn); }
@@ -701,7 +860,9 @@ const PAGE = `<!doctype html>
   .act:hover { background: var(--accent); color: var(--bg); }
   .act:disabled { opacity: .5; cursor: default; }
   #note { font-size: 12px; margin: 8px 0; display: none; }
-  #note.ok { color: var(--ok); } #note.warn { color: var(--warn); } #note.error { color: var(--bad); }
+  #note.ok, .cardnote.ok { color: var(--ok); } #note.warn, .cardnote.warn { color: var(--warn); } #note.error, .cardnote.error { color: var(--bad); }
+  .cardnote { font-size: 12px; margin: 8px 0 4px; }
+  #caller { font-size: 12px; margin: 8px 0; color: var(--dim); }
   .filters { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; padding: 8px 10px; border-bottom: 1px solid var(--line); }
   .filters label { color: var(--dim); font-size: 12px; display: flex; align-items: center; gap: 6px; }
   .filters select { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; color: var(--text); font: inherit; font-size: 12px; padding: 4px 8px; }
@@ -734,6 +895,12 @@ const PAGE = `<!doctype html>
   #keybox input { width: 100%; padding: 10px 12px; margin: 12px 0; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; color: var(--text); font: inherit; }
   #keybox button { padding: 8px 20px; background: var(--accent); border: 0; border-radius: 6px; color: var(--panel); font: inherit; font-weight: 600; cursor: pointer; }
   footer { color: var(--dim); font-size: 12px; margin-top: 24px; }
+  /* A mixed Claude/Codex fleet: one framed group per provider, so the cards of
+     one kind read together however the accounts were added. */
+  .acctgroup { border: 1px solid var(--line); border-radius: 10px; padding: 10px 10px 2px; margin-bottom: 14px; }
+  .acctgroup .card { margin-bottom: 8px; }
+  .acctgroup-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin: 0 6px 8px; }
+  .acctgroup-head .name { font-size: 13px; }
 </style>
 <script>
 (function () {
@@ -769,6 +936,7 @@ const PAGE = `<!doctype html>
     <div id="err"></div>
     <div id="problems"></div>
     <div id="note"></div>
+    <div id="caller" style="display:none"><span id="callerText"></span> <button id="changeKey" class="act" type="button">Change key</button></div>
     <div id="routesWrap" style="display:none">
       <h2>Routing</h2>
       <div class="card" style="padding:4px 6px"><table id="routes"></table></div>
@@ -889,7 +1057,19 @@ ${SHARED_HELPERS}
     return row;
   }
 
-  function renderAccount(a, current, currentAccounts, fleetThreshold, fleetThresholds) {
+  // A "Model" row under Session: what this account is serving right now.
+  function modelsRow(usage) {
+    var labels = recentModelLabels(usage);
+    if (!labels.length) return null;
+    var row = el('div', 'quota models');
+    row.appendChild(el('span', 'lbl', 'Model'));
+    var names = el('span', 'names');
+    labels.forEach(function (l) { names.appendChild(el('span', 'badge model', l)); });
+    row.appendChild(names);
+    return row;
+  }
+
+  function renderAccount(a, current, currentAccounts, fleetThreshold, fleetThresholds, caller) {
     var card = el('div', 'card');
     var head = el('div', 'row');
     head.appendChild(el('span', 'name', a.name));
@@ -902,7 +1082,7 @@ ${SHARED_HELPERS}
     // Last in the row so the badges sit in the same place on every card.
     if (!isCurrent) {
       var btn = el('button', 'act', 'switch');
-      btn.addEventListener('click', function () { doSwitch(a.name, btn); });
+      btn.addEventListener('click', function () { doSwitch(a.name, cardNoteKey(a), btn); });
       head.appendChild(btn);
     }
     // Account controls, in the order an operator reaches for them: take it out
@@ -912,32 +1092,51 @@ ${SHARED_HELPERS}
     // Named ctl* deliberately: var is function-scoped, and this builder already
     // declares a "last" further down (the last-used string). A button named
     // last here is overwritten by that before any click can fire.
-    var ctlDisable = el('button', 'act', a.disabled ? 'enable' : 'disable');
-    ctlDisable.addEventListener('click', function () { doControlAccount(a.name, { disabled: !a.disabled }, ctlDisable); });
-    head.appendChild(ctlDisable);
-    if (!a.disabled) {
+    // A control this key would be refused is not drawn at all; the line under
+    // the actions says why, once (callerNotice).
+    if (callerCan(caller, '/teamclaude/disable')) {
+      var ctlDisable = el('button', 'act', a.disabled ? 'enable' : 'disable');
+      ctlDisable.addEventListener('click', function () { doControlAccount(a.name, cardNoteKey(a), { disabled: !a.disabled }, ctlDisable); });
+      head.appendChild(ctlDisable);
+    }
+    if (!a.disabled && callerCan(caller, '/teamclaude/priority')) {
       var ctlFirst = el('button', 'act', 'prioritize');
-      ctlFirst.addEventListener('click', function () { doControlAccount(a.name, { place: 'first' }, ctlFirst); });
+      ctlFirst.addEventListener('click', function () { doControlAccount(a.name, cardNoteKey(a), { place: 'first' }, ctlFirst); });
       head.appendChild(ctlFirst);
       var ctlLast = el('button', 'act', 'deprioritize');
-      ctlLast.addEventListener('click', function () { doControlAccount(a.name, { place: 'last' }, ctlLast); });
+      ctlLast.addEventListener('click', function () { doControlAccount(a.name, cardNoteKey(a), { place: 'last' }, ctlLast); });
       head.appendChild(ctlLast);
     }
     card.appendChild(head);
     if (a.unavailable) card.appendChild(el('div', 'blocked', 'blocked: ' + (UNAVAILABLE_TEXT[a.unavailable] || a.unavailable)));
+    if (a.entitlementDenial) card.appendChild(el('div', 'blocked', 'denied: ' + (a.entitlementDenial.detail || 'OAuth entitlement denied') + ' \u00b7 first ' + fmtAgo(a.entitlementDenial.since)));
     var q = a.quota || {};
+    var models = modelsRow(a.usage);
     if (q.unified5h != null || q.unified7d != null) {
-      card.appendChild(quotaRow('Session', q.unified5h, q.unified5hReset));
-      card.appendChild(quotaRow('Weekly', q.unified7d, q.unified7dReset));
+      // No Session row for a plan with no session window (see showSessionRow).
+      if (showSessionRow(q)) card.appendChild(quotaRow('Session', q.unified5h, q.unified5hReset));
+      if (models) card.appendChild(models);
+      models = null;
+      if (showWeeklyRow(q)) card.appendChild(quotaRow('Weekly', q.unified7d, q.unified7dReset));
       // Model-scoped weekly buckets are learned from the usage endpoint rather
       // than declared, so hard-coding the two families that have dedicated
       // fields drew an incomplete picture the moment upstream metered a third.
       scopedWeeklyRows(q).forEach(function (r) { card.appendChild(quotaRow(r.label, r.utilization, r.resetAt)); });
     } else if (q.tokensLimit != null && q.tokensRemaining != null) {
       card.appendChild(quotaRow('Tokens', 1 - q.tokensRemaining / q.tokensLimit, q.resetsAt));
+    } else if (q.backend && (q.backend.text || q.backend.utilization != null)) {
+      var bq = backendQuotaRows(q.backend);
+      bq.rows.forEach(function (r) { card.appendChild(quotaRow(r.label, r.utilization, r.resetAt)); });
+      if (bq.text) card.appendChild(el('div', 'usage', bq.text));
     } else {
       card.appendChild(el('div', 'usage', 'quota unknown (no traffic observed yet)'));
     }
+    if (models) card.appendChild(models);
+    // Spend on this account that did not come through the proxy (#475).
+    var outside = outsideSpendText(q.outsideSpend);
+    if (outside) card.appendChild(el('div', 'usage', 'outside: ' + outside));
+    var forecast = forecastText(q.forecast, Date.now());
+    if (forecast) card.appendChild(el('div', 'usage', 'forecast: ' + forecast));
     var u = a.usage || {};
     var last = u.lastUsed ? ' · last ' + fmtAgo(u.lastUsed) : '';
     card.appendChild(el('div', 'usage', (u.totalRequests || 0) + ' req · ' + fmtNum(accountTokens(u)) + ' tok' + last));
@@ -1214,6 +1413,13 @@ ${SHARED_HELPERS}
     // TUI or another browser shows up here without a refresh.
     var thrInput = document.getElementById('thrVal');
     if (document.activeElement !== thrInput) thrInput.value = thresholdPercentText(s.switchThreshold);
+    // Kept visible read-only: the number still tells a client where the fleet switches.
+    var canThreshold = callerCan(s.caller, '/teamclaude/threshold');
+    thrInput.disabled = !canThreshold;
+    document.getElementById('thrSet').style.display = canThreshold ? '' : 'none';
+    var notice = callerNotice(s.caller);
+    document.getElementById('callerText').textContent = notice || '';
+    document.getElementById('caller').style.display = notice ? 'block' : 'none';
     var sess = s.sessions || {};
     var up = s.server && s.server.uptimeSeconds != null ? 'up ' + fmtIn(s.server.uptimeSeconds) : '';
     var sum = document.getElementById('summary');
@@ -1238,13 +1444,35 @@ ${SHARED_HELPERS}
     // one page saying "sessions" here and "conversations" there would read as
     // two different quantities rather than one counted twice.
     sum.appendChild(el('span', '', ' · ' + (sess.active || 0) + ' active / ' + (sess.known || 0) + ' known conversations' + (up ? ' · ' + up : '')));
+    var pinsText = sessionPinsText(s.sessionPins);
+    if (pinsText) sum.appendChild(el('span', 'pin', ' · ' + pinsText));
+    var fleetText = fleetForecastText(s.fleetForecast, Date.now());
+    if (fleetText) sum.appendChild(el('span', '', ' · ' + fleetText));
     var probe = s.probe || {};
     var probeBtn = document.getElementById('probe');
     probeBtn.textContent = probe.running ? 'Probe running…' : 'Probe quotas';
     probeBtn.disabled = !!probe.running;
     var acc = document.getElementById('accounts');
     acc.textContent = '';
-    (s.accounts || []).forEach(function (a) { acc.appendChild(renderAccount(a, s.currentAccount, currentAccounts, s.switchThreshold, s.switchThresholds)); });
+    var now = Date.now();
+    var groups = accountGroups(s.accounts);
+    groups.forEach(function (g) {
+      var box = acc;
+      if (groups.length > 1) {
+        box = el('section', 'acctgroup');
+        var head = el('div', 'acctgroup-head');
+        head.appendChild(el('span', 'name', g.label));
+        var cur = currentAccounts && currentAccounts[g.provider];
+        head.appendChild(el('span', 'tag', g.accounts.length + (g.accounts.length === 1 ? ' account' : ' accounts') + (cur ? ' · current ' + cur : '')));
+        box.appendChild(head);
+        acc.appendChild(box);
+      }
+      g.accounts.forEach(function (a) {
+        var cn = cardNoteFor(cardNotes, cardNoteKey(a), now);
+        if (cn) box.appendChild(el('div', 'cardnote ' + cn.kind, cn.text));
+        box.appendChild(renderAccount(a, s.currentAccount, currentAccounts, s.switchThreshold, s.switchThresholds, s.caller));
+      });
+    });
     renderProblems(s);
     renderRoutes(s);
     renderClients(s.clients);
@@ -1257,6 +1485,19 @@ ${SHARED_HELPERS}
     document.getElementById('foot').textContent = 'refreshes every ' + (POLL_MS / 1000) + 's · ' + new Date().toLocaleTimeString();
   }
 
+  // An account action reports above its own card, where the click was: the
+  // page-wide note sits above the cards and is off screen for a card further down.
+  // No prototype: an account named __proto__ would otherwise set it.
+  var cardNotes = Object.create(null);
+  // With now set it re-renders at once, for a failure no poll follows. Otherwise the
+  // poll the caller starts shows it: re-rendering the stale status here would
+  // rebuild the card and re-enable a switch button that must stay disabled
+  // until the poll reports the switch.
+  function cardNote(key, kind, text, now) {
+    cardNotes[key] = { kind: kind, text: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) + ' · ' + text, at: Date.now() };
+    if (now && lastStatus) render(lastStatus);
+  }
+
   function note(kind, text) {
     var n = document.getElementById('note');
     n.className = kind;
@@ -1267,7 +1508,7 @@ ${SHARED_HELPERS}
   // One manual switch. The endpoint is a nudge, not a pin: it sets the current
   // account and normal rotation resumes from there (see the handler's comment
   // in server.js for what "eligible" means).
-  function doSwitch(name, btn) {
+  function doSwitch(name, noteKey, btn) {
     btn.disabled = true;
     var r = switchRequest(name, localStorage.getItem(KEY));
     fetch(r.url, r.init)
@@ -1278,16 +1519,16 @@ ${SHARED_HELPERS}
       .then(function (json) {
         if (!json) return;
         var out = switchOutcome(json);
-        note(out.kind, out.text);
+        cardNote(noteKey, out.kind, out.text, false);
         // Re-enabled on any non-success, whether the server refused or the
         // fetch threw, so the two failure paths leave the button in one state.
         if (out.kind !== 'ok') btn.disabled = false;
         poll();
       })
-      .catch(function (e) { note('error', 'switch failed: ' + e.message); btn.disabled = false; });
+      .catch(function (e) { cardNote(noteKey, 'error', 'switch failed: ' + e.message, true); btn.disabled = false; });
   }
 
-  function doControlAccount(name, spec, btn) {
+  function doControlAccount(name, noteKey, spec, btn) {
     btn.disabled = true;
     var r = accountControlRequest(name, spec, localStorage.getItem(KEY));
     fetch(r.url, r.init)
@@ -1298,10 +1539,10 @@ ${SHARED_HELPERS}
       .then(function (json) {
         if (!json) return;
         var out = accountControlOutcome(json, spec);
-        note(out.kind, out.text);
+        cardNote(noteKey, out.kind, out.text, false);
         poll();
       })
-      .catch(function (e) { note('error', 'change failed: ' + e.message); })
+      .catch(function (e) { cardNote(noteKey, 'error', 'change failed: ' + e.message, true); })
       // Unlike doSwitch, always re-enabled: the card is rebuilt by the poll
       // above, and a button that stayed dead after a refused change would be
       // the only control an operator could not retry.
@@ -1444,6 +1685,9 @@ ${SHARED_HELPERS}
   document.getElementById('reload').addEventListener('click', function () { doControl('/teamclaude/reload', 'config reload', this); });
   document.getElementById('probe').addEventListener('click', function () { doControl('/teamclaude/probe', 'quota probe', this); });
   document.getElementById('thrSet').addEventListener('click', function () { doThreshold(this); });
+  // A client key is a valid key, so nothing else on the page would ever ask for
+  // another one: the operator needs a way back to the key box.
+  document.getElementById('changeKey').addEventListener('click', function () { localStorage.removeItem(KEY); document.getElementById('key').value = ''; showKeybox(); });
   document.getElementById('thrVal').addEventListener('keydown', function (e) {
     if (e.key === 'Enter') document.getElementById('thrSet').click();
   });

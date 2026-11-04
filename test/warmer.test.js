@@ -4,7 +4,7 @@ import { AccountManager } from '../src/account-manager.js';
 import { MaintenanceCoordinator } from '../src/maintenance-coordinator.js';
 import { Prober } from '../src/prober.js';
 import { resolveAccountPin } from '../src/server.js';
-import { Warmer } from '../src/warmer.js';
+import { Warmer, resolveClaudeCommand, claudeSpawnShell } from '../src/warmer.js';
 import { accountIdKey } from '../src/identity.js';
 
 function oauth(name, extra = {}) {
@@ -46,6 +46,21 @@ test('warms only healthy, idle Anthropic OAuth accounts with no live 5h window',
 
   assert.equal(spawn.calls.length, 1, 'exactly one account warmed');
   assert.equal(spawn.calls[0].env.ANTHROPIC_BASE_URL, `http://127.0.0.1:3456/tc-acct/${encodeURIComponent(accountIdKey(am.accounts[0]))}`);
+});
+
+// The warm-up is a `claude` run, which the server refuses on a Codex account,
+// and a Codex plan may have no 5-hour window to start at all: with no reset
+// ever recorded it would be a target on every cycle, forever.
+test('a Codex subscription is never a warm target', async () => {
+  const am = new AccountManager([
+    oauth('codex', { provider: 'codex', accountId: 'acct-1' }),
+  ], 0.98);
+  const spawn = fakeSpawner();
+  const warmer = makeWarmer(am, spawn);
+  await warmer.warmAll();
+
+  assert.equal(spawn.calls.length, 0);
+  assert.equal(warmer.getStatus().accounts[0].status, 'not-applicable');
 });
 
 test('an expired 5h window is a warm target again (keeps the timer going)', async () => {
@@ -102,7 +117,9 @@ test('errored and exhausted accounts are skipped', async () => {
 test('the spawn invocation is a minimal non-interactive claude pinned to the account', async () => {
   const am = new AccountManager([oauth('solo', { accountUuid: 'person-1', orgName: 'R&D / Europe' })], 0.98);
   const spawn = fakeSpawner();
-  await makeWarmer(am, spawn, { port: 9999, apiKey: 'tc-secret', model: 'haiku' }).warmAll();
+  await makeWarmer(am, spawn, {
+    port: 9999, apiKey: 'tc-secret', model: 'haiku', commandFn: () => 'claude',
+  }).warmAll();
 
   const spec = spawn.calls[0];
   assert.equal(spec.command, 'claude');
@@ -152,6 +169,50 @@ test('a non-zero exit is recorded as an error', async () => {
   const st = warmer.getStatus().accounts.find(a => a.name === 'a');
   assert.equal(st.status, 'error');
   assert.match(st.error, /exited 1/);
+});
+
+test('resolveClaudeCommand keeps the bare name when claude is already on PATH', () => {
+  assert.equal(resolveClaudeCommand({
+    pathEnv: '/usr/bin:/bin',
+    home: '/Users/x',
+    platform: 'darwin',
+    exists: (p) => p === '/usr/bin/claude',
+  }), 'claude');
+});
+
+test('resolveClaudeCommand uses the native binary when PATH has no claude', () => {
+  assert.equal(resolveClaudeCommand({
+    pathEnv: '/usr/bin:/bin',
+    home: '/Users/x',
+    platform: 'darwin',
+    exists: (p) => p === '/Users/x/.local/bin/claude',
+  }), '/Users/x/.local/bin/claude');
+});
+
+test('resolveClaudeCommand stays the bare name when claude is nowhere', () => {
+  assert.equal(resolveClaudeCommand({
+    pathEnv: '/usr/bin',
+    home: '/Users/x',
+    platform: 'linux',
+    exists: () => false,
+  }), 'claude');
+});
+
+test('resolveClaudeCommand finds a Windows native exe that is off PATH', () => {
+  const native = 'C:\\Users\\x\\.local\\bin\\claude.exe';
+  assert.equal(resolveClaudeCommand({
+    pathEnv: 'C:\\Windows\\System32',
+    home: 'C:\\Users\\x',
+    platform: 'win32',
+    exists: (p) => p === native,
+  }), native);
+});
+
+test('a bare claude on Windows still goes through the shell, an absolute path does not', () => {
+  assert.equal(claudeSpawnShell('claude', 'win32'), true);
+  assert.equal(claudeSpawnShell('C:\\Users\\x\\.local\\bin\\claude.exe', 'win32'), false);
+  assert.equal(claudeSpawnShell('/Users/x/.local/bin/claude', 'darwin'), false);
+  assert.equal(claudeSpawnShell('claude', 'darwin'), false);
 });
 
 test('a spawn failure (e.g. claude not on PATH) is recorded as an error, not thrown', async () => {
@@ -334,7 +395,9 @@ test('a shared coordinator serializes probe and warm-up for one account without 
     coordinator,
     probeFn: async () => {
       await probeStarted;
-      return { sevenDay: { utilization: 0.2, resetAt: 5_000 } };
+      // A five-hour window, already reset: a weekly-only reading would say the
+      // plan meters none, and then there is nothing for keep-warm to start.
+      return { fiveHour: { utilization: 0.1, resetAt: 5_000 }, sevenDay: { utilization: 0.2, resetAt: 5_000 } };
     },
     log: () => {},
   });

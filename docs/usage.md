@@ -10,7 +10,7 @@ teamclaude server
 
 From a TTY this shows the interactive TUI: an account table with session/weekly quota bars and reset countdowns, a real-time activity log, and keyboard controls.
 
-With accounts from two providers (Claude and Codex) and a terminal at least 127 columns wide, the account table is drawn as two panes side by side, one per provider, each titled with its provider. Each pane carries its own `►` current-account marker, because each provider pool keeps its own cursor. The panes are used only when both can draw every quota bar their rows have, so a fleet with per-model bars, route columns or blocked-family tags needs a little more than 127 columns; a narrower terminal keeps the single list, with the provider named in the type column (and still one `►` per provider). A Codex row whose subscription has reported a weekly window and no 5-hour one draws the weekly bar alone, at the width of both cells, while the Claude rows beside it keep `Ses` and `Wk`; a list made only of such rows drops the `Ses` column outright. An account that has not reported yet keeps both cells, and a row keeps them when its 5-hour window merely runs out.
+With accounts from two providers (Claude and Codex) and a terminal at least 127 columns wide, the account table is drawn as two panes side by side, one per provider, each titled with its provider. Each pane carries its own `►` current-account marker, because each provider pool keeps its own cursor. The panes are used only when both can draw every quota bar their rows have, so a fleet with per-model bars, route columns or blocked-family tags needs a little more than 127 columns; a narrower terminal keeps the single list, with the provider named in the type column (and still one `►` per provider). A row whose subscription has reported a weekly window and no 5-hour one (some Codex plans, and a Claude Ultra plan once Anthropic has lifted its 5-hour limit; see [Accounts without a 5-hour window](quota.md#accounts-without-a-5-hour-window)) draws the weekly bar alone, at the width of both cells, while the rows beside it keep `Ses` and `Wk`; a list made only of such rows drops the `Ses` column outright. On a terminal too narrow for two bars per row, where the other rows draw only `Ses`, such a row draws `Wk` in that one slot. An account that has not reported yet keeps both cells, and a row keeps them when its 5-hour window merely runs out.
 
 It falls back to plain log output when stdout is not a TTY (e.g. running as a service). Pass `--headless` (or `--no-tui`) to force plain-log mode from a terminal — useful for backgrounding the proxy.
 
@@ -80,7 +80,7 @@ It is a setting, not a nudge: the number is written to the config file (under it
 
 You usually don't need to call it directly. `login`, `import`, `enable`, `disable`, `priority`, `route`, `threshold`, `distribute`, `probe` and `warmup` notify a running server themselves.
 
-Control-plane **writes** (`reload`, `switch`, `threshold`, `priority`, `disable`) are refused when the request carries a browser `Origin` or a cross-site `Sec-Fetch-Site`. Loopback is exempt from the proxy API key so the CLI needs no configuration, but that exemption also covers any web page you happen to visit: a page can POST to `127.0.0.1` cross-origin without a preflight, and while it cannot read the reply, the write would still land. `curl` and the CLI send neither header and are unaffected. Reads (`status`) are not restricted — the same-origin policy already stops a page from seeing the response.
+Control-plane **writes** (`reload`, `switch`, `session-pin`, `threshold`, `priority`, `disable`) are refused when the request carries a browser `Origin` or a cross-site `Sec-Fetch-Site`. Loopback is exempt from the proxy API key so the CLI needs no configuration, but that exemption also covers any web page you happen to visit: a page can POST to `127.0.0.1` cross-origin without a preflight, and while it cannot read the reply, the write would still land. `curl` and the CLI send neither header and are unaffected. Reads (`status`) are not restricted — the same-origin policy already stops a page from seeing the response.
 
 `GET /teamclaude/quota` is the compact read endpoint for status-line integrations. It returns tier-weighted fleet aggregates and the underlying per-account limits; see [Fleet quota endpoint](quota.md#fleet-quota-endpoint).
 
@@ -89,7 +89,10 @@ Switching the account by hand has the same headless path — the equivalent of p
 ```bash
 teamclaude switch                 # list accounts, marking the current one
 teamclaude switch me@example.com  # make that account the preferred one
+teamclaude switch me@example.com --session   # move only the session this runs in
 ```
+
+`--session [<id>]` moves one session instead of the fleet; see [Move one running session](routing.md#move-one-running-session).
 
 Both forms need a running server: the choice is runtime state and is never written to the config, so there is nothing to apply on a later restart. The command wraps `POST /teamclaude/switch` with a `{"account": "<name>"}` body, and the account can be given as its display name, its bare email, its `accountUuid`, its `orgUuid`, or the fully qualified `accountUuid/orgUuid` — the last being the only form that tells apart one email that holds accounts in several orgs. The rotation index is deliberately not accepted — it is array position, so a script pinned to `1` would silently follow a different account after a removal.
 
@@ -120,10 +123,10 @@ curl -X POST http://localhost:3456/teamclaude/priority \
 | `e` | Enable/disable the selected account |
 | `d` | Delete an account after confirmation |
 | `o` | Reorder the selected account; arrows move it, `a` resets all ranks, `c` clears its rank |
-| `l` | Sign an account in again via the browser (opens on the first account in `error`; not in attach mode) |
+| `l` | Sign an account in again (opens on the first account in `error`; not in attach mode). A panel shows the sign-in link, clickable and copied to the clipboard, and takes the pasted answer back, so it works over SSH — see [Signing in again from the TUI](accounts.md#signing-in-again-from-the-tui) |
 | `p` | Refresh quota on all accounts (one-shot probe of the zero-spend usage endpoint) |
 | `R` | Reload accounts from config and request quota refresh |
-| `g` | Settings (threshold, quota probe, quota-bar contents, routing, add/remove/reorder accounts, upstream and account proxies, sx.org) |
+| `g` | Settings (threshold, quota probe, quota-bar contents, routing, add/remove/reorder/sort accounts, upstream and account proxies, sx.org) |
 | `q` | Quit |
 
 In selection mode, use `j`/`k` or the arrow keys to navigate, `Enter` to confirm, `Esc` to cancel.
@@ -131,6 +134,8 @@ In selection mode, use `j`/`k` or the arrow keys to navigate, `Enter` to confirm
 The settings screen is a list, not a set of letter shortcuts: `↑`/`↓` move between rows, `←`/`→` change the value in place (threshold by 1%, probe by 30s, modes cycle), `Enter` opens a row that needs typing or a sub-screen, `Esc` goes back.
 
 **Reorder accounts** opens the account list with the same two pairs of keys and one extra job for them: `↑`/`↓` pick the account, `←`/`→` move *that account* up and down the list, `Enter` or `Esc` goes back. Every move applies as you make it and is written a moment after the keys stop (or on leaving the screen), so there is nothing to confirm and nothing to cancel. An account moves among the accounts of its own provider: a mixed Claude and Codex fleet is drawn grouped by provider, so a move that would cross into the other group does nothing. This is the order the list is **drawn** in and nothing else — rotation order is [`priority`](routing.md#choosing-an-account), which the screen never touches. `teamclaude attach` draws the same order: each account in `/teamclaude/status` carries its `displayOrder` (`null` until it has been placed).
+
+**Sort accounts** chooses what orders the list inside each provider group: **arranged** (your order, above), or the soonest reset of one window — **session reset** (five-hour), **weekly reset**, **S7 reset** or **F7 reset** — which puts the account whose window ends soonest at the top: the quota you lose first if nothing spends it. S7 and F7 read the all-models weekly on an account that has no Sonnet or Fable bucket of its own, since that is the window its Sonnet or Fable use counts against. Accounts with no reading for the window go last (for the session sort, that includes every account with no five-hour window open), and your arrangement breaks ties. A third-party backend sorts by its probed windows, with the monthly one standing in for a weekly reset the plan does not have. The reorder screen always shows the arranged order, because that is the order it edits. `teamclaude attach` reads the same `accountSort` from its own config file.
 
 ## Run Claude Code through the proxy
 
@@ -188,6 +193,8 @@ teamclaude alias --install    # or write it to your shell rc (--uninstall to rem
 
 This is an interactive-shell alias — it affects `claude` typed at a prompt, not `claude` spawned by editors or scripts. It's a thin passthrough to `teamclaude run`, which holds the proxy-up/down logic (so it errors when the proxy is down; add `--auto-fallback` to launch claude directly instead).
 
+The Claude Code extension for VS Code starts `claude` itself in its chat panel, so neither the alias nor `run` reaches it there. It takes the proxy settings from its own setting instead: see [VS Code extension](vscode.md). In terminal mode (`claudeCode.useTerminal`) on macOS and Linux, and on Windows in a Git Bash or WSL terminal, it types `claude` into an integrated terminal, where the alias does apply.
+
 ## Command reference
 
 ```bash
@@ -207,6 +214,7 @@ teamclaude remove <name>     # Remove an account (by name or email)
 teamclaude disable <name>    # Temporarily exclude an account from rotation
 teamclaude enable <name>     # Re-enable it (also clears a stuck error state)
 teamclaude priority <name> 1 # Set rotation priority (lower = preferred)
+teamclaude rename <name> <new> # Rename an account (and the routes that list it)
 teamclaude route list        # Manage per-model routes (add/rm)
 teamclaude threshold 90      # Utilization at which rotation leaves an account
 teamclaude distribute on     # Spread new sessions across equal-priority accounts
@@ -217,6 +225,8 @@ teamclaude warmup reset 15:30 --timezone Europe/Moscow
 teamclaude warmup rolling 15:30 --timezone Europe/Moscow
                              # Anchor resets at 15:30, then continue every 5h
 teamclaude api <path>        # Call an API endpoint with account credentials
+teamclaude callback login    # Sign in to callback.net: keep OAuth tokens in step across your installs
+teamclaude callback status   # (also: sync, logout) — see docs/accounts.md
 teamclaude update            # Check npm for a newer teamclaude and install it
 teamclaude version           # Print the installed version
 teamclaude help              # Show all commands
@@ -226,13 +236,31 @@ teamclaude help              # Show all commands
 
 `teamclaude attach` opens the terminal dashboard itself against a server that is already running, which is how you get interactive control back when the proxy runs as a background service. It polls the same status endpoint every second and can do the two things the remote control exposes: `s` switches account, `R` reloads config. The browser dashboard adds the matching **Reload config** action plus a zero-spend **Probe quotas** action; settings editing and the request activity stream still stay in the server's own TUI because they need state that only that process has. When contact with the server drops, the header marker turns from `▲` to `▼` and what is on screen is the last snapshot, not the current state.
 
-`teamclaude service install` registers the proxy as a user service that starts at login and restarts on its own — a LaunchAgent on macOS, a `systemd --user` unit on Linux (`uninstall`, `status` and `print` round it out; `print` writes the unit to stdout without touching anything). On macOS the LaunchAgent runs with `ProcessType` `Standard`: the `Background` class it used before carried a QoS clamp that starved the proxy under host contention (status timeouts, seconds of event-loop lag). The unit is only written at install time, so an existing install keeps whatever it was installed with until you re-run `teamclaude service install`.
+`teamclaude service install` registers the proxy as a user service that starts at login and restarts on its own — a LaunchAgent on macOS, a `systemd --user` unit on Linux (`uninstall`, `status` and `print` round it out; `print` writes the unit to stdout without touching anything). On macOS the LaunchAgent runs with `ProcessType` `Standard`: the `Background` class it used before carried a QoS clamp that starved the proxy under host contention (status timeouts, seconds of event-loop lag). The unit is only written at install time, so an existing install keeps whatever it was installed with until you re-run `teamclaude service install`. The service `PATH` includes `~/.local/bin` when that directory exists, which is where the native Claude Code installer places `claude`. Keep-warm also checks that directory when `claude` is not on the service `PATH`, so an already-installed service finds the binary without another install.
+
+Re-running `teamclaude service install` rewrites the unit and restarts the proxy on both platforms, so the proxy also picks up an updated install. Requests in flight are dropped.
 
 ![teamclaude status output](assets/status-redacted.png)
 
 ## Control routes under a second name
 
-Every `/teamclaude/…` route the server exposes — `status`, `quota`, `reload`, `switch`, `disable`, `priority`, `threshold`, `probe`, `dashboard` and `mcp` — also answers at the same path under `/teamrouter/…`, with the same gates and the same replies. It is the first step of the [rename to TeamRouter](../README.md#renaming-to-teamrouter); scripts and dashboards written against `/teamclaude/…` keep working unchanged.
+Every `/teamclaude/…` route the server exposes — `status`, `quota`, `reload`, `switch`, `disable`, `priority`, `threshold`, `probe`, `drain`, `undrain`, `dashboard` and `mcp` — also answers at the same path under `/teamrouter/…`, with the same gates and the same replies. It is the first step of the [rename to TeamRouter](../README.md#renaming-to-teamrouter); scripts and dashboards written against `/teamclaude/…` keep working unchanged.
+
+## Draining for maintenance
+
+Before a restart, or while you work on the proxy's machine, drain it so the requests in flight finish instead of being cut:
+
+```bash
+curl -X POST http://localhost:3456/teamclaude/drain   -H "x-api-key: $KEY"
+curl -X POST http://localhost:3456/teamclaude/undrain -H "x-api-key: $KEY"
+```
+
+- While draining, a new request to the forwarded API routes gets `503` with a `retry-after` header and `Connection: close`. The body is `{"type":"error","error":{"type":"overloaded_error","message":"…","details":{"error_code":"draining"}}}`, so a client can retry once the proxy is back. Streams already open run to their end.
+- The control routes still answer while draining, so `undrain` works. `GET /teamclaude/status` carries `drain: { draining, since, inFlight }`, where `since` is when the drain began and `inFlight` is the number of requests still running.
+- Drain is runtime state. It is not written to the config, and a restart clears it. Only the shared `proxy.apiKey` and the operator's own loopback calls may drain or undrain; a `proxy.clientKeys` entry gets `403`, scoped or not.
+- The count covers the requests the forwarding listener admits, including ones intercepted in [MITM mode](proxy-modes.md#mitm-proxy-mode-default), until the proxy has finished with each one. It does not cover blind CONNECT tunnels, the WebSocket channel that Remote Control opens, or absolute-form forward-proxy requests. None of those is refused during a drain either, and all of them are cut when the process exits.
+- To have SIGTERM drain as well, set `proxy.drainTimeoutSeconds` (see [Configuration](configuration.md)). It is off by default, and SIGTERM then stops at once as it always has.
+- The service manager's own stop timeout caps the drain. `teamclaude service install` writes no `ExitTimeOut` into the LaunchAgent plist and no `TimeoutStopSec` into the systemd unit, so the platform defaults apply: launchd sends SIGKILL once its exit timeout has passed (`man launchd.plist` calls the default "system-defined"), and systemd once its `DefaultTimeoutStopSec` has passed (90 seconds unless the system changes it). A drain window longer than that is cut short by SIGKILL. Keep `proxy.drainTimeoutSeconds` below the timeout that applies to your service, or raise the manager's timeout yourself; the plist and unit are rewritten by `teamclaude service install`, so a hand edit to them does not survive a reinstall.
 
 ## Status dashboard (browser)
 
@@ -250,9 +278,11 @@ A **Routing** table above the accounts shows, for Fable, Sonnet, and any configu
 
 Each account card has a **switch** button that makes that account the current one (the same `POST /teamclaude/switch` the CLI uses). It is a nudge, not a pin: normal rotation resumes from there. What happens to traffic already running depends on `distributeSessions` — with it on, a conversation pinned to another account keeps it until it goes idle, so the badge moves before the traffic does; with it off (the default), everything follows the switch on its next request. The page reports whether rotation will actually use the target: a disabled, errored, rate-limited, or over-threshold account — or one outranked by a higher-priority account — is still switched to, but the page says so and why rather than reporting a bare "done".
 
-A **Switch at __ %** control on the actions row sets the fleet-wide switch threshold, the utilization at which rotation leaves an account — the same setting as `teamclaude threshold <1-100>` and the TUI's settings screen, sent as `POST /teamclaude/threshold` with a `{"percent": 1-100}` body. Unlike the switch button this writes the config file and reloads, so it holds across a restart. One number replaces a per-bucket `switchThreshold` table, and the page says which buckets were dropped; per-account `accounts[].switchThreshold` overrides are untouched. The field follows changes made from the CLI, the TUI or another browser on the next poll, except while you are typing in it. A dashboard opened with a `proxy.clientKeys` key may not call it — the server answers 403, since a client key is a tenant of the proxy rather than its operator.
+A **Switch at __ %** control on the actions row sets the fleet-wide switch threshold, the utilization at which rotation leaves an account — the same setting as `teamclaude threshold <1-100>` and the TUI's settings screen, sent as `POST /teamclaude/threshold` with a `{"percent": 1-100}` body. Unlike the switch button this writes the config file and reloads, so it holds across a restart. One number replaces a per-bucket `switchThreshold` table, and the page says which buckets were dropped; per-account `accounts[].switchThreshold` overrides are untouched. The field follows changes made from the CLI, the TUI or another browser on the next poll, except while you are typing in it. A dashboard opened with a `proxy.clientKeys` key may not call it — the server answers 403, since a client key is a tenant of the proxy rather than its operator — so for such a key the page shows the number read-only, without the **Set** button.
 
-Beside it, each card has an **enable** / **disable** button (`POST /teamclaude/disable`) and, for an enabled account, **prioritize** and **deprioritize** (`POST /teamclaude/priority` with `place: "first"` / `"last"`). Unlike switch, these write the config file and reload the server — the same as `teamclaude disable`, `enable` and `priority --first` / `--last` — so they persist across restarts. A disabled account shows only the enable button: reordering an account that nothing will select is a control that looks like it does something and does not. The note under the cards reports the priority the account landed on, since a relative move picks a number the operator did not type. Both are refused when the page holds a `proxy.clientKeys` key rather than the shared proxy key; see the endpoint notes above.
+Beside it, each card has an **enable** / **disable** button (`POST /teamclaude/disable`) and, for an enabled account, **prioritize** and **deprioritize** (`POST /teamclaude/priority` with `place: "first"` / `"last"`). Unlike switch, these write the config file and reload the server — the same as `teamclaude disable`, `enable` and `priority --first` / `--last` — so they persist across restarts. A disabled account shows only the enable button: reordering an account that nothing will select is a control that looks like it does something and does not. The result of any card button — switch, enable/disable, prioritize, deprioritize — appears in a line directly above that card for a minute, so it is in view wherever the card sits on the page; a priority move reports the number the account landed on, since a relative move picks a number the operator did not type. Both are refused when the page holds a `proxy.clientKeys` key rather than the shared proxy key (see the endpoint notes above), so for such a key the page does not draw them. One line under the actions row says which client key the page is using, that account and settings changes need the proxy key, and has a **Change key** button back to the key box.
+
+The page knows which controls to hide from `caller` in `/teamclaude/status`: `{ "kind": "operator" | "client", "client": <client-key name or null>, "refused": [<paths>] }`. `refused` lists the control endpoints this key would get a 403 from, read from the same table the server's check uses, so the page and the server cannot disagree; it is empty for the shared proxy key and for a key-less loopback caller.
 
 
 ```
@@ -283,9 +313,36 @@ The endpoint is one more `/teamclaude/` route and is gated like the others: the 
 
 It speaks both the stateless 2026-07-28 revision of the protocol and the handshake revisions before it, so a client on either works. Replies are plain JSON, never a stream.
 
+## CLIProxyAPI-compatible usage API
+
+Some usage dashboards read a multi-account fleet through the management API of [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) rather than through each provider. The server can answer the part of that API those dashboards use, so the quota of every account in the pool shows up there. It is off until the config says otherwise:
+
+```json
+{ "proxy": { "cliproxyApi": "read" } }
+```
+
+Point the dashboard's "CLI Proxy" source at the proxy (`http://localhost:3456`) and give it the proxy key as its management key. It sends the key as `Authorization: Bearer <key>` (`X-Management-Key` and `x-api-key` work too); `proxy.apiKey` and every `proxy.clientKeys` key are accepted, since the data is no more than `/teamclaude/status` already shows a key holder.
+
+Two routes are served:
+
+- `GET /v0/management/auth-files` lists the Claude and Codex subscription accounts as `{ "observed_at", "files": [{ id, auth_index, name, provider, email, status, disabled }] }`, in the fleet's own order. `auth_index` is the account's config entry id, and `status` is `error` for an account whose login was rejected. API-key and third-party backend accounts have no subscription usage and are not listed. CLIProxyAPI's query parameters work as they do there: `name` (an id or a name) and `auth_index` narrow the list, and `page` / `page_size` (default 50) page it, adding `total`, `page`, `page_size` and `has_more`; a paging value that is not a positive whole number is a 400.
+- `POST /v0/management/api-call` with `{ "auth_index", "method": "GET", "url" }` answers two URLs: `https://api.anthropic.com/api/oauth/usage` for a Claude account and `https://chatgpt.com/backend-api/wham/usage` for a Codex one. The reply is CLIProxyAPI's envelope, `{ "status_code": 200, "header": {…}, "body": "<json>" }`, with the body in the provider's own shape: `five_hour`, `seven_day` and `weekly_scoped` limits on a 0–100 scale with ISO-8601 reset times for Claude, `rate_limit.primary_window` / `secondary_window` with `used_percent` and epoch-second `reset_at` for Codex.
+
+Unlike CLIProxyAPI, `api-call` relays nothing. The answer is built from the quota the server already tracks; no request goes upstream, no credential is read, and the request's `header` and `data` (including any `$TOKEN$` placeholder) are ignored. Any other URL or method is refused with 403. Codex reset credits are not offered: their list and consume URLs, and `POST /v0/management/reset-quota`, answer 501, because spending a credit is irreversible and is left to the server's own [`autoRedeemResets`](quota.md) policy.
+
+The readings are as fresh as the server's: an account in use is read off every response, an idle one only by the [quota probe](quota.md#quota-probe), which is off by default. Turn the probe on for current numbers on idle accounts. Three cases are reported the way the provider would report them, so a dashboard can tell them apart:
+
+- A window the plan meters but that has no live reading — it reset since the last reading — is sent as the provider sends a window that has not started: `{ "utilization": 0, "resets_at": null }` for Claude, `used_percent: 0` with `reset_at: null` for Codex. That is what the server itself believes about the account; usage spent outside the proxy since the reset is not seen until the next reading.
+- A window the plan does not meter is `null`: `seven_day` on a Team seat, and the 5-hour window on a Codex plan without one (its weekly window is then the primary).
+- An account the server cannot vouch for answers a non-2xx `status_code` inside a 200 envelope, so the dashboard shows it as unreadable rather than idle: 503 for an account never read yet, 401 for one whose login was rejected (what the provider answers a dead token).
+
+The gates are the ones every other route passes, plus the MCP endpoint's rule for a config with no proxy key at all: then only callers on the proxy's own machine are served, and everyone else gets 403. Every path under `/v0/management/` is answered by the proxy itself, on or off, and never forwarded upstream; a WebSocket handshake there is refused with 404.
+
 ## Auto-update
 
 When TeamClaude is installed globally via npm, it self-updates in the background: it checks the npm registry at most once a day, and when a newer version is published it runs `npm install -g @karpeleslab/teamclaude@latest` and applies it on the next launch. The check runs after a `teamclaude run` session ends and when a headless server starts. In a headless server the install runs as a background child process, so the proxy keeps serving requests while npm works (a synchronous install used to stall it for the duration). A git checkout is never touched — update that with `git pull`. Run `teamclaude update` to update on demand.
+
+Only an npm global install is updated in place. Any other copy gets a notice when a newer version is out. A pnpm global install is recognized: the notice names `pnpm add -g @karpeleslab/teamclaude@latest`, and `teamclaude update` prints that command instead of running npm, which would install a second copy and leave the one on your PATH as it was. Update a copy that another tool installed, such as Yarn or Bun, with that tool as well.
 
 Disable it with `TEAMCLAUDE_DISABLE_AUTOUPDATE=1` or `"autoUpdate": false` in the config.
 
@@ -302,3 +359,13 @@ Bodies are truncated past a size cap, and files older than the retention window 
 `--activity-log FILE` appends the TUI activity lines to a file instead, and works in headless mode too.
 
 Claude Code's telemetry (`/api/event_logging/*`) is high-volume activity-log noise and is hidden from the log by default; see [`eventLogging`](configuration.md#fields) to block or show it instead.
+
+## Request correlation
+
+A caller can name its own requests, so the proxy's log lines and activity can be matched to the caller's records.
+
+- The proxy reads `x-request-id` from the caller. It uses that value when it is one header value of 1 to 128 characters from letters, digits, `.`, `_`, `:` and `-`. Anything else (absent, too long, other characters, or repeated) is replaced by a generated UUID.
+- Every response from the proxy's forwarding listener carries the id as `x-teamclaude-request-id`, including refusals and streamed responses. An upstream's own `x-request-id` (Codex sends one) is passed through unchanged.
+- The id is for correlation only. It is not an identity, it is not used to deduplicate requests, and it never affects which account is chosen. The inbound `x-request-id` is still forwarded upstream as the caller sent it.
+- Each upstream attempt's request-log file starts with a header such as `=== REQUEST (account: live, retry: 1, attempt: 2, request: 1, caller: ticket.42) ===`. `request` is the proxy's number for the request, `attempt` counts the upstream sends for it (a failover, a 429 retry and a stream-failure hop each add one), and `caller` is the caller's id. A hop that is answered with a 401 writes no file of its own, so the files show the attempt that answered.
+- The activity hooks (`onRequestStart`, `onRequestEnd`) carry `callerRequestId`, and `onRequestEnd` also carries `attempts`.

@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { normalizeUsageBucket, findScopedWeeklyLimit, normalizeUsagePayload } from '../src/oauth.js';
 import { AccountManager, isFableModel, parseRequestModel } from '../src/account-manager.js';
-import { Prober, MAX_PROBE_INTERVAL_MS } from '../src/prober.js';
+import { Prober, MAX_PROBE_INTERVAL_MS, probeApplicable } from '../src/prober.js';
 
 function oauth(name, extra = {}) {
   return { name, type: 'oauth', accessToken: 't-' + name, expiresAt: Date.now() + 3600_000, ...extra };
@@ -337,6 +337,23 @@ test('a third-party backend reads not-applicable, not a pending probe', () => {
   assert.equal(rows[1].status, 'not-applicable');   // nothing to probe, ever
 });
 
+// #512: the status a server reports before its Prober exists is built from
+// probeApplicable, so it has to give the Prober's own answer for every kind of
+// account — a backend with a quota provider included, which the old copy of the
+// rule in index.js called not-applicable.
+test('probeApplicable agrees with the Prober for every kind of account', () => {
+  const am = new AccountManager([
+    oauth('claude'),
+    { ...oauth('codex'), provider: 'codex', accountId: 'acct-1' },
+    { name: 'deepseek', type: 'apikey', apiKey: 'sk', upstream: 'https://api.deepseek.com/anthropic' },
+    { name: 'silent', type: 'apikey', apiKey: 'sk', upstream: 'https://api.example.invalid/anthropic' },
+    { name: 'key', type: 'apikey', apiKey: 'sk' },
+  ], 0.98);
+  const rows = new Prober(am, { intervalMs: 300_000, log: () => {}, ownCoordinator: true }).getStatus().accounts;
+  assert.deepEqual(rows.map(r => r.status), ['never', 'never', 'never', 'not-applicable', 'not-applicable']);
+  assert.deepEqual(am.accounts.map(a => probeApplicable(a)), [true, true, true, false, false]);
+});
+
 test('prober skips API-key accounts', async () => {
   const am = new AccountManager([{ name: 'k', type: 'apikey', apiKey: 'sk' }], 0.98);
   let calls = 0;
@@ -576,6 +593,43 @@ test('prober monitors disabled accounts without refreshing their lineage', async
   assert.deepEqual(probed.sort(), ['t-a', 't-b']);
   assert.equal(refreshes, 0);
   assert.equal(am.accounts[0].disabled, true);
+});
+
+// The operator can opt disabled accounts back in, and the prober reads the
+// switch off the shared config per cycle, so a toggle needs no reschedule.
+test('prober reads disabled accounts while probeDisabledAccounts is on', async () => {
+  // Fork rule (b3db880): a disabled account is read on the token it holds either
+  // way; the switch decides whether a lapsed token is renewed for the read.
+  const lapsed = () => Date.now() - 1000;
+  const am = new AccountManager([oauth('a', { refreshToken: 'r-a', expiresAt: lapsed() }), oauth('b')], 0.98,
+    { refreshFn: async () => ({ accessToken: 't-a', refreshToken: 'r-a', expiresAt: Date.now() + 3600_000 }) });
+  am.setDisabled(0, true);
+  const config = { probeDisabledAccounts: true };
+  const probed = [];
+  const prober = new Prober(am, { intervalMs: 0, config, probeFn: async cred => { probed.push(cred); return {}; }, log: () => {}, ownCoordinator: true });
+  await prober.probeAll();
+  assert.deepEqual(probed.sort(), ['t-a', 't-b']);
+
+  config.probeDisabledAccounts = false;
+  am.accounts[0].expiresAt = lapsed();
+  probed.length = 0;
+  await prober.probeAll();
+  assert.deepEqual(probed, ['t-b']);
+});
+
+test('probeDisabledAccounts does not lift the skip for a rejected refresh token', async () => {
+  const am = new AccountManager(
+    [oauth('a', { refreshToken: 'rt-dead', expiresAt: Date.now() - 1000 })],
+    0.98,
+    { refreshFn: async () => { const e = new Error('invalid_grant'); e.status = 400; throw e; } },
+  );
+  am.setDisabled(0, true);
+  let probes = 0;
+  const prober = new Prober(am, { intervalMs: 0, config: { probeDisabledAccounts: true }, probeFn: async () => { probes++; return {}; }, log: () => {}, ownCoordinator: true });
+  await prober.probeAll();                 // the refresh is tried once and rejected
+  const probesAfterRejection = probes;
+  await prober.probeAll();
+  assert.equal(probes, probesAfterRejection);
 });
 
 test('prober skips an account holding a rejected refresh token, until a new one arrives', async () => {

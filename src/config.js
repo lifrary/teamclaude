@@ -5,7 +5,7 @@ import { homedir } from 'node:os';
 import { createHash, randomBytes } from 'node:crypto';
 import { accountId, accountIdKey, createIdentityRegistry, parseAccountIdKey } from './identity.js';
 import { resolveUpstreamProxy, setUpstreamProxy } from './upstream-proxy.js';
-import { ensureAccountIds } from './account-id.js';
+import { ensureAccountIds, accountIdsComplete } from './account-id.js';
 import { envVar, NAME, LEGACY_NAME } from './brand.js';
 
 /**
@@ -172,6 +172,16 @@ export function getCanonicalStatePath() {
 }
 
 /**
+ * Path to the quota series behind the fleet forecast (a sibling of the state
+ * file, see quota-series.js). Kept out of the state file: it is the one piece
+ * of runtime state that grows with time, so it carries bounds of its own.
+ */
+export function getQuotaSeriesPath() {
+  const cfg = getConfigPath();
+  return cfg.endsWith('.json') ? cfg.replace(/\.json$/, '.quota-series.json') : cfg + '.quota-series';
+}
+
+/**
  * Where a fatal error is recorded before the server process exits. A sibling of
  * the config, so it follows TEAMCLAUDE_CONFIG / XDG_CONFIG_HOME wherever they
  * point. `.log`, not `.json`: it is appended to and holds stacks, not a document.
@@ -200,8 +210,12 @@ export class CanonicalStateError extends Error {
 
 const STATE_FIELDS = new Set(['version', 'writtenAt', 'migration', 'activeAccountId', 'accounts', 'template', 'clients', 'usageDimensions']);
 const MIGRATION_FIELDS = new Set(['completed', 'sourceDigests']);
-const ACCOUNT_STATE_FIELDS = new Set(['quota', 'usage', 'throttle', 'convergence', 'reset', 'profile', 'adaptive']);
-const PROFILE_FIELDS = new Set(['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro']);
+const ACCOUNT_STATE_FIELDS = new Set(['quota', 'usage', 'throttle', 'convergence', 'reset', 'profile', 'adaptive', 'outsideSpend']);
+const PROFILE_FIELDS = new Set(['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro', 'subscriptionLost']);
+// account.subscriptionLost: the plan a Max/Pro account's profile stopped naming, and since when.
+const SUBSCRIPTION_LOST_FIELDS = new Set(['plan', 'since']);
+// OutsideSpendTracker.export(index): one row per weekly window (outside-spend.js).
+const OUTSIDE_SPEND_FIELDS = new Set(['lastU', 'peakU', 'lastAt', 'resetAt', 'share', 'idleIntervals', 'intervals', 'since']);
 const ADAPTIVE_FIELDS = new Set(['burnRate', 'concCap']);
 const BURN_RATE_FIELDS = new Set(['burnRate', 'lastU', 'lastAt', 'burnAnchorU', 'burnAnchorAt']);
 // Every field account-manager's PERSISTED_QUOTA_FIELDS exports must be listed
@@ -213,8 +227,10 @@ const QUOTA_FIELDS = new Set([
   'unified5hReset', 'unified7dReset', 'unified7dSonnetReset', 'unified7dFableReset',
   'resetsAt', 'modelWeekly', 'scopedWeekly', 'unified7dSonnetSeenAt', 'unified7dFableSeenAt',
   'unified5hSeenAt', 'unified7dSeenAt', 'resetCredits', 'sessionWindowStated',
+  'weeklyWindowStated', 'claudeResetHoldUntil',
 ]);
-const RESET_CREDITS_FIELDS = new Set(['available', 'applicable', 'seenAt']);
+// `expiresAt`: a Claude banked reset's soonest grant end (oauth.js bankedResets).
+const RESET_CREDITS_FIELDS = new Set(['available', 'applicable', 'seenAt', 'expiresAt']);
 const USAGE_FIELDS = new Set(['totalInputTokens', 'totalOutputTokens', 'totalRequests', 'lastUsed', 'totalCacheReadTokens', 'totalCacheCreationTokens', 'byBucket']);
 const BUCKET_USAGE_FIELDS = new Set(['inputTokens', 'outputTokens', 'requests', 'cacheReadTokens', 'cacheCreationTokens']);
 // `slots` is the 15-minute tally ClientUsageTracker.exportState() persists so
@@ -282,8 +298,16 @@ function validateAccountState(value) {
   assertAllowed(value, ACCOUNT_STATE_FIELDS, 'account');
   if (value.profile !== undefined) {
     assertAllowed(value.profile, PROFILE_FIELDS, 'profile');
-    for (const scalar of Object.values(value.profile)) assertScalar(scalar, 'profile');
+    for (const [field, scalar] of Object.entries(value.profile)) {
+      if (field === 'subscriptionLost' && scalar != null) {
+        assertAllowed(scalar, SUBSCRIPTION_LOST_FIELDS, 'profile.subscriptionLost');
+        for (const nested of Object.values(scalar)) assertScalar(nested, 'profile.subscriptionLost');
+      } else {
+        assertScalar(scalar, 'profile');
+      }
+    }
   }
+  if (value.outsideSpend !== undefined) validateCounterMap(value.outsideSpend, OUTSIDE_SPEND_FIELDS, 'outsideSpend');
   if (value.adaptive !== undefined) {
     assertAllowed(value.adaptive, ADAPTIVE_FIELDS, 'adaptive');
     if (value.adaptive.burnRate !== undefined) validateCounterMap(value.adaptive.burnRate, BURN_RATE_FIELDS, 'adaptive.burnRate');
@@ -654,6 +678,52 @@ export async function saveState(state) {
   await saveCanonicalState(canonical);
 }
 
+/**
+ * Write a JSON document so that the file at `path` is, at every instant, either
+ * the previous complete document or the new one. Used by the files outside the
+ * config and the canonical state: the quota series (quota-series.js) and the
+ * callback.net session token (callback-auth.js).
+ *
+ * A plain writeFile truncates first and fills in afterwards; a crash or power
+ * loss in that gap left an empty or half-written file. So the document goes to
+ * a sibling temp file, is fsynced so it is on disk before it is named, and is
+ * renamed over the target — rename replaces atomically on POSIX and, in Node,
+ * on Windows too (same scheme mitm.js uses for the leaf key).
+ *
+ * The temp file is created 0600 and chmod'ed before the rename, so a token is
+ * never on disk under a looser mode even for an instant.
+ *
+ * `space` is JSON.stringify's indent: 2 for the hand-readable files, 0 for
+ * the quota series, whose thousands of rows would otherwise take a line per
+ * number.
+ * @param {string} path @param {unknown} value @param {{ space?: number }} [options]
+ */
+export async function writeJsonAtomic(path, value, { space = 2 } = {}) {
+  // A rename replaces the NAME, so a file that is a symlink (a dotfiles
+  // checkout, say) would silently become a regular file where an in-place
+  // write followed the link. Resolve it first; a dangling or absent path is
+  // written where it is.
+  path = await realpath(path).catch(() => path);
+  await mkdir(dirname(path), { recursive: true });
+  const tmp = `${path}.tmp-${process.pid}-${randomBytes(4).toString('hex')}`;
+  try {
+    const fh = await open(tmp, 'w', 0o600);
+    try {
+      await fh.writeFile(JSON.stringify(value, null, space) + '\n');
+      await fh.sync();
+    } finally {
+      await fh.close();
+    }
+    // `open`'s mode is masked by the umask; make the mode exact regardless.
+    await chmod(tmp, 0o600).catch(() => {});
+    await rename(tmp, path);
+  } catch (err) {
+    // Never leave a half-written copy of a token lying beside the target.
+    await unlink(tmp).catch(() => {});
+    throw err;
+  }
+}
+
 /** @param {{ from: ConfigIdentity, to: ConfigIdentity, beforeState: CanonicalState, afterState: CanonicalState, phase?: 'prepared' }} options
  * @returns {Readonly<RekeyRecord>}
  */
@@ -840,7 +910,9 @@ export function createDefaultConfig() {
     holdSeconds: 0,
     distributeSessions: false,
     sessionTitles: { enabled: false, width: 18 },
-    quotaBarPercent: true,
+    quotaBarPercent: false,
+    probeDisabledAccounts: false,
+    accountSort: 'arranged',
     eventLogging: 'hide',
     defaultClientMode: 'mitm',
     // Written out rather than left absent, so a fresh config states the one
@@ -849,6 +921,8 @@ export function createDefaultConfig() {
     autoRedeemResets: false,
     blockedModels: [],
     stripOverageHeaders: false,
+    synthesizeQuotaHeaders: false,
+    poolQuotaHeaders: false,
     accounts: [],
   };
 }
@@ -1002,7 +1076,17 @@ function writeConfig(config, {
 //
 //   path     <configPath>.lock
 //   acquire  open(O_CREAT|O_EXCL, 0600), then write {"pid":<pid>,"at":<ms epoch>}
-//   stale    `at` older than 10 s, or the pid no longer alive: unlink and retry
+//   stale    `at` older than 10 s, or the pid no longer alive: break it and retry.
+//            Breaking is serialised by a second exclusive file, `<lock>.steal`,
+//            and re-checks staleness while holding it, so two waiters that both
+//            judged the old lock stale cannot both unlink (the slower one would
+//            remove the fresh lock the faster one just took). A `.steal` file
+//            older than 10 s is a crashed breaker's and is removed. This
+//            narrows the race, it does not close it: a live holder past 10 s
+//            can release, and a third party can take the lock, between the
+//            re-judge and the unlink; with three or more waiters, removing a
+//            crashed guard races the same way. Only writers that honour the
+//            guard are excluded.
 //   busy     poll every 25 ms for at most 2 s, then write WITHOUT the lock
 //   release  unlink
 //
@@ -1037,6 +1121,34 @@ function lockIsStale(lockPath) {
   try { process.kill(pid, 0); return false; } catch (err) { return errorProperty(err, 'code') === 'ESRCH'; }
 }
 
+/** Break a stale lock. True when this caller attempted the break and should
+ * retry the acquire at once; false when another waiter holds the break guard
+ * (or the lock turned out live), so the caller should poll as for a busy lock.
+ * @param {string} lockPath
+ * @returns {Promise<boolean>} */
+async function breakStaleLock(lockPath) {
+  const guardPath = `${lockPath}.steal`;
+  try {
+    closeSync(openSync(guardPath, 'wx', 0o600));
+  } catch (err) {
+    if (/** @type {NodeJS.ErrnoException} */ (err).code === 'EEXIST') {
+      // A breaker holds it for microseconds; one this old crashed holding it.
+      try { if (Date.now() - statSync(guardPath).mtimeMs > LOCK_STALE_MS) await unlink(guardPath); } catch { /* released under us */ }
+    }
+    return false;
+  }
+  try {
+    // Re-judge under the guard: the lock we saw may have been replaced since.
+    if (!lockIsStale(lockPath)) return false;
+    // Retry at once only if the lock is really gone; a stale lock we cannot
+    // remove (EPERM, EBUSY) must fall back to the wait budget, not spin.
+    try { await unlink(lockPath); } catch (err) { return /** @type {NodeJS.ErrnoException} */ (err).code === 'ENOENT'; }
+    return true;
+  } finally {
+    await unlink(guardPath).catch(() => {});
+  }
+}
+
 /** True when the lock is ours; false when we gave up and proceed without it.
  * @param {string} lockPath
  */
@@ -1054,10 +1166,7 @@ async function acquireConfigLock(lockPath) {
         return false;
       }
     }
-    if (lockIsStale(lockPath)) {
-      await unlink(lockPath).catch(() => {});
-      continue;
-    }
+    if (lockIsStale(lockPath) && await breakStaleLock(lockPath)) continue;
     if (Date.now() >= deadline) {
       console.error(`[TeamClaude] ${lockPath} is still held by another process after ${waitMs}ms; writing the config without it`);
       return false;
@@ -1128,8 +1237,42 @@ export async function atomicConfigUpdate(updater) {
     await updater(config);
     const normalizedConfig = normalizeConfig(config);
     if (!Array.isArray(normalizedConfig.accounts)) normalizedConfig.accounts = [];
+    // A row the updater added (a login, an API key, an import) is written with
+    // its id, minted here rather than by every reader. A row written without
+    // one is given a fresh id by each read: the running server pairs its token
+    // writes by id, so the id it minted on reload matched no row on disk, and
+    // the account's refreshed tokens were never saved (#564).
     ensureAccountIds(normalizedConfig.accounts);
     await writeConfig(normalizedConfig, { path });
     return normalizedConfig;
+  });
+}
+
+/**
+ * loadConfig, with any entry id it had to mint written back to the file before
+ * the config is handed out. null when there is no file.
+ *
+ * For a reader that builds running accounts from what it loads: a running
+ * account keeps its entry's id, and every token write pairs it with its row by
+ * that id. A row the file holds without one (a hand edit, an older CLI) would
+ * get a different id on each read, and the account built from it would find no
+ * row to save to. Under the config lock, so no writer lands between the read
+ * and the write; a file that already carries every id is not rewritten. Locked
+ * and written as atomicConfigUpdate does: on the resolved path, through
+ * writeConfig.
+ */
+export async function loadConfigPersistingIds() {
+  const path = await realpath(getConfigPath()).catch(() => getConfigPath());
+  return withConfigLock(path, async () => {
+    let raw;
+    try {
+      raw = JSON.parse(await readFile(path, 'utf-8'));
+    } catch (err) {
+      if (errorProperty(err, 'code') === 'ENOENT') return null;
+      throw err;
+    }
+    const config = await loadConfig();
+    if (config && !accountIdsComplete(raw?.accounts)) await writeConfig(config, { path });
+    return config;
   });
 }

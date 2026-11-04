@@ -108,6 +108,8 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       continue;
     }
     if (!manager.id) manager.id = disk.id;
+    // Read before a rekey swaps in a replacement already carrying the disk name.
+    const previousName = manager.name;
 
     const diskExpiry = normalizeExpiresAt(resolved?.expiresAt);
     const liveExpiry = normalizeExpiresAt(manager.expiresAt);
@@ -148,6 +150,8 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       if (disk[field] != null) manager[field] = disk[field];
     }
     // Display renames are safe only after the canonical key has been reconciled.
+    // A session pin names its account, so it follows the rename (#543).
+    if (disk.name && previousName !== disk.name) accountManager.sessionPins?.rename(previousName, disk.name);
     manager.name = disk.name;
     if (memory) {
       for (const field of ['name', 'accountUuid', 'orgUuid', 'orgName', 'accountId', 'provider',
@@ -160,7 +164,8 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       }
     }
     if (resolved?.accessToken && !stale
-      && (manager.credential !== resolved.accessToken || manager.refreshToken !== resolved.refreshToken)) {
+      // The manager keeps a missing refresh token as null, the disk entry as undefined.
+      && (manager.credential !== resolved.accessToken || (manager.refreshToken || null) !== (resolved.refreshToken || null))) {
       accountManager.updateAccountTokens(manager.index, {
         accessToken: resolved.accessToken,
         refreshToken: resolved.refreshToken,
@@ -171,6 +176,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       if (manager.status === 'error') { manager.status = 'active'; Reflect.deleteProperty(manager, '_errorFromRefresh'); }
       // A different key is a different credential: the 401 hold was about the old one.
       accountManager.clearCredentialRejected(manager.index);
+      accountManager.clearBillingRejected(manager.index);
     }
   }
   // Running accounts that no disk row claims any more were removed on disk (a

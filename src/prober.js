@@ -32,6 +32,11 @@ const ABANDONED_RETRY_DEADLINES = 5;
 const MAX_ABANDONED_PROBES = 3;
 const ABANDONED = Symbol('abandoned');
 
+// How often an account's OAuth profile is read again once its plan is known. A
+// plan that lapses shows there (see AccountManager.applyProfileData), and it
+// changes far more rarely than quota does.
+export const PROFILE_RECHECK_MS = 60 * 60 * 1000;
+
 /**
  * `promise`'s value, or `fallback` once `ms` pass first.
  * @template T, F
@@ -50,6 +55,28 @@ function settleWithin(promise, ms, fallback) {
   return Promise.race([promise, expiry]).finally(() => clearTimeout(timer));
 }
 
+// Which accounts the probe reads, one rule per source. Exported so the status
+// payload a server builds before its Prober exists states the same answer the
+// Prober will (#512), instead of keeping a copy of the rule.
+const isAnthropicProbeTarget = (/** @type {any} */ account) => !!account && providerOf(account) === 'anthropic'
+  && account.type === 'oauth' && !!account.credential && !account.upstream;
+
+const isCodexProbeTarget = (/** @type {any} */ account) => !!account && providerOf(account) === 'codex'
+  && account.type === 'oauth' && !!account.credential && !!account.accountId && !account.upstream;
+
+const isBackendProbeTarget = (/** @type {any} */ account) => !!account?.credential && hasBackendQuota(account);
+
+/**
+ * True when the quota probe has something to read for this account: an
+ * Anthropic or Codex subscription, or a third-party backend that publishes a
+ * quota of its own. Anything else reads `not-applicable` in the probe status.
+ * @param {any} account
+ * @returns {boolean}
+ */
+export function probeApplicable(account) {
+  return isAnthropicProbeTarget(account) || isCodexProbeTarget(account) || isBackendProbeTarget(account);
+}
+
 export class Prober {
   // `log` resolves the console per call rather than capturing it. A default
   // parameter is evaluated when the constructor runs, and the server builds its
@@ -58,6 +85,10 @@ export class Prober {
   // notices below are produced later still, by a reload that changes the probe
   // interval, so a captured `console.log` would put them on a terminal the
   // alternate screen has already covered.
+  //
+  // `config` is the SHARED config object, not a snapshot: `probeDisabledAccounts`
+  // is read off it per cycle, so a TUI toggle or a reload applies on the next
+  // probe without a reschedule.
   /**
    * @param {import('./account-manager.js').AccountManager} accountManager
    * @param {object} [options]
@@ -65,8 +96,10 @@ export class Prober {
    * @param {typeof fetchUsage} [options.probeFn] called as (credential, signal, routing)
    * @param {typeof fetchCodexUsage} [options.codexProbeFn]
    * @param {typeof import('./oauth.js').fetchProfile | null} [options.profileFn] called as (credential, signal, routing)
+   * @param {number} [options.profileIntervalMs] how long a known plan goes before its profile is read again
    * @param {typeof fetchBackendQuota} [options.backendFn]
    * @param {number} [options.timeoutMs]
+   * @param {{ probeDisabledAccounts?: boolean } | null} [options.config] the shared config object
    * @param {(...args: any[]) => void} [options.log]
    * @param {MaintenanceCoordinator} [options.coordinator]
    * @param {boolean} [options.ownCoordinator]
@@ -74,15 +107,20 @@ export class Prober {
    */
   constructor(accountManager, {
     intervalMs = 0, probeFn = fetchUsage, codexProbeFn = fetchCodexUsage,
-    profileFn = null, backendFn = fetchBackendQuota, timeoutMs = 10_000,
-    log = (/** @type {string} */ line) => console.log(line), coordinator, ownCoordinator = false,
+    profileFn = null, profileIntervalMs = PROFILE_RECHECK_MS, backendFn = fetchBackendQuota, timeoutMs = 10_000,
+    config = null, log = (/** @type {string} */ line) => console.log(line), coordinator, ownCoordinator = false,
     now = () => Date.now(),
   } = {}) {
     this.am = accountManager;
+    /** @type {{ probeDisabledAccounts?: boolean } | null} */
+    this.config = config;
     this.intervalMs = clampInterval(intervalMs);
     this.probeFn = probeFn;
     this.codexProbeFn = codexProbeFn;
     this.profileFn = profileFn;
+    this.profileIntervalMs = profileIntervalMs;
+    // By account object: names are not unique.
+    this.profileReadAt = new WeakMap();
     this.backendFn = backendFn;
     this.timeoutMs = timeoutMs;
     this.log = log;
@@ -145,25 +183,43 @@ export class Prober {
   }
 
   _isProbeTarget(account) {
-    return !!account && providerOf(account) === 'anthropic'
-      && account.type === 'oauth' && !!account.credential && !account.upstream;
+    return isAnthropicProbeTarget(account);
   }
 
   _isCodexProbeTarget(account) {
-    return !!account && providerOf(account) === 'codex'
-      && account.type === 'oauth' && !!account.credential && !!account.accountId && !account.upstream;
+    return isCodexProbeTarget(account);
   }
 
-  _isBackendTarget(account) { return !!account?.credential && hasBackendQuota(account); }
+  /** A third-party backend that publishes a quota of its own. The provider
+   * module decides which; nothing in this file knows one by name. */
+  _isBackendTarget(account) {
+    return isBackendProbeTarget(account);
+  }
   _isTarget(account) { return this._isProbeTarget(account) || this._isCodexProbeTarget(account) || this._isBackendTarget(account); }
 
+  // An account whose refresh token upstream has already rejected is not probed:
+  // refreshing it again only rotates the token family once more, and its access
+  // token cannot be trusted either. The manager's dead-token guard is keyed on
+  // the token value, so a re-login lifts this skip on its own.
+  //
+  // Disabled means out of rotation, not out of monitoring, so a disabled account
+  // is still read. Never rotate its OAuth lineage from a quota read, though; the
+  // separate keep-alive sweep owns that. It is read on the token it holds, and
+  // skipped once that token has expired. `probeDisabledAccounts` (#612) is the
+  // operator accepting the refresh: the probe then renews a disabled account's
+  // token when it is due and retries a 401, as it does for any other account.
+  // A dead token stays skipped either way.
   _probeable(account) {
     if (!account?.credential) return false;
     if (account._deadRefreshToken && account._deadRefreshToken === account.refreshToken) return false;
-    // Disabled means out of rotation, not out of monitoring. Never rotate its
-    // OAuth lineage from a quota read; the separate keep-alive sweep owns that.
-    if (account.disabled && account.type === 'oauth' && isTokenExpired(account.expiresAt)) return false;
+    if (!this._mayRefresh(account) && account.type === 'oauth' && isTokenExpired(account.expiresAt)) return false;
     return true;
+  }
+
+  /** Whether a probe may refresh this account's token: always for an account
+   *  in rotation, and for a disabled one only under `probeDisabledAccounts`. */
+  _mayRefresh(account) {
+    return !account.disabled || this.config?.probeDisabledAccounts === true;
   }
 
   _deadlineMs() { return this.timeoutMs * PROBE_DEADLINE_TIMEOUTS; }
@@ -245,7 +301,7 @@ export class Prober {
         reading = await this._withTimeout(probeSignal => this.backendFn(account, { timeoutMs: this.timeoutMs, signal: probeSignal }), signal);
       } else {
         record({ phase: 'token refresh' });
-        if (!account.disabled) await this.am.ensureTokenFresh(account);
+        if (this._mayRefresh(account)) await this.am.ensureTokenFresh(account);
         this._throwIfAborted(signal);
         if (!this._probeable(account)) throw new Error('quota probe requires a live credential');
         // The account's own egress proxy rides third: the injected probe
@@ -255,7 +311,7 @@ export class Prober {
           : this.probeFn(account.credential, probeSignal, account.routing ?? null);
         record({ phase: 'usage read' });
         reading = await this._withTimeout(read, signal);
-        if (reading?.status === 401 && !account.disabled) {
+        if (reading?.status === 401 && this._mayRefresh(account)) {
           // Token rejected: force refresh and retry once — unless the manager
           // declined to renew a refresh token upstream already rejected.
           record({ phase: 'token refresh' });
@@ -267,6 +323,8 @@ export class Prober {
       }
       this._throwIfAborted(signal);
       if (!reading || reading.error) {
+        // A refused usage read can be the lapsed plan itself; the profile says.
+        if (reading && !this._isBackendTarget(account) && !this._isCodexProbeTarget(account)) await this._readProfile(account, signal, record);
         const finishedAt = Date.now();
         record({ status: reading?.error ? 'error' : 'timeout', error: reading?.error || 'probe timed out', startedAt, finishedAt, durationMs: finishedAt - startedAt });
         return false;
@@ -275,13 +333,7 @@ export class Prober {
       else if (this._isCodexProbeTarget(account)) this.am.applyCodexUsageData(account, reading);
       else {
         this.am.applyUsageData(account, reading);
-        const missingTier = !account.rateLimitTier && !account.seatTier
-          && account.hasClaudeMax == null && account.hasClaudePro == null;
-        if (missingTier && this.profileFn) {
-          record({ phase: 'profile read' });
-          const profile = await this._withTimeout(probeSignal => this.profileFn(account.credential, probeSignal, account.routing ?? null), signal);
-          this.am.applyProfileData(account, profile);
-        }
+        await this._readProfile(account, signal, record);
       }
       const finishedAt = Date.now();
       record({ status: 'ok', error: null, startedAt, finishedAt, durationMs: finishedAt - startedAt });
@@ -291,6 +343,26 @@ export class Prober {
       record({ status: signal?.aborted ? 'cancelled' : 'error', error: signal?.aborted ? null : err?.message || String(err), startedAt, finishedAt, durationMs: finishedAt - startedAt });
       return false;
     }
+  }
+
+  /**
+   * The OAuth profile, read while the plan is unknown and again once per
+   * profileIntervalMs once it is known: a Max or Pro plan that lapses shows
+   * there, and AccountManager.applyProfileData reports it (#610).
+   * @param {Record<string, any>} account
+   * @param {AbortSignal} signal
+   * @param {(status: Record<string, any>) => void} record
+   */
+  async _readProfile(account, signal, record) {
+    if (!this.profileFn) return;
+    const missingTier = !account.rateLimitTier && !account.seatTier
+      && account.hasClaudeMax == null && account.hasClaudePro == null;
+    const now = Date.now();
+    if (!missingTier && now - (this.profileReadAt.get(account) ?? -Infinity) < this.profileIntervalMs) return;
+    this.profileReadAt.set(account, now);
+    record({ phase: 'profile read' });
+    const profile = await this._withTimeout(probeSignal => this.profileFn(account.credential, probeSignal, account.routing ?? null), signal);
+    this.am.applyProfileData(account, profile);
   }
 
   getStatus() {

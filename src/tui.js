@@ -11,8 +11,9 @@ import {
 import { configIndexFor, managerAccountFor, markAccountRemoved, markAccountAdded } from './account-pairing.js';
 import { PROVIDERS, providerOf, isSubscriptionAccount, upstreamFor } from './provider.js';
 import { mintAccountId } from './account-id.js';
-import { formatPercent, heldResetCredits } from './status-renderer.js';
-import { resolveMaxUsage, resolveMaxSpendMinor, switchThresholdDiffs } from './model.js';
+import { ACCOUNT_REFUSAL_CODES } from './account-refusal.js';
+import { formatPercent, heldResetCredits, showSessionRow, showWeeklyRow, unavailableLine } from './status-renderer.js';
+import { resolveMaxUsage, resolveMaxSpendMinor, switchThresholdDiffs, modelLabel, EFFORT_SEP } from './model.js';
 import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy, localListener, isSelfProxy } from './upstream-proxy.js';
 import { describeRouting, parseRoutingUrl, routingToUrl, checkRouting } from './account-routing.js';
 import { sanitizeText, safeLine } from './safe-text.js';
@@ -20,6 +21,8 @@ import { sanitizeText, safeLine } from './safe-text.js';
 // all read them from there, so they cannot drift apart (#426).
 import { MAX_PROBE_SECONDS, ROUTE_COLORS } from './config-ops.js';
 import { isLocalUpstream } from './provider.js';
+import { hyperlink, clipboardSequence } from './osc.js';
+/** @typedef {import('./login-flow.js').LoginPrompt} LoginPrompt */
 
 /**
  * @typedef {import('./account-manager.js').AccountManager['accounts'][number]} TuiAccount
@@ -231,8 +234,9 @@ const PROVIDER_ORDER = Object.keys(PROVIDERS);
 // Two provider pools side by side: the gutter between the panes.
 const PANE_GUTTER = ' │ ';
 // Pane bars: at least wide enough for `10h23m`, and past that only once every
-// name is whole.
-const PANE_BAR_MAX = 12;
+// name is whole. From there they grow to BAR_MAX, as the list's bars do: a
+// narrower cap left a 600-column terminal drawing 12-column bars beside
+// hundreds of blank columns.
 const PANE_BAR_FLOOR = 8;
 // The narrowest a list draws both shared bars in, full width and in a pane.
 const LIST_MIN = 70;
@@ -254,20 +258,66 @@ const HEAD_GAP = 2;
 // the feature, and there is nothing to migrate.
 const listRank = (/** @type {any} */ a) => (Number.isFinite(a?.displayOrder) ? a.displayOrder : Infinity);
 
+// How the account list is ordered inside each provider group (`accountSort`).
+// `arranged` is the operator's own order (listRank). Each of the others puts
+// the account whose window ends soonest first, so quota that is about to
+// expire unspent is at the top of the list.
+//
+// The window each sort reads. S7 and F7 are the family's own weekly bucket
+// where the account has one, else the all-models weekly, which is what governs
+// that family on such an account — the rule quota-summary.js resolves a
+// family's window by.
+
+// The window the weekly sorts read, backend windows included (a backend row
+// draws these same resets). A live window without a reset stays unknown: it
+// does not fall through to the monthly one, which the row draws separately.
+const weeklyResetOf = (/** @type {any} */ q) => {
+  if (q.unified7dReset != null) return q.unified7dReset;
+  const bw = q.backend?.windows;
+  const weekly = bwLive(bw?.weekly);
+  if (weekly) return weekly.resetAt;
+  return bwLive(bw?.monthly)?.resetAt;
+};
+/** @type {Record<string, (q: any) => any>} */
+const SORT_RESET = {
+  'session-reset': q => q.unified5hReset ?? bwLive(q.backend?.windows?.fiveHour)?.resetAt,
+  'weekly-reset': weeklyResetOf,
+  'sonnet-reset': q => (q.unified7dSonnet != null ? q.unified7dSonnetReset : weeklyResetOf(q)),
+  'fable-reset': q => (q.unified7dFable != null ? q.unified7dFableReset : weeklyResetOf(q)),
+};
+export const ACCOUNT_SORTS = ['arranged', ...Object.keys(SORT_RESET)];
+/** @type {Record<string, string>} */
+const ACCOUNT_SORT_LABELS = {
+  arranged: 'arranged',
+  'session-reset': 'session reset',
+  'weekly-reset': 'weekly reset',
+  'sonnet-reset': 'S7 reset',
+  'fable-reset': 'F7 reset',
+};
+
+// The sort key: when the window resets. No reading (an API-key account, one
+// that has not reported, a five-hour window nothing has opened) and a reset
+// that has already passed both sort last: the second is a window that has just
+// started over, so its next reset is the one furthest away.
+const resetRank = (/** @type {any} */ t, /** @type {number} */ now) => (Number.isFinite(t) && t > now ? t : Infinity);
+
 // How long a reorder waits after the last move before it is written. Longer
 // than a terminal's key-repeat interval, so a held arrow is one write; short
 // enough that the file is current by the time anyone looks at it.
 const ORDER_SAVE_DELAY_MS = 400;
 
-// Which pair of bars a row draws: the subscription buckets (Ses/Wk, plus the
-// S7/F7 family bars) for a subscription or any unified reading, else the metered
-// Tok/Req pair an API-key account reports. The account row budget is drawn per
-// category (#234): the two kinds of row share no bar, so sizing an API-key row
-// for family bars it never draws only left it short of the edge.
+// Which bars a row draws: the subscription buckets (Ses/Wk, plus the S7/F7
+// family bars) for a subscription or any unified reading; the same slots filled
+// from the probed windows (plus Mon) for a third-party backend; else the
+// metered Tok/Req pair an API-key account reports. The account row budget is
+// drawn per category (#234): the three kinds of row share no bar, so sizing a
+// backend row for the family bars it never draws — or a Claude row for a
+// backend's Mon bar — only leaves the others short of the edge.
 function rowCategory(/** @type {any} */ account) {
   const q = displayQuota(account);
-  return (isSubscriptionAccount(account) || q.unified5h != null || q.unified7d != null || q.unified7dSonnet != null || q.unified7dFable != null)
-    ? 'unified' : 'metered';
+  if (isSubscriptionAccount(account) || q.unified5h != null || q.unified7d != null || q.unified7dSonnet != null || q.unified7dFable != null) return 'unified';
+  if (q.backend?.windows != null) return 'backend';
+  return 'metered';
 }
 
 // The quota a row draws: the shared fields, plus the learned Fable weekly
@@ -427,6 +477,11 @@ export function routingTag(account) {
   return text ? `via ${text}` : '';
 }
 
+// The status cell's name for an errorReason code. A code it does not know keeps `error`.
+const errorLabel = (/** @type {unknown} */ code) => code === 'account_on_hold' ? 'on hold'
+  : code === 'refresh_rejected' || code === 'credential_rejected' ? 're-login'
+  : typeof code === 'string' && ACCOUNT_REFUSAL_CODES.has(code) ? 'refused' : 'error';
+
 /** Fit a line to exactly w columns: truncate if too long, pad if too short.
  *  Truncation drops a wide glyph that would straddle the limit, so the result
  *  can come up one column short; pad that too — the frame is repainted in
@@ -466,6 +521,13 @@ function formatReset(resetTs) {
 // and the seven-day weekly buckets (unified, Sonnet, Fable) reset on these.
 const FIVE_HOUR_MS = 5 * 60 * 60 * 1000;
 const SEVEN_DAY_MS = 7 * 24 * 60 * 60 * 1000;
+// A calendar month is 28-31 days; pace colouring off by a few percent at the
+// edges is the price of not knowing which one the provider means.
+const MONTH_MS = 30 * 24 * 60 * 60 * 1000;
+
+// A backend window past its reset is stale, not current (the probe may be
+// off); a window without a reset is live but unpaced.
+const bwLive = (/** @type {{ utilization: number, resetAt: number|null }|null|undefined} */ w) => (w && (w.resetAt == null || w.resetAt > Date.now()) ? w : null);
 
 // { bg, fg } SGR params per severity. White label on red (dark everywhere),
 // black on the lighter green/yellow/orange (bright-white would vanish on the
@@ -510,7 +572,8 @@ function barColor(ratio, resetTs, windowMs, threshold) {
  * burn rate instead of raw fill. threshold is the routing switch threshold, at
  * or above which the bar goes red regardless of pace. showPct false drops the
  * percentage wherever a countdown can stand in its place (config
- * `quotaBarPercent`); with no countdown the percentage is the label either way.
+ * `quotaBarPercent`, off unless set); with no countdown the percentage is the
+ * label either way.
  */
 export function bar(ratio, w = 10, resetTs, windowMs, threshold, showPct = true) {
   const rst = formatReset(resetTs);
@@ -560,16 +623,33 @@ export function bar(ratio, w = 10, resetTs, windowMs, threshold, showPct = true)
 }
 
 // The request fields the hooks hand us come from the client — the path and
-// method off the request line, the model peeked from the body, the session id
-// from a header — so they are cut down once here, before they are stored to be
-// drawn every frame and logged.
-const REQ_FIELD_MAX = { method: 16, path: 256, model: 64, account: 64, sessionId: 64 };
+// method off the request line, the model and effort read from the body, the
+// session id from a header — so they are cut down once here, before they are
+// stored to be drawn every frame and logged.
+const REQ_FIELD_MAX = { method: 16, path: 256, model: 64, effort: 16, account: 64, sessionId: 64 };
 function cleanRequestInfo(info) {
   const out = { ...info };
   for (const [k, max] of Object.entries(REQ_FIELD_MAX)) {
     if (out[k] != null) out[k] = safeLine(out[k], max);
   }
   return out;
+}
+
+// ` (model·effort)`, with the `·effort` suffix in a fixed grey a step under
+// the model. Fixed rather than dim because the live row already dims the
+// model, and dim on dim is no step at all.
+const effortGrey = (/** @type {string} */ s) => fg('38;5;244', s);
+/**
+ * @param {string} label  modelLabel's text
+ * @param {string|null|undefined} effort
+ * @param {boolean} dimModel
+ */
+function modelParen(label, effort, dimModel) {
+  if (!label) return '';
+  const paint = dimModel ? dim : (/** @type {string} */ s) => s;
+  const suffix = effort ? `${EFFORT_SEP}${effort}` : '';
+  if (!suffix || !label.endsWith(suffix)) return paint(` (${label})`);
+  return `${paint(` (${label.slice(0, -suffix.length)}`)}${effortGrey(suffix)}${paint(')')}`;
 }
 
 // A stored key, shown enough to recognise and no more. First-4/last-4 on a key
@@ -585,6 +665,102 @@ function timestamp() {
   return new Date().toLocaleTimeString('en-US', { hour12: false });
 }
 
+// ── Login panel helpers ──────────────────────────────────────
+
+// Bracketed paste (DEC mode 2004): while the login panel is open the terminal
+// is asked to wrap a paste in these markers, so the TUI can tell a paste from
+// typing however the terminal chunks it.
+const PASTE_ON = `${ESC}?2004h`;
+const PASTE_OFF = `${ESC}?2004l`;
+const PASTE_START = `${ESC}200~`;
+const PASTE_END = `${ESC}201~`;
+const PASTE_MARKERS = [PASTE_START, PASTE_END];
+// A read can end part-way through a marker (over SSH, at any byte), so the
+// panel holds back a tail that could be a marker's start until the next read
+// says what it was. A lone ESC is also the Esc key: held this long with
+// nothing after it, it is taken as the key. Long enough for the rest of a
+// marker split across reads to arrive, short enough not to be felt.
+const ESC_WAIT_MS = 100;
+// A paste arrives in one burst. Still without its closing marker after this
+// long, the marker was lost, and the field stops treating keys as paste.
+const PASTE_IDLE_MS = 2_000;
+
+/** How many characters at the end of `s` could be the start of one of
+ *  `markers`, cut off by the end of the read.
+ *  @param {string} s
+ *  @param {string[]} markers */
+function markerTail(s, markers) {
+  for (let n = Math.min(s.length, PASTE_START.length - 1); n > 0; n--) {
+    const tail = s.slice(-n);
+    if (markers.some(m => m.startsWith(tail))) return n;
+  }
+  return 0;
+}
+const UNDERLINE = `${ESC}4m`;
+/** How a link looks: underlined, in the cyan the rest of the screen uses for
+ *  things to act on. The OSC 8 sequence itself is added after the line is
+ *  fitted (see _render).
+ *  @param {string} s */
+const linkText = s => `${UNDERLINE}${cyan(s)}`;
+
+/** What the login field keeps of a paste or a key: no control or format
+ *  character of any kind. C1 included, since U+009B is a CSI by itself, and
+ *  the field is drawn into the frame as it stands. No sign-in code or address
+ *  holds one.
+ *  @param {string} s */
+const fieldText = s => s.replace(/\p{C}/gu, '');
+
+/** Plain text wrapped at spaces to lines of at most `w` columns. A word longer
+ *  than a line keeps a line to itself, and fitLine cuts it.
+ *  @param {string} text
+ *  @param {number} w */
+function wrapWords(text, w) {
+  /** @type {string[]} */
+  const out = [];
+  let line = '';
+  for (const word of String(text).split(/\s+/).filter(Boolean)) {
+    if (!line) line = word;
+    else if (vw(line) + 1 + vw(word) <= w) line += ` ${word}`;
+    else { out.push(line); line = word; }
+  }
+  if (line) out.push(line);
+  return out;
+}
+
+/** The end of `s` in at most `w` columns, led by `…` when the start is cut: a
+ *  pasted address is several hundred characters, and its end is the part that
+ *  differs from one paste to the next.
+ *  @param {string} s
+ *  @param {number} w */
+function tailText(s, w) {
+  if (vw(s) <= w) return s;
+  if (w <= 1) return '…';
+  return `…${[...s].slice(-(w - 1)).join('')}`;
+}
+
+/**
+ * The `l` key's callback, wired by index.js. It runs the whole sign-in and the
+ * save; `onPrompt` hands the panel the link and the paste target once the flow
+ * is ready, and aborting `signal` cancels it.
+ * @typedef {(account: Record<string, any>, opts?: { signal?: AbortSignal, onPrompt?: (prompt: LoginPrompt) => void }) => Promise<{ action: 'updated' | 'added', name: string }>} LoginAccount
+ */
+
+/**
+ * The login panel's state, for as long as it is open.
+ * @typedef {object} LoginPanel
+ * @property {string} account  the row that was picked, for the title
+ * @property {AbortController} controller  Esc aborts it; it is how the panel cancels the flow
+ * @property {LoginPrompt | null} prompt  null until the flow is listening
+ * @property {string} buf  the paste field
+ * @property {string | null} error  why the last paste was refused
+ * @property {string | null} notice  a one-off confirmation (the link copied again)
+ * @property {boolean} pasting  inside a bracketed paste that has not ended yet
+ * @property {string} held  the end of the last read, held back as a possible marker's start
+ * @property {ReturnType<typeof setTimeout> | null} timer  the ESC wait or the paste watchdog
+ * @property {number} timerGen  bumped on every arm and disarm, so a stale timer does nothing
+ * @property {string} linkId  joins the pieces of a wrapped URL into one link
+ */
+
 // ── TUI class ────────────────────────────────────────────────
 
 export class TUI {
@@ -593,7 +769,7 @@ export class TUI {
     onQuit, sx = /** @type {import('./sx.js').SxManager|null} */ (null),
     probeQuota = /** @type {import('./prober.js').Prober['probeAll']|null} */ (null),
     // Cast so the destructured binding is the callback type, not `null`: index.js passes a function here.
-    loginAccount = /** @type {null | ((account: Record<string, any>) => Promise<{ action: 'updated' | 'added', name: string }>)} */ (null),
+    loginAccount = /** @type {LoginAccount | null} */ (null),
     activityLogPath = /** @type {string|null} */ (null),
     // Attach mode: the accounts belong to a server in another process, reached
     // over its control plane. Everything that would mutate local state is off,
@@ -611,7 +787,10 @@ export class TUI {
     // How the header names this build, and whether a newer release is known.
     // In attach mode the account manager carries the server's own answer and
     // these are unused; the empty defaults keep the label hidden until it does.
-    versionLabel = '', updateAvailable = false }) {
+    versionLabel = '', updateAvailable = false,
+    // Read for TMUX when the login panel copies its link. Injectable so the
+    // tmux wrapping can be exercised without running inside tmux.
+    env = /** @type {Record<string, string | undefined>} */ (process.env) }) {
     this.am = accountManager;
     this.remote = remote;
     this.applySwitch = applySwitch;
@@ -624,8 +803,9 @@ export class TUI {
     /** @type {Awaited<ReturnType<import('./sx.js').SxManager['getBalance']>>} */
     this.sxBalance = null;   // last fetched sx.org balance, for the settings screen
     this.probeQuota = probeQuota; // on-demand fleet-wide quota refresh (may be null)
-    /** @type {null | ((account: Record<string, any>) => Promise<{ action: 'updated' | 'added', name: string }>)} */
-    this.loginAccount = loginAccount; // browser (re-)login for a chosen account (may be null)
+    /** @type {LoginAccount | null} */
+    this.loginAccount = loginAccount; // (re-)login for a chosen account (may be null)
+    this._env = env;
     this.activityLogPath = activityLogPath;
     this._readCredentials = readCredentials;
     this._readProfile = readProfile;
@@ -637,7 +817,7 @@ export class TUI {
 
     this.log = [];           // completed activity entries
     this.active = new Map(); // in-flight requests
-    this.mode = 'normal';    // normal | select | add | input | settings | pick
+    this.mode = 'normal';    // normal | select | add | input | settings | pick | order | login
     /** @type {PickerState|null} */
     this.pick = null;        // active list picker (routes editor accounts/bucket/color)
     this.pickReturn = 'routes'; // mode to fall back to when the picker closes
@@ -673,6 +853,10 @@ export class TUI {
     // Set once the terminal has reported a failure. Everything that would
     // write to it checks this first.
     this._stdoutDead = false;
+    // The sign-in the login panel is showing (mode 'login'), or null. See _doLogin.
+    /** @type {LoginPanel | null} */
+    this.login = null;
+    this._loginSeq = 0;   // numbers each panel's link id, so two logins' links are never one
   }
 
   // ── lifecycle ──────────────────────────────────────
@@ -812,6 +996,12 @@ export class TUI {
   }
 
   stop() {
+    // A login still waiting holds a listener (port 1455, for Codex) and the
+    // terminal's bracketed-paste mode; neither may outlive the dashboard.
+    const pasteOff = this.login ? PASTE_OFF : '';
+    if (this.login) this._loginTimerOff(this.login);
+    this.login?.controller.abort();
+    this.login = null;
     this.running = false;
     if (this.timer) { clearTimeout(this.timer); this.timer = null; }
     // Written now rather than dropped: quitting inside the debounce window
@@ -849,7 +1039,7 @@ export class TUI {
       this._stdoutErrorHandler = null;
     };
     if (!this._stdoutDead) {
-      try { process.stdout.write(`${ESC}?25h${ESC}?1049l`, release); } catch { /* terminal already gone */ }
+      try { process.stdout.write(`${pasteOff}${ESC}?25h${ESC}?1049l`, release); } catch { /* terminal already gone */ }
     }
     try { process.stdin.setRawMode(false); } catch {}
     process.stdin.pause();
@@ -875,10 +1065,15 @@ export class TUI {
     if (this.active.size === 1) this._retick();   // idle → animating
   }
 
+  // Called up to twice for one request: with the model as soon as it is peeked
+  // from the stream, then with the effort once the whole body is in.
   onRequestModel(id, info) {
     const r = this.active.get(id);
-    const model = info.model ? safeLine(info.model, 64) : '';
-    if (r && model) { r.model = model; this.render(); }
+    const { model, effort } = cleanRequestInfo(info);
+    if (!r || !(model || effort)) return;
+    if (model) r.model = model;
+    if (effort) r.effort = effort;
+    this.render();
   }
 
   onRequestRouted(id, info) {
@@ -892,7 +1087,7 @@ export class TUI {
     this.active.delete(id);
     const dur = r ? ((Date.now() - r.started) / 1000).toFixed(1) : '?';
     const acct = info.account || r?.account || '?';
-    const model = info.model ? ` (${info.model})` : ''; // shown when the request named a model
+    const model = modelParen(modelLabel(info.model, info.effort), info.effort, false); // shown when the request named a model
     const sid = info.sessionId || r?.sessionId || null;
     const pin = (info.pinned || r?.pinned) ? dim(' [pin]') : '';
     this._addLog(`${this._sessionTag(sid)} ${info.method} ${info.path}${model} → ${acct}${pin} (${info.status}, ${dur}s)`);
@@ -916,6 +1111,15 @@ export class TUI {
   // ── input handling ─────────────────────────────────
 
   _onData(d) {
+    // The login panel reads its input as a stream: see _loginInput.
+    if (this.mode === 'login' && this.login) return this._loginInput(this.login, d);
+    this._onKeys(d);
+  }
+
+  /** One read of keyboard input, as keys. A read is taken whole: an arrow
+   *  key's sequence arrives in one read, and a lone ESC is the Esc key.
+   *  @param {string} d */
+  _onKeys(d) {
     if (d === '\x1b[A') return this._key('up');
     if (d === '\x1b[B') return this._key('down');
     if (d === '\x1b[C') return this._key('right');
@@ -933,10 +1137,121 @@ export class TUI {
     // sequence this parser does not know, not text. Control characters are
     // dropped, the clipboard's trailing newline among them, so a paste fills
     // the prompt and the operator still presses Enter on what they can see.
-    if (this.mode === 'input' && d.length > 1 && !d.includes('\x1b')) {
-      this.inputBuf += d.replace(/[\x00-\x1f\x7f]/g, '');
+    // The login panel's field takes one the same way, for a terminal that does
+    // not do bracketed paste.
+    if ((this.mode === 'input' || this.mode === 'login') && d.length > 1 && !d.includes('\x1b')) {
+      if (this.mode === 'input') this.inputBuf += d.replace(/[\x00-\x1f\x7f]/g, '');
+      else if (this.login) { this.login.buf += fieldText(d); this.login.error = null; }
       this.render();
     }
+  }
+
+  /**
+   * One read of input while the login panel is open.
+   *
+   * The panel turns bracketed paste on, so a paste arrives between markers,
+   * and everything inside them is text, even where one character of it would
+   * otherwise read as a key. Reads can split anywhere, a marker included, so
+   * this is a stream: a tail that could be a marker's start is held back
+   * (`held`) until the next read completes it or shows it was not one. What
+   * lies outside the markers is keys, handled as _onKeys always has.
+   *
+   * A new paste replaces what is in the field: pasting again is how a wrong
+   * paste is put right. Control characters are dropped, the clipboard's
+   * trailing newline among them, so the paste is submitted by an Enter the
+   * operator presses on what they can see. An end marker with no start (the
+   * start was lost, or the watchdog gave up on it) still ends a paste: what
+   * came before it is kept as text.
+   *
+   * @param {LoginPanel} login
+   * @param {string} d
+   */
+  _loginInput(login, d) {
+    this._loginTimerOff(login);
+    let data = d;
+    if (login.held) {
+      const joined = login.held + d;
+      if (login.pasting || PASTE_MARKERS.some(m => joined.startsWith(m) || m.startsWith(joined))) {
+        data = joined;
+        login.held = '';
+      } else {
+        // What was held was a key of its own (Esc, most likely), not the
+        // start of a marker; it goes first, then this read.
+        const key = login.held;
+        login.held = '';
+        this._onKeys(key);
+        if (this.login !== login) { if (d) this._onData(d); return; }
+      }
+    }
+    while (data) {
+      if (login.pasting) {
+        const end = data.indexOf(PASTE_END);
+        if (end < 0) {
+          const keep = markerTail(data, [PASTE_END]);
+          login.buf += fieldText(data.slice(0, data.length - keep));
+          login.held = data.slice(data.length - keep);
+          this._loginTimer(login, PASTE_IDLE_MS, () => { login.pasting = false; login.held = ''; });
+          break;
+        }
+        login.buf += fieldText(data.slice(0, end));
+        login.pasting = false;
+        data = data.slice(end + PASTE_END.length);
+        continue;
+      }
+      const start = data.indexOf(PASTE_START);
+      const end = data.indexOf(PASTE_END);
+      if (end >= 0 && (start < 0 || end < start)) {
+        login.buf += fieldText(data.slice(0, end));
+        login.error = null;
+        data = data.slice(end + PASTE_END.length);
+        continue;
+      }
+      if (start >= 0) {
+        if (start > 0) {
+          this._onKeys(data.slice(0, start));
+          if (this.login !== login) { this._onData(data.slice(start)); return; }
+        }
+        login.buf = '';
+        login.error = null;
+        login.pasting = true;
+        data = data.slice(start + PASTE_START.length);
+        continue;
+      }
+      const keep = markerTail(data, PASTE_MARKERS);
+      login.held = data.slice(data.length - keep);
+      if (keep < data.length) this._onKeys(data.slice(0, data.length - keep));
+      if (login.held && this.login === login) {
+        this._loginTimer(login, ESC_WAIT_MS, () => {
+          const key = login.held;
+          login.held = '';
+          this._onKeys(key);
+        });
+      }
+      break;
+    }
+    this.render();
+  }
+
+  /** Arm the panel's one timer. Only the newest arming may fire, and only
+   *  while its panel is still the open one.
+   *  @param {LoginPanel} login
+   *  @param {number} ms
+   *  @param {() => void} fire */
+  _loginTimer(login, ms, fire) {
+    const gen = ++login.timerGen;
+    login.timer = this._setTimeout(() => {
+      if (this.login !== login || login.timerGen !== gen) return;
+      login.timer = null;
+      fire();
+      if (this.running) this.render();
+    }, ms);
+    login.timer?.unref?.();
+  }
+
+  /** @param {LoginPanel} login */
+  _loginTimerOff(login) {
+    login.timerGen++;
+    if (login.timer) { clearTimeout(login.timer); login.timer = null; }
   }
 
   _key(k) {
@@ -952,6 +1267,7 @@ export class TUI {
       case 'routes': this._keyRoutes(k); break;
       case 'pick': this._keyPick(k); break;
       case 'blocklist': this._keyBlocklist(k); break;
+      case 'login': this._keyLogin(k); break;
     }
     this.render();
   }
@@ -1016,7 +1332,8 @@ export class TUI {
     });
 
     // Fleet-scoped because the policy behind it is: a credit is spent only when
-    // the whole Codex pool is dry. It sits here, on the screen, rather than in
+    // the whole Codex pool is dry (and, for a banked Claude reset, the whole
+    // Claude pool). It sits here, on the screen, rather than in
     // the config file alone because the one thing an operator needs from this
     // setting is to be able to kill it at once.
     fields.push({
@@ -1043,10 +1360,20 @@ export class TUI {
     });
 
     fields.push({
+      id: 'probeDisabledAccounts',
+      label: 'Probe disabled',
+      hint: '←→ toggle',
+      value: () => (this.config.probeDisabledAccounts === true ? green('on') : gray('off')),
+      left: () => this._toggleProbeDisabledAccounts(),
+      right: () => this._toggleProbeDisabledAccounts(),
+      enter: () => this._toggleProbeDisabledAccounts(),
+    });
+
+    fields.push({
       id: 'quotaBarPercent',
       label: 'Bar percentage',
       hint: '←→ toggle',
-      value: () => (this.config.quotaBarPercent !== false ? green('on') : gray('off')),
+      value: () => (this.config.quotaBarPercent === true ? green('on') : gray('off')),
       left: () => this._toggleQuotaBarPercent(),
       right: () => this._toggleQuotaBarPercent(),
       enter: () => this._toggleQuotaBarPercent(),
@@ -1146,6 +1473,21 @@ export class TUI {
           this.mode = 'select'; this.selAction = 'reorder'; this.selAcct = first;
           this.selIdx = Math.max(0, this._displayList().indexOf(first)); this.selReturn = 'settings';
         },
+      });
+    }
+
+    if (this.am.accounts.length > 1) {
+      fields.push({
+        id: 'accountSort',
+        label: 'Sort accounts',
+        hint: '←→ cycle',
+        value: () => {
+          const s = this._accountSort();
+          return s === 'arranged' ? gray(ACCOUNT_SORT_LABELS[s]) : green(ACCOUNT_SORT_LABELS[s]);
+        },
+        left: () => this._cycleAccountSort(-1),
+        right: () => this._cycleAccountSort(+1),
+        enter: () => this._cycleAccountSort(+1),
       });
     }
 
@@ -1554,6 +1896,48 @@ export class TUI {
     else if (k.length === 1) { this.inputBuf += k; }
   }
 
+  // The login panel. Esc cancels the sign-in and Enter submits the field. `c`
+  // (copy the link again) acts only while the field is empty: typing must work
+  // in it, and nobody types a code that starts with it before pasting has been
+  // tried.
+  _keyLogin(/** @type {string} */ k) {
+    const login = this.login;
+    if (!login) { this.mode = 'normal'; return; }
+    if (k === 'esc') {
+      login.controller.abort();
+      this._closeLogin();
+    } else if (k === 'enter') {
+      this._submitLogin(login);
+    } else if (k === 'bs') {
+      login.buf = login.buf.slice(0, -1);
+      login.error = null;
+    } else if (!login.buf && k === 'c') {
+      if (this._copyLoginUrl(login)) login.notice = 'Sent again.';
+    } else if (k.length === 1 && fieldText(k)) {
+      login.buf += k;
+      login.error = null;
+    }
+  }
+
+  /**
+   * Enter in the login panel. A paste the flow takes closes the panel: the
+   * token exchange runs on, and _doLogin reports how it ended. One it refuses
+   * stays open with the reason, and the field is emptied for the next try.
+   * @param {LoginPanel} login
+   */
+  _submitLogin(login) {
+    if (!login.prompt || !login.buf.trim()) return;
+    try {
+      // false means nothing was left to settle (the browser got there first),
+      // so the panel has nothing more to wait for either.
+      login.prompt.submit(login.buf);
+      this._closeLogin();
+    } catch (/** @type {any} */ e) {
+      login.error = safeLine(e?.message || String(e), 300);
+      login.buf = '';
+    }
+  }
+
   // ── account operations ─────────────────────────────
 
   // On-demand fleet-wide quota refresh (the `p` key): probe every OAuth
@@ -1576,15 +1960,19 @@ export class TUI {
     }
   }
 
-  // Browser login for the account under the cursor (the `l` key). The row
-  // chooses the PROVIDER's sign-in page and tells the operator which identity to
-  // sign in as; it does not choose where the tokens go. They go to the account
-  // the browser actually signed in as — the same identity match `teamclaude
-  // login` makes — because writing one person's tokens onto the row that was
-  // merely highlighted would be a credential crossing. So a sign-in as someone
-  // else is reported as exactly that, and the picked row stays in need of one.
-  // Fire-and-forget: the flow waits on a human for up to two minutes, and the
-  // dashboard has to stay live meanwhile.
+  // Sign-in for the account under the cursor (the `l` key). The row chooses
+  // the PROVIDER's sign-in page and tells the operator which identity to sign
+  // in as; it does not choose where the tokens go. They go to the account the
+  // browser actually signed in as — the same identity match `teamclaude login`
+  // makes — because writing one person's tokens onto the row that was merely
+  // highlighted would be a credential crossing. So a sign-in as someone else is
+  // reported as exactly that, and the picked row stays in need of one.
+  //
+  // The login panel opens at once and holds the keyboard until the flow is
+  // decided: it shows the link (the browser may be on another machine), copies
+  // it, and takes the pasted answer. Fire-and-forget all the same: the flow
+  // waits on a human for minutes, and the requests and the activity pane go on
+  // meanwhile.
   async _doLogin(/** @type {number} */ idx) {
     const acct = this.am.accounts[idx];
     if (!acct) { this._addLog('That account is no longer listed'); return; }
@@ -1599,20 +1987,84 @@ export class TUI {
     // for Codex for the fixed callback port as well.
     if (this._loggingIn) { this._addLog(`Still waiting on the sign-in for "${this._loggingIn}"`); return; }
     this._loggingIn = acct.name;
-    this._addLog(`Sign in as "${acct.name}" in the browser (waits 2 minutes)...`);
+    const controller = new AbortController();
+    this._openLogin(acct.name, controller);
     try {
-      const outcome = await this.loginAccount(acct);
+      const outcome = await this.loginAccount(acct, {
+        signal: controller.signal,
+        onPrompt: prompt => this._loginPrompted(controller, prompt),
+      });
       if (outcome?.name && outcome.name !== acct.name) {
         this._addLog(`Signed in as "${outcome.name}" (${outcome.action}), not "${acct.name}" — that one still needs a login`);
       } else {
         this._addLog(`Logged in "${acct.name}"`);
       }
     } catch (/** @type {any} */ e) {
-      this._addLog(`Login failed for "${acct.name}": ${e?.message || e}`);
+      // A cancel is the operator's own Esc: one line saying so, not a failure.
+      this._addLog(e?.name === 'AbortError'
+        ? `Sign-in cancelled for "${acct.name}"`
+        : `Login failed for "${acct.name}": ${e?.message || e}`);
     } finally {
       this._loggingIn = null;
+      if (this.login?.controller === controller) this._closeLogin();
       if (this.running) this.render();
     }
+  }
+
+  /** Open the login panel for `account`, before the flow is even listening, so
+   *  Esc can cancel it from the first moment.
+   *  @param {string} account
+   *  @param {AbortController} controller */
+  _openLogin(account, controller) {
+    this.login = {
+      account, controller, prompt: null, buf: '', error: null, notice: null,
+      pasting: false, held: '', timer: null, timerGen: 0,
+      linkId: `teamclaude-login-${++this._loginSeq}`,
+    };
+    this.mode = 'login';
+    this._writeTerminal(PASTE_ON);
+  }
+
+  /** The flow is listening: show its link and copy it, unless the panel was
+   *  closed (or another login opened) in the meantime.
+   *  @param {AbortController} controller
+   *  @param {LoginPrompt} prompt */
+  _loginPrompted(controller, prompt) {
+    const login = this.login;
+    if (login?.controller !== controller) return;
+    login.prompt = prompt;
+    this._copyLoginUrl(login);
+    if (this.running) this.render();
+  }
+
+  _closeLogin() {
+    if (!this.login) return;
+    this._loginTimerOff(this.login);
+    this.login = null;
+    if (this.mode === 'login') this.mode = 'normal';
+    this._writeTerminal(PASTE_OFF);
+  }
+
+  /** Put the panel's link on the clipboard (OSC 52). True when it was sent;
+   *  whether the terminal honoured it is not something a terminal reports.
+   *  @param {LoginPanel} login */
+  _copyLoginUrl(login) {
+    if (!login.prompt) return false;
+    return this._writeTerminal(clipboardSequence(login.prompt.url, { tmux: Boolean(this._env.TMUX) }));
+  }
+
+  /**
+   * A control sequence for the terminal itself rather than for the frame: a
+   * mode switch or a clipboard write. Through the same stdout the frame is
+   * painted on, and under the same rule: nothing once the terminal is gone.
+   * Not dropped while the terminal is behind, as a frame is: it is a few
+   * hundred bytes, written once, and the next frame does not repeat it.
+   * @param {string} seq
+   */
+  _writeTerminal(seq) {
+    if (!this.running || this._stdoutDead) return false;
+    try { process.stdout.write(seq); } catch { return false; }
+    return true;
   }
 
   async _doSync() {
@@ -1844,18 +2296,51 @@ export class TUI {
     const next = prev !== true;
     this.config.autoRedeemResets = next;
     if (!await this._saveSetting('auto-redeem', () => { this.config.autoRedeemResets = prev; })) return;
-    this._addLog(`Auto-redeem Codex reset credits: ${next ? 'on' : 'off'}`);
+    this._addLog(`Auto-redeem reset credits (Codex and Claude): ${next ? 'on' : 'off'}`);
+    if (this.running) this.render();
+  }
+
+  async _toggleProbeDisabledAccounts() {
+    // Whether the probe (periodic and `p`) may also refresh a disabled account's
+    // token. It reads a disabled account either way, on the token the account
+    // holds (see Prober._probeable). The prober reads this off the shared config
+    // per cycle, so the assignment is the whole application and the save is only
+    // what survives a restart.
+    const prev = this.config.probeDisabledAccounts;
+    const on = prev !== true;
+    this.config.probeDisabledAccounts = on;
+    if (!await this._saveSetting('probe disabled', () => { this.config.probeDisabledAccounts = prev; })) return;
+    this._addLog(`Probe disabled accounts with a token refresh: ${on ? 'on' : 'off'}`);
     if (this.running) this.render();
   }
 
   async _toggleQuotaBarPercent() {
-    // Absent means on, so the first toggle from a config that predates the key
-    // has to write `false` — hence the comparison rather than a negation.
+    // Absent means off (it is opt-in), so the first toggle from a config that
+    // predates the key has to write `true` — hence the comparison rather than a
+    // negation.
     const prev = this.config.quotaBarPercent;
-    const on = prev === false;
+    const on = prev !== true;
     this.config.quotaBarPercent = on;
     if (!await this._saveSetting('bar percentage', () => { this.config.quotaBarPercent = prev; })) return;
     this._addLog(`Quota bar percentage: ${on ? 'on' : 'off'}`);
+    if (this.running) this.render();
+  }
+
+  /** The configured account sort; anything unknown reads as `arranged`. */
+  _accountSort() {
+    const s = this.config?.accountSort;
+    return ACCOUNT_SORTS.includes(s) ? s : 'arranged';
+  }
+
+  async _cycleAccountSort(dir = 1) {
+    // Read by _displayOrder on every frame, so the assignment is the whole
+    // application and the save is only what survives a restart.
+    const prev = this.config.accountSort;
+    const cur = this._accountSort();
+    const next = ACCOUNT_SORTS[(ACCOUNT_SORTS.indexOf(cur) + dir + ACCOUNT_SORTS.length) % ACCOUNT_SORTS.length];
+    this.config.accountSort = next;
+    if (!await this._saveSetting('account sort', () => { this.config.accountSort = prev; })) return;
+    this._addLog(`Account sort: ${ACCOUNT_SORT_LABELS[next]}`);
     if (this.running) this.render();
   }
 
@@ -2077,8 +2562,17 @@ export class TUI {
    * rank (_arrangedOrder). autoCompare returns 0 on ties and Array.sort is
    * stable, so accounts with no quota data keep their array order (the previous
    * display behavior).
+   *
+   * With a reset sort (`accountSort`) the soonest reset goes before that order,
+   * which then only breaks ties, rank included; the `#N` tag still shows the
+   * rank. Provider groups and locally-served rows keep their places, since
+   * those are what a row IS. Not in the order mode or on the reorder screen,
+   * and not when `arranged` is asked for: those edit the order above, so they
+   * must see it.
+   *
+   * @param {{ arranged?: boolean }} [opts]
    */
-  _displayList() {
+  _displayList({ arranged = false } = {}) {
     const ranked = this._rankedSorted();
     const set = new Set(ranked);
     const compare = typeof this.am.autoCompare === 'function'
@@ -2094,7 +2588,21 @@ export class TUI {
       this._arrangedOrder(a, b) || compare(a, b));
     // Stable, so within a provider the ranked-then-auto order above stands.
     const provider = (/** @type {TuiAccount} */ a) => PROVIDER_ORDER.indexOf(providerOf(a));
-    return [...ranked, ...auto].sort((a, b) => provider(a) - provider(b));
+    const list = [...ranked, ...auto].sort((a, b) => provider(a) - provider(b));
+    const resetOf = arranged || this.mode === 'order' || (this.mode === 'select' && this.selAction === 'reorder')
+      ? null : SORT_RESET[this._accountSort()];
+    if (!resetOf) return list;
+    const now = Date.now();
+    // displayQuota, so the F7 sort reads the learned Fable window the row draws.
+    const resetAt = new Map(list.map(a => [a, resetRank(resetOf(displayQuota(a)), now)]));
+    const local = (/** @type {TuiAccount} */ a) => (isLocalUpstream(a) ? 1 : 0);
+    // Stable again, so accounts that reset together keep the order above.
+    return list.sort((a, b) => {
+      const ta = resetAt.get(a);
+      const tb = resetAt.get(b);
+      // Infinity - Infinity is NaN, so the resets are compared, not subtracted.
+      return provider(a) - provider(b) || local(a) - local(b) || (ta === tb ? 0 : ta < tb ? -1 : 1);
+    });
   }
 
   /** 1-based rank position among the ranked accounts, or null if unranked. */
@@ -2357,6 +2865,10 @@ export class TUI {
     }
 
     const lines = [];
+    // Links to draw on this frame, keyed by the exact line that carries one
+    // (see the paint loop at the end).
+    /** @type {Map<string, { text: string, url: string, id: string }>} */
+    let links = new Map();
 
     // ── Header
     const left = bold(' TeamClaude');
@@ -2364,7 +2876,7 @@ export class TUI {
     const sess = this.am.sessionStats();
     const sessStr = (sess.active || sess.known)
       ? `${sess.active} sess${this.am.distributeSessions
-        ? green(this.am.distributionMode === 'adaptive' ? ' adapt' : ' dist')
+        ? green(this.am.distributionMode === 'adaptive' ? ' adapt' : this.am.distributionMode === 'load' ? ' load' : ' dist')
         : (sess.draining ? yellow(` drain ${sess.draining}`) : '')}  `
       : '';
     // ▼ marks a dashboard that lost contact with the server it polls (attach
@@ -2419,8 +2931,13 @@ export class TUI {
     } else if (view === 'blocklist') {
       this._renderBlocklist(lines);
     } else {
-    // ── Accounts
-    if (this.am.accounts.length === 0) {
+    // ── Accounts, or the login panel in their place. The activity pane stays
+    // under the panel: the sign-in's own progress lines land there.
+    if (view === 'login') {
+      const panel = this._loginLines(W);
+      lines.push(...panel.lines);
+      links = panel.links;
+    } else if (this.am.accounts.length === 0) {
       lines.push('');
       // Attach mode cannot add an account, and pointing at a key that does
       // nothing here would be worse than saying only what is known.
@@ -2438,16 +2955,16 @@ export class TUI {
       if (split) {
         const [a, b] = groups;
         lines.push(paneTitle(PROVIDERS[a.provider].label, split.leftW) + dim(PANE_GUTTER) + paneTitle(PROVIDERS[b.provider].label, split.rightW));
-        for (let r = 0; r < Math.max(a.indices.length, b.indices.length); r++) {
-          const left = r < a.indices.length ? this._renderRow(a.indices[r], split.left, current) : '';
-          const right = r < b.indices.length ? this._renderRow(b.indices[r], split.right, current) : '';
-          lines.push(fitLine(left, split.leftW) + dim(PANE_GUTTER) + right);
+        const left = a.indices.flatMap(i => this._rowLines(i, split.left, current));
+        const right = b.indices.flatMap(i => this._rowLines(i, split.right, current));
+        for (let r = 0; r < Math.max(left.length, right.length); r++) {
+          lines.push(fitLine(left[r] ?? '', split.leftW) + dim(PANE_GUTTER) + (right[r] ?? ''));
         }
       } else {
         lines.push('');
         const order = this._displayOrder();
         const layout = this._listLayout(order, W);
-        for (const i of order) lines.push(this._renderRow(i, layout, current));
+        for (const i of order) lines.push(...this._rowLines(i, layout, current));
       }
     }
 
@@ -2469,7 +2986,7 @@ export class TUI {
     for (const [, r] of this.active) {
       const el = ((now - r.started) / 1000).toFixed(1);
       const sp = cyan(SPINNER[this.frame]);
-      const m = r.model ? dim(` (${r.model})`) : ''; // filled in as soon as the model is peeked from the stream
+      const m = modelParen(modelLabel(r.model, r.effort), r.effort, true); // filled in as soon as the model is peeked from the stream
       const pin = r.pinned ? dim(' [pin]') : '';
       const a = r.account ? ` → ${r.account}${pin}` : '';
       lines.push(` ${sp} ${gray(r.t)}  ${this._sessionTag(r.sessionId)} ${r.method} ${r.path}${m}${a} ${dim(`(${el}s...)`)}`);
@@ -2507,12 +3024,99 @@ export class TUI {
     // Write buffer
     let buf = `${ESC}H`;
     for (let i = 0; i < H; i++) {
-      buf += fitLine(lines[i] || '', W);
+      // A link is spliced in only after the line is fitted. Neither the width
+      // measure nor truncate knows OSC 8, and truncate must not learn it: it is
+      // the last guard against an escape in a foreign value reaching the
+      // terminal. A link line whose text was cut to fit simply stays plain.
+      const link = links.get(lines[i]);
+      const row = fitLine(lines[i] || '', W);
+      buf += link ? row.replace(link.text, () => hyperlink(link.url, link.text, { id: link.id })) : row;
       if (i < H - 1) buf += '\r\n';
     }
     // Show cursor only in input mode
     buf += this.mode === 'input' ? `${ESC}?25h` : `${ESC}?25l`;
     this._paint(buf, force);
+  }
+
+  /**
+   * The login panel, drawn where the account rows go while a sign-in waits.
+   *
+   * The URL is drawn in full under a bold label, one piece per line, every
+   * piece the same OSC 8 link. The link and the clipboard copy both depend on
+   * the terminal (and on tmux passing them through); the text does not, so a
+   * terminal that does neither still leaves the URL to select by hand. The
+   * pieces start at column 0 and fill the width, so a selection across them
+   * picks up nothing but the URL and the line breaks, which a browser's
+   * address bar drops on paste.
+   *
+   * The paste line carries the ▸ the body scroll follows, so on a terminal too
+   * short for the whole panel the field is what stays in view.
+   *
+   * @param {number} W
+   * @returns {{ lines: string[], links: Map<string, { text: string, url: string, id: string }> }}
+   */
+  _loginLines(W) {
+    /** @type {string[]} */
+    const lines = [''];
+    /** @type {Map<string, { text: string, url: string, id: string }>} */
+    const links = new Map();
+    const login = this.login;
+    if (!login) return { lines, links };
+    const prompt = login.prompt;
+    const brand = prompt?.provider === 'codex' ? 'OpenAI' : prompt ? 'Claude' : '';
+    lines.push(` ${bold(`Sign in "${safeLine(login.account, 60)}"`)}${brand ? dim(` · ${brand}`) : ''}`);
+    lines.push('');
+    if (!prompt) {
+      lines.push(dim('   Starting the sign-in...'));
+      return { lines, links };
+    }
+
+    const textW = Math.max(20, W - 4);
+    // A numbered step wraps under its own text, not under its number.
+    const prose = (/** @type {string} */ text, paint = (/** @type {string} */ l) => l) => {
+      const hang = /^\d+\. /.test(text) ? 3 : 0;
+      wrapWords(text, textW - hang).forEach((l, i) => lines.push(`   ${i && hang ? ' '.repeat(hang) : ''}${paint(l)}`));
+    };
+    /** @param {string} text */
+    const linkLine = text => {
+      lines.push(text);
+      links.set(text, { text, url: prompt.url, id: login.linkId });
+    };
+
+    lines.push(`   ${bold(`Open the ${brand} sign-in page:`)}`);
+    for (let i = 0; i < prompt.url.length; i += W) linkLine(linkText(prompt.url.slice(i, i + W)));
+    prose(`Link sent to your clipboard (if your terminal allows OSC 52).${login.notice ? ` ${login.notice}` : ''}`, dim);
+    lines.push('');
+
+    // A browser was opened here only when the flow is listening for it on a
+    // local terminal; otherwise the link is the whole way in. Said as what
+    // was done on this machine, not as what the person sees: a server whose
+    // terminal only looks local (see isRemoteSession) opened it where nobody is.
+    const automatic = prompt.listening && !prompt.remote;
+    if (automatic) prose('A browser was opened on this machine. Approving the sign-in there finishes it by itself.');
+    if (prompt.provider === 'claude') {
+      if (automatic) prose('Not at this machine? Open the link on your device, sign in, and paste the code the page shows.');
+      else {
+        prose('1. Open the link on any device and sign in.');
+        prose('2. The page then shows a code. Copy it and paste it below.');
+      }
+    } else {
+      if (automatic) prose('Not at this machine? Open the link on your device. Its browser ends on a localhost:1455 page that does not load; copy that address and paste it below.');
+      else {
+        prose('1. Open the link on any device and sign in.');
+        prose('2. The browser then lands on a localhost:1455 page that does not load. Copy that address from the address bar and paste it below.');
+      }
+      // The listener is up but out of reach of a browser on another machine,
+      // and one ssh flag puts it within reach.
+      if (prompt.listening && prompt.remote) prose('Tip: connect with ssh -L 1455:localhost:1455 and the browser reaches this machine, so the sign-in finishes by itself.', dim);
+      if (prompt.note) prose(`${safeLine(prompt.note, 200)}, so only a pasted address can finish this sign-in.`, yellow);
+    }
+
+    lines.push('');
+    const label = `   ${bold('Paste')} ${cyan('▸')} `;
+    lines.push(`${label}${tailText(login.buf, Math.max(1, W - vw(label) - 2))}█`);
+    if (login.error) prose(`✗ ${login.error}`, red);
+    return { lines, links };
   }
 
   /** Width budget for a list `W` wide, per row category, as one provider's pane when
@@ -2525,15 +3129,15 @@ export class TUI {
     const genRoutes = routes.filter((/** @type {any} */ r) => routeFamily(r) === null
       && (pane == null || providerOf(r) === pane)); // a pane only holds its own provider's routes
     // Bar width, budgeted PER ROW CATEGORY (#234). A subscription row draws
-    // Ses/Wk and the S7/F7 family bars; an API-key row draws Tok/Req and
-    // nothing else. Neither shares a bar with the other, so the two are laid
-    // out against separate budgets: every subscription row lines up with the
-    // other subscription rows, every API-key row with the other API-key rows,
-    // and an API-key row no longer pays for family columns it never draws (or
-    // for a blocked-family tag only a subscription row can carry). Within a
-    // category the budget is still shared, on purpose: bars line up and equal
-    // lengths mean equal percentages, and the whitespace that costs a row
-    // without a tag is the price of that.
+    // Ses/Wk and the S7/F7 family bars; a third-party backend row draws the
+    // same slots from its probed windows plus Mon; an API-key row draws
+    // Tok/Req and nothing else. The three share no bar, so the three are laid
+    // out against separate budgets: rows line up within a category, and no
+    // category pays for bars it never draws (or for a blocked-family tag only
+    // a subscription row can carry). Within a category the budget is still
+    // shared, on purpose: bars line up and equal lengths mean equal
+    // percentages, and the whitespace that costs a row without a tag is the
+    // price of that.
     //
     // The budget must count every column the widest row in the category
     // actually draws, or the row overruns the terminal and fitLine cuts the
@@ -2550,14 +3154,14 @@ export class TUI {
     // The type cell and the space after it, at the width the row pads it to.
     const typeCell = pane == null ? typeColumn(this.am.accounts).width + 1 : 0;
     const floor = pane == null ? LIST_MIN : PANE_MIN;
-    const barCap = pane == null ? BAR_MAX : PANE_BAR_MAX;
     // The columns every name needs past NAME_MIN to be whole.
     const longestName = Math.max(0, ...accts.map(a => vw(a.name)));
     const nameWant = Math.max(0, longestName - NAME_MIN);
     const budgetFor = (/** @type {string} */ cat, /** @type {any[]} */ members, /** @type {number} */ numW) => {
       const anyFable = members.some(a => displayQuota(a).unified7dFable != null);
       const anySonnet = members.some(a => displayQuota(a).unified7dSonnet != null);
-      const families = (anyFable ? 1 : 0) + (anySonnet ? 1 : 0);
+      const anyMonthly = members.some(a => bwLive(a.quota.backend?.windows?.monthly) != null && bwLive(a.quota.backend?.windows?.weekly) != null);
+      const families = (anyFable ? 1 : 0) + (anySonnet ? 1 : 0) + (anyMonthly ? 1 : 0);
       const tagW = members.reduce((w, a) => {
         const names = blockedFamilies(displayQuota(a), key => this.am.thresholdFor(key, a));
         return names.length ? Math.max(w, 4 + vw(names.join(' '))) : w;
@@ -2571,6 +3175,15 @@ export class TUI {
         const tag = spendTag(a.quota, a.maxSpend);
         const xu = extraUsageTag(a.allowExtraUsage === true, this._onExtraUsage(a));
         return Math.max(w, (tag ? 2 + vw(tag) : 0) + (xu ? 2 + vw(xu) : 0));
+      }, 0);
+      // And for the reset-credit tag (`RC1`), drawn after the two above. It went
+      // unbudgeted once: the bars were sized to the edge, fitLine cut the tag, and
+      // an account holding a reset credit showed nothing on any row that drew a
+      // family bar. Counted through resetCreditTag, so a stale reading that draws
+      // no tag reserves no column either.
+      const creditW = members.reduce((/** @type {number} */ w, /** @type {any} */ a) => {
+        const tag = resetCreditTag(a.quota);
+        return tag ? Math.max(w, 2 + vw(tag)) : w;
       }, 0);
       // Same rule again for the switch-threshold tag (#409) — silent on the
       // common (no override, or one that matches the fleet) row, so it costs
@@ -2590,15 +3203,19 @@ export class TUI {
       // The rank tag (`#N`, or `auto` while the order mode is open) trails the
       // row too, and the row number (`NN.`, see below) may lead it: numW columns.
       const rankW = members.reduce((w, a) => Math.max(w, a.priority != null ? 3 + String(this._rankOf(a)).length : this.mode === 'order' ? 6 : 0), 0);
-      const fixed = 20 + numW + typeCell + NAME_MIN + routeCells + tagW + spendW + switchW + routeW + rankW;
+      const fixed = 20 + numW + typeCell + NAME_MIN + routeCells + tagW + spendW + creditW + switchW + routeW + rankW;
       const span = (/** @type {number} */ n, /** @type {number} */ bar) => fixed + 6 * (n - 1) + n * bar;
       const roomFor = (/** @type {number} */ n) => span(n, BAR_MIN) <= W;
-      // No Ses bar once every Codex account here has said it meters no 5h window
+      // No Ses bar once every account here has said it meters no 5h window
       // (`sessionWindowStated`, the fact a reading leaves behind; not
       // `unified5h` itself, which the expiry sweep nulls every five hours on a
-      // row that does have one); a Claude row or an unreported account keeps it.
+      // row that does have one). Some Codex plans meter none, and so does an
+      // Anthropic Ultra account once its 5-hour limit is lifted. An unreported account keeps the column, and so does a
+      // reading that is still there (showSessionRow). Not keyed on a weekly
+      // reading being present either: a weekly reset nulls `unified7d` until
+      // the next reading, and the column would come back empty meanwhile.
       const shortBar = cat !== 'unified'
-        || members.some(a => providerOf(a) !== 'codex' || a.quota.sessionWindowStated !== false || a.quota.unified7d == null);
+        || members.some(a => showSessionRow(a.quota));
       // The family bars are the first thing to go: below the width where they
       // fit even at BAR_MIN they would push the row past the edge, and a row
       // cut mid-bar reads worse than one that simply doesn't draw them (the
@@ -2620,11 +3237,11 @@ export class TUI {
       const avail = barRoom(0);
       let bw = avail < BAR_MIN
         ? Math.max(1, avail)
-        : Math.min(barCap, avail);
+        : Math.min(BAR_MAX, avail);
       // A pane gives names the columns before bars grow past the floor.
       if (pane != null && avail >= BAR_MIN) {
         const named = barRoom(nameWant);
-        bw = named >= PANE_BAR_FLOOR ? Math.min(barCap, named) : Math.min(PANE_BAR_FLOOR, avail);
+        bw = named >= PANE_BAR_FLOOR ? Math.min(BAR_MAX, named) : Math.min(PANE_BAR_FLOOR, avail);
       }
       const slack = Math.max(0, W - fixed - 6 * (nbars - 1) - nbars * bw);
       const drawn = (shortBar ? 2 : 1) + families;
@@ -2632,7 +3249,7 @@ export class TUI {
       // width that reaches it draws every bar.
       const s1 = Math.max(floor, span(2 + families, BAR_MIN), span(drawn, PANE_BAR_FLOOR));
       const s2 = Math.max(s1, span(drawn, PANE_BAR_FLOOR) + nameWant);
-      const s3 = Math.max(s2, span(drawn, barCap) + nameWant);
+      const s3 = Math.max(s2, span(drawn, BAR_MAX) + nameWant);
       return {
         bw, showBoth, showFamily, anyFable, anySonnet, slack, shortBar,
         complete: showBoth && (families === 0 || showFamily),
@@ -2691,6 +3308,17 @@ export class TUI {
     return this._renderAcct(idx, b.bw, b.showBoth, L.routes, L.genRoutes, L.familyTarget, b.showFamily, L.nameW, { current, compact: L.compact, shortBar: b.shortBar, numbered: L.numbered });
   }
 
+  /** The row, then for an account out of rotation as `error` the line `teamclaude status`
+   *  prints for it, wrapped to the pane so the command at its end is not cut off. */
+  _rowLines(/** @type {number} */ idx, /** @type {any} */ L, /** @type {Set<number>} */ current) {
+    const a = this.am.accounts[idx];
+    const row = this._renderRow(idx, L, current);
+    if (this._unavailable(a) !== 'error') return [row];
+    const plain = (/** @type {string} */ s) => s;
+    const why = unavailableLine({ ...a, unavailable: 'error', onExtraUsage: this._onExtraUsage(a) }, { dim: plain, yellow: plain, red: plain });
+    return [row, ...wrapWords(why ?? '', L.width - 4).map(l => `    ${yellow(l)}`)];
+  }
+
   /** The accounts of each provider present, in the order its rows are drawn. */
   _providerGroups() {
     /** @type {Map<string, number[]>} */
@@ -2704,7 +3332,9 @@ export class TUI {
   }
 
   /** Two pane layouts, or null when `W` cannot fit both. Width goes stage by stage,
-   *  both panes reaching one before either starts the next, a partial one shared pro rata. */
+   *  both panes reaching one before either starts the next, a partial one shared pro rata.
+   *  Width past the last stage stays unused on the right: shared between the panes, it
+   *  set the Codex pane mid-screen on an ultrawide, hundreds of columns from its neighbour. */
   _splitLayout(/** @type {{ provider: string, indices: number[] }[]} */ groups, /** @type {number} */ W) {
     const [a, b] = groups;
     const avail = W - vw(PANE_GUTTER);
@@ -2727,8 +3357,6 @@ export class TUI {
       leftW += wantA;
       rightW += wantB;
     }
-    leftW += Math.floor((avail - leftW - rightW) / 2);
-    rightW = avail - leftW;
     const left = this._listLayout(a.indices, leftW, { pane: a.provider });
     const right = this._listLayout(b.indices, rightW, { pane: b.provider });
     return left.complete && right.complete ? { leftW, rightW, left, right } : null;
@@ -2741,9 +3369,13 @@ export class TUI {
    *  so nothing about selection or routing moves with the rows. Which is also
    *  why the arrangement is a sort key rather than a permutation of
    *  `am.accounts`: see _doMoveAccount.
+   *
+   *  `arranged` asks for the order with no reset sort applied (_displayList).
+   *
+   *  @param {{ arranged?: boolean }} [opts]
    */
-  _displayOrder() {
-    return this._displayList().map(a => this.am.accounts.indexOf(a));
+  _displayOrder({ arranged = false } = {}) {
+    return this._displayList({ arranged }).map(a => this.am.accounts.indexOf(a));
   }
 
   /** Manager indices of the rows the operator can arrange, in drawn order.
@@ -2751,9 +3383,13 @@ export class TUI {
    *  Every account except the locally-served ones: _displayOrder pins those to
    *  the end of the list whatever a number says, so they hold no position and
    *  their array slots are simply stepped over.
+   *
+   *  Always in the arranged order, whatever `accountSort` says: a move
+   *  renumbers every account from this list, so a sorted list here would
+   *  write the sort into `displayOrder`.
    */
   _arrangeable() {
-    return this._displayOrder().filter((/** @type {number} */ i) => !isLocalUpstream(this.am.accounts[i]));
+    return this._displayOrder({ arranged: true }).filter((/** @type {number} */ i) => !isLocalUpstream(this.am.accounts[i]));
   }
 
   /** The rows that carry ►: the cursor, or in a mixed pool each provider's current
@@ -2835,9 +3471,7 @@ export class TUI {
     // not in it, and a row reading `active` for an account that receives nothing
     // sent operators looking at the wrong thing (#468). Live, the manager says;
     // in attach mode the status payload carries the same reason.
-    const barred = typeof this.am.unavailableReason === 'function'
-      ? this.am.unavailableReason(a)
-      : (a.unavailable ?? null);
+    const barred = this._unavailable(a);
     let status;
     if (a.disabled || a.enabled === false) {
       status = gray('disabled');
@@ -2848,24 +3482,47 @@ export class TUI {
     } else if (typeof barred === 'string' && /capped$/.test(barred)) {
       status = yellow('capped');
     } else switch (a.status) {
-      case 'active':    status = isCur ? green('active') : 'active'; break;
+      case 'active':
+        // Re-admitted after an entitlement cooldown, not yet proven by a served request.
+        if (a.entitlementDenial) {
+          // The count can arrive off the attach payload, and the column is ten wide.
+          const n = Number.isSafeInteger(a.entitlementDenial.count) ? a.entitlementDenial.count : 1;
+          status = yellow(n > 99 ? 'denied 99+' : n > 1 ? `denied \u00d7${n}` : 'denied');
+        } else status = isCur ? green('active') : 'active';
+        break;
       case 'throttled': status = yellow('throttled'); break;
       case 'exhausted': status = red('exhausted'); break;
-      case 'error':     status = red('error'); break;
+      case 'error':     status = red(errorLabel(a.errorReason?.code)); break;
       default:          status = a.status || 'ready';
     }
     status = rpad(status, 10);
 
-    // Quota ratios — prefer unified (Claude Max), fall back to standard (API key)
     let r1 = null, r2 = null, l1 = 'Ses', l2 = 'Wk ', t1 = null, t2 = null, w1 = null, w2 = null;
 
-    if (rowCategory(a) === 'unified') {
-      r1 = q.unified5h;
-      r2 = q.unified7d;
-      t1 = q.unified5hReset;
-      t2 = q.unified7dReset;
+    const backendWindows = q.backend?.windows
+      ? { fiveHour: bwLive(q.backend.windows.fiveHour), weekly: bwLive(q.backend.windows.weekly), monthly: bwLive(q.backend.windows.monthly) }
+      : undefined;
+    let r2BackendMonthly = false;
+    const category = rowCategory(a);
+    if (category !== 'metered') {
+      // A third-party backend has no unified readings; its probed windows fill
+      // the same slots. No threshold: rotation gates nothing on a backend, so
+      // its bars never redden at one.
+      r1 = q.unified5h ?? backendWindows?.fiveHour?.utilization ?? null;
+      r2 = q.unified7d ?? backendWindows?.weekly?.utilization ?? null;
+      t1 = q.unified5hReset ?? backendWindows?.fiveHour?.resetAt ?? null;
+      t2 = q.unified7dReset ?? backendWindows?.weekly?.resetAt ?? null;
       w1 = FIVE_HOUR_MS;
       w2 = SEVEN_DAY_MS;
+      // A plan with a monthly window and no weekly one (the newer Kimi plans)
+      // puts the month in the Wk slot rather than leaving it empty.
+      if (r2 == null && q.unified7d == null && backendWindows?.monthly != null) {
+        l2 = 'Mon';
+        r2 = backendWindows.monthly.utilization;
+        t2 = backendWindows.monthly.resetAt;
+        w2 = MONTH_MS;
+        r2BackendMonthly = true;
+      }
     } else {
       l1 = 'Tok';
       l2 = 'Req';
@@ -2895,33 +3552,52 @@ export class TUI {
       const th = thFor(k);
       return cap == null ? th : (typeof th === 'number' ? Math.min(th, cap) : cap);
     };
-    let th1 = limFor(r1 === q.unified5h ? 'unified5h' : 'tokens');
-    const th2 = limFor(r2 === q.unified7d ? 'unified7d' : 'requests');
+    // Per slot, not per row: a slot filled from a backend window carries no
+    // threshold (rotation gates nothing on it), whatever its neighbour holds.
+    const r1Backend = q.unified5h == null && backendWindows?.fiveHour != null;
+    const r2Backend = q.unified7d == null && backendWindows?.weekly != null;
+    let th1 = r1Backend ? null : limFor(r1 === q.unified5h ? 'unified5h' : 'tokens');
+    const th2 = (r2Backend || r2BackendMonthly) ? null : limFor(r2 === q.unified7d ? 'unified7d' : 'requests');
 
     // A list with no five-hour window to draw (see _listLayout) starts the row
     // at the weekly bar.
-    const weeklyFirst = !shortBar && rowCategory(a) === 'unified';
-    // A Codex row whose subscription meters no five-hour window draws only the
-    // weekly bar even while Claude rows on the same list keep Ses/Wk: a `Ses -`
-    // cell there said nothing. Keyed on the fact the reading left behind
-    // (`sessionWindowStated`, see _updateCodexQuota), never on `unified5h`
+    const weeklyFirst = !shortBar && category !== 'metered';
+    // A row whose subscription meters no five-hour window (a Codex plan, or a
+    // Claude Ultra plan once its 5-hour limit is lifted) draws only the weekly
+    // bar even while other rows on the same list keep Ses/Wk: a `Ses -` cell
+    // there said nothing. Keyed on the fact the reading left behind
+    // (`sessionWindowStated`, see noteSessionWindow), never on `unified5h`
     // being empty: the expiry sweep nulls that every five hours on a row that
     // does have a session window, and the row would swing between the two
     // shapes. An account that has not reported keeps both cells, so the row
-    // does not change shape at startup. The weekly bar takes the two cells'
-    // width (bar + `  Wk ` + bar) so the row still ends where its neighbours do.
-    const weeklyOnly = !weeklyFirst && showBoth && rowCategory(a) === 'unified'
-      && providerOf(a) === 'codex' && q.sessionWindowStated === false && q.unified7d != null;
+    // does not change shape at startup. A reading that is still present keeps
+    // its cell whatever the flag says (showSessionRow): it may be the one
+    // holding the account out of rotation. With two bars the weekly bar takes
+    // the two cells' width (bar + `  Wk ` + bar) so the row still ends where
+    // its neighbours do. In single-bar mode (no room for two) it takes the one
+    // slot at its own width: the row would otherwise draw `Ses` over nothing
+    // and leave out the weekly window, the only limit it has. A weekly reset
+    // leaves the shape alone: it nulls `unified7d` until the next reading,
+    // and the row draws an empty weekly bar meanwhile, not an empty Ses cell.
+    const weeklyOnly = !weeklyFirst && category === 'unified' && !showSessionRow(q);
+    // The mirror case: a plan with no shared weekly window (a Team seat). Its
+    // one slot already holds the session bar, so only two-bar mode changes it.
+    const sessionOnly = !weeklyFirst && showBoth && category === 'unified' && !showWeeklyRow(q);
     if (weeklyFirst || weeklyOnly) [l1, r1, t1, w1, th1] = [l2, r2, t2, w2, th2];
-    const bw1 = weeklyOnly ? bw * 2 + 6 : bw;
+    const bw1 = showBoth && (weeklyOnly || sessionOnly) ? bw * 2 + 6 : bw;
 
     // Keep the optional chaining: _renderAcct is called on instances built
     // without a config, and it read none before this line existed.
-    const pctInBar = this.config?.quotaBarPercent !== false;
+    const pctInBar = this.config?.quotaBarPercent === true;
 
     let line = `${lead}${sel}${cur} ${startSlot}${name} ${type}${status} ${l1} ${bar(r1, bw1, t1, w1, th1, pctInBar)}`;
     if (showBoth) {
-      if (!weeklyFirst && !weeklyOnly) line += `  ${l2} ${bar(r2, bw, t2, w2, th2, pctInBar)}`;
+      if (!weeklyFirst && !weeklyOnly && !sessionOnly) line += `  ${l2} ${bar(r2, bw, t2, w2, th2, pctInBar)}`;
+      // A backend's monthly window has no unified slot; it draws its own bar
+      // and is budgeted as a family column, like S7/F7.
+      if (showFamily && backendWindows?.monthly != null && l2 !== 'Mon') {
+        line += `  Mon ${bar(backendWindows.monthly.utilization, bw, backendWindows.monthly.resetAt, MONTH_MS, null, pctInBar)}`;
+      }
       // Sonnet weekly bar — only shown when the usage probe has populated it. A
       // leading ► (in place of a padding space) marks a Sonnet route on this account.
       if (showFamily && q.unified7dSonnet != null) {
@@ -2980,6 +3656,12 @@ export class TUI {
    * @param {{ index: number, onExtraUsage?: boolean }} a */
   _onExtraUsage(a) {
     return typeof this.am.onExtraUsage === 'function' ? this.am.onExtraUsage(a.index) : a.onExtraUsage === true;
+  }
+
+  /** Why the account is out of rotation: the manager's verdict live, the payload's attached.
+   * @param {any} a */
+  _unavailable(a) {
+    return typeof this.am.unavailableReason === 'function' ? this.am.unavailableReason(a) : (a.unavailable ?? null);
   }
 
   /**
@@ -3051,6 +3733,9 @@ export class TUI {
     // ── Quota probe
     lines.push(bold('  Quota probe') + dim('  — refresh idle accounts from the usage endpoint'));
     lines.push(row(byId('probe')));
+    lines.push(row(byId('probeDisabledAccounts')));
+    lines.push(dim('  Disabled accounts are read either way. On, the probe also'));
+    lines.push(dim('  refreshes their tokens, so one whose token expired is read too.'));
     lines.push('');
     // ── Quota bars
     lines.push(bold('  Quota bars') + dim('  — what the bar on each account row carries'));
@@ -3075,6 +3760,12 @@ export class TUI {
     lines.push(row(byId('addAccount')));
     if (byId('removeAccount')) lines.push(row(byId('removeAccount')));
     if (byId('orderAccounts')) lines.push(row(byId('orderAccounts')));
+    if (byId('accountSort')) {
+      lines.push(row(byId('accountSort')));
+      lines.push(dim('  A reset sort lists the account whose window ends soonest first;'));
+      lines.push(dim('  S7/F7 read the weekly window on an account without one. The'));
+      lines.push(dim('  arranged order breaks ties.'));
+    }
     lines.push('');
     // ── Network
     // Drawn before the sx.org block, which returns early when sx is unavailable:
@@ -3459,6 +4150,13 @@ export class TUI {
         return ` ${bold('i')}mport Claude Code  ${bold('k')} API key  ${bold('Esc')} cancel`;
       case 'input':
         return ` ${this.inputPrompt}: ${this.inputSecret ? '*'.repeat(this.inputBuf.length) : this.inputBuf}█`;
+      case 'login': {
+        // `c` is only a key while the field is empty (see _keyLogin), so it
+        // is only offered then.
+        const login = this.login;
+        const panelKeys = login?.prompt && !login.buf ? `  ${bold('c')} copy link` : '';
+        return ` ${bold('Enter')} submit  ${bold('Esc')} cancel${panelKeys}`;
+      }
       default:
         return '';
     }

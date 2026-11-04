@@ -45,6 +45,10 @@ export const DISTRIBUTE_MODES = {
     value: 'adaptive',
     said: 'Session distribution adaptive — new sessions concentrate on the account with the least remaining weekly credit, tapering off as it nears the switch threshold and backing off when it is busy.',
   },
+  load: {
+    value: 'load',
+    said: 'Session distribution by load — new sessions go to the account that served the fewest requests in the last ten minutes, each pinned to its own for cache reuse.',
+  },
 };
 
 const BAD_PERCENT = 'A threshold is a percentage from 1 to 100.';
@@ -203,7 +207,7 @@ export function setBucketThresholds(config, pairs) {
  */
 export function setDistribution(config, mode) {
   if (typeof mode !== 'string' || !Object.hasOwn(DISTRIBUTE_MODES, mode)) {
-    throw new ConfigOpError('Session distribution is off, even or adaptive.');
+    throw new ConfigOpError('Session distribution is off, even, adaptive or load.');
   }
   // Compared as modes, not stored values: a hand-written `"on"` already means
   // even, and rewriting it would be a read-modify-write for nothing.
@@ -396,4 +400,40 @@ export function setAccountDisabled(config, query, disabled, spec = {}) {
   if (disabled) account.disabled = true;
   else delete account.disabled;
   return { name: account.name, disabled: !!account.disabled };
+}
+
+/**
+ * Give an account a new name, and carry it into every route that lists the old one.
+ *
+ * A route names its accounts by exact name, so renaming the account alone would
+ * drop it from those routes without a word. The new name is refused when it
+ * would resolve to another account (as a name or as an email), since every
+ * command looks accounts up that way, and when it is all digits, which a route
+ * reads as an account index.
+ *
+ * @param {any} config
+ * @param {string} query
+ * @param {unknown} newName
+ * @param {{ orgFilter?: string }} [spec]
+ * @returns {{ from: string, name: string, routes: string[] }} `routes` names the routes that were updated
+ */
+export function renameAccount(config, query, newName, spec = {}) {
+  const account = resolveConfiguredAccount(config, query, spec.orgFilter);
+  if (typeof newName === 'string') refuseControlCharacters(newName, 'An account name');
+  const name = typeof newName === 'string' ? newName.trim() : '';
+  if (!name) throw new ConfigOpError('name the new account name');
+  if (/^\d+$/.test(name)) throw new ConfigOpError(`"${name}" is all digits, which a route reads as an account index`);
+  const others = (config.accounts || []).filter((/** @type {any} */ a) => a !== account);
+  if (matchAccounts(others, name).length) throw new ConfigOpError(`"${name}" already names another account`);
+
+  const from = account.name;
+  account.name = name;
+  /** @type {string[]} */
+  const routes = [];
+  for (const r of Array.isArray(config.routes) ? config.routes : []) {
+    if (!Array.isArray(r.accounts) || !r.accounts.includes(from)) continue;
+    r.accounts = [...new Set(r.accounts.map((/** @type {string} */ a) => a === from ? name : a))];
+    routes.push(r.name);
+  }
+  return { from, name, routes };
 }

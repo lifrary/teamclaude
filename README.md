@@ -9,6 +9,8 @@ Multi-account proxy for [Claude Code](https://claude.ai/claude-code) and [Codex]
 
 It sits between the coding agent and the provider's API, holds several accounts, and moves to the next one when the current account gets close to its session or weekly limit. The session keeps running instead of stopping on a 429. Claude accounts serve Claude Code, Codex accounts serve the Codex CLI, and both pools share one proxy.
 
+**It is built for one person.** The "team" is the agents: someone running ten, or fifty, coding-agent sessions at once needs more than one subscription, and switching accounts by hand each time one fills up is what this replaces. Every account in the pool is your own, and the client is the provider's own CLI. It is not a way to share an account between people, and not a bridge for other clients onto subscription credentials — see [Scope](#scope).
+
 ![TeamClaude TUI](screenshots/teamclaude.png)
 
 ## Quick start
@@ -101,13 +103,15 @@ Step-by-step lifecycle: [docs/routing.md](docs/routing.md#request-lifecycle).
 
 | Page | Contents |
 | --- | --- |
-| [Accounts](docs/accounts.md) | OAuth login, import, API keys, multiple orgs, per-account proxy routing, Codex accounts, third-party backends |
-| [Usage](docs/usage.md) | Server and TUI, running Claude Code, shell alias, command reference, browser dashboard, MCP endpoint, logging |
+| [Accounts](docs/accounts.md) | OAuth login, import, API keys, multiple orgs, syncing tokens across machines via callback.net, per-account proxy routing, Codex accounts, third-party backends |
+| [Usage](docs/usage.md) | Server and TUI, running Claude Code, shell alias, command reference, browser dashboard, MCP endpoint, CLIProxyAPI-compatible usage API, logging |
+| [VS Code](docs/vscode.md) | The Claude Code extension for VS Code through the proxy: settings, a check, updates |
 | [Routing](docs/routing.md) | Rotation, the two kinds of 429, storm control, model routes, session spreading, pinning, prompt cache |
 | [Quota](docs/quota.md) | Quota probe, keep-warm, holding on exhaustion |
 | [Configuration](docs/configuration.md) | Config format, every field, environment variables, network tuning |
 | [Proxy modes](docs/proxy-modes.md) | MITM forward proxy, upstream proxy, per-account routing, sx.org residential egress |
-| [Compliance](docs/compliance.md) | Terms of service notes |
+| [Compliance](docs/compliance.md) | Who the project is for, and terms of service notes for each provider |
+| [Contributing](CONTRIBUTING.md) | What is in scope, and what a pull request needs |
 
 ## Renaming to TeamRouter
 
@@ -121,9 +125,15 @@ This repository is the customized lifrary fork. Installing upstream directly
 does not include the custom behavior described above. See [SECURITY.md](SECURITY.md)
 for upstream security reporting guidance.
 
-## Compliance
+## Scope
 
-TeamClaude is a local proxy holding your own credentials and driving your own Claude Code CLI. How that lines up with Anthropic's terms, including the multi-subscription question people ask most, is written up in [docs/compliance.md](docs/compliance.md). Not legal advice.
+TeamClaude is a local proxy holding your own credentials and driving the provider's own CLI, for one person's work. That holds for every provider it supports, not only Anthropic:
+
+- **One person, their own accounts.** Not account sharing, not a hosted service, not resale.
+- **The provider's own client.** Claude Code on Claude accounts, the Codex CLI on Codex accounts. No support for other harnesses on subscription credentials.
+- **A third-party backend is an account like any other:** a key you were issued, used under that vendor's terms.
+
+How this lines up with the providers' terms, including the multi-subscription question people ask most, is written up in [docs/compliance.md](docs/compliance.md). Not legal advice. Changes that step outside this scope are not merged; see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Star history
 

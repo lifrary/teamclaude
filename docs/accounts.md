@@ -10,6 +10,8 @@ teamclaude login
 
 Opens your browser and uses the same OAuth flow as Claude Code. Auto-detects the account email and subscription tier. Logging in with the same account again updates its credentials.
 
+The browser is sent back to a listener on this machine, so it has to run here. On a terminal the command also prints a second link, which works from any device: open it there, sign in, and paste the code the page shows at the prompt. Whichever arrives first is used. Over SSH, or on Linux with no display (`DISPLAY`/`WAYLAND_DISPLAY` unset), no browser is opened and the paste is the whole flow, the same as `teamclaude login --token`.
+
 Run it once per account. You can add accounts while the server is running — press **R** in the TUI to reload.
 
 If the profile cannot be identified, login stops without adding a placeholder
@@ -59,6 +61,8 @@ For Anthropic API key accounts (billed via Console):
 teamclaude login --api
 ```
 
+A key is **metered** — every token it serves is billed — while a subscription's quota is paid for whether it is spent or not. So a key is added as the last resort, which in this fork means **unranked**: an unset priority sorts after every finite one, so rotation reaches the key only after every ranked account, and among the unranked ones a subscription whose weekly window is known comes first. The key serves once those are spent, and rotation goes back to a subscription that has quota again at the next re-evaluation (`reevalIntervalMs`, five minutes by default). Pass `--priority <n>` to rank it yourself; any number, `0` included, puts it ahead of every unranked account. A key already in the config keeps whatever priority it has: `teamclaude priority <name> auto` makes it unranked, the back of the line (`--last` only places it after the other ranked accounts).
+
 ### When the key is rejected (401)
 
 A 401 on an API-key account never reaches the client. The request fails over to the next account, and the account that answered it is held out of rotation for a cooldown, then tried again. It is not benched for good, because a 401 does not always mean the key is bad: a gateway such as LiteLLM, set as the account's `upstream`, can answer one while its own upstream is unreachable.
@@ -90,12 +94,41 @@ teamclaude enable <name>        # re-enable it (also clears a stuck error state)
 teamclaude priority <name> 1    # rotation preference, lower = preferred
 teamclaude priority <name> --first
 teamclaude priority <name> --last
+teamclaude rename <name> <new>  # rename it; routes that list it are updated too
 teamclaude routing <name> <url> # route ALL of the account's traffic via its own proxy
 teamclaude routing <name> none  # clear it
 teamclaude routing <name> --check  # test the proxy the account already has
 ```
 
-`login`, `import`, `enable`, `disable`, `priority` and `routing` notify a running server to reload, so credential, priority, enable/disable and routing changes are picked up live; the same reload (POST `/teamclaude/reload`, or **R** in the TUI) also applies hand edits to an account's `upstream`/`modelMap`. Account **removals** made on disk (`teamclaude remove` from another shell, or a hand edit) are applied by the same reload: a running account whose entry is gone from the file is dropped from the fleet, and the reload reports how many it added and how many it removed. An account added in the TUI is safe during the moment between its addition and its save — a reload that reads the file first leaves it alone rather than treating the missing row as a removal. Removing one from the TUI or through the [MCP endpoint](usage.md#mcp-endpoint)'s `remove_account` takes effect at once.
+Rename while the server runs: an API-key account's saved quota readings are matched by name, so a rename made with the server stopped loses them on the next start. Sessions launched with `TC_ACCT=<old name>` pin by name and need relaunching with the new one.
+
+`login`, `import`, `enable`, `disable`, `priority`, `rename` and `routing` notify a running server to reload, so credential, priority, enable/disable, name and routing changes are picked up live; the same reload (POST `/teamclaude/reload`, or **R** in the TUI) also applies hand edits to an account's `upstream`/`modelMap`. Account **removals** made on disk (`teamclaude remove` from another shell, or a hand edit) are applied by the same reload: a running account whose entry is gone from the file is dropped from the fleet, and the reload reports how many it added and how many it removed. An account added in the TUI is safe during the moment between its addition and its save — a reload that reads the file first leaves it alone rather than treating the missing row as a removal. Removing one from the TUI or through the [MCP endpoint](usage.md#mcp-endpoint)'s `remove_account` takes effect at once.
+
+## Syncing accounts across machines (callback.net)
+
+A pooled OAuth token lives a few days, and then has to be signed in again — on every machine that holds a copy. Sign each install in to [callback.net](https://www.callback.net/) instead, and they keep each other's tokens:
+
+```bash
+teamclaude callback login      # prints a URL to approve in any browser (--no-browser to not open one)
+teamclaude callback status     # who this install is signed in as
+teamclaude callback sync       # reconcile the running server with the store now
+teamclaude callback logout     # revoke the session and stop syncing
+```
+
+The sign-in is a poll-token OAuth2 flow: the URL can be opened on any machine, so it works over SSH and in a container, and no local port is listened on. The session token is this install's own and lives beside the config (`<config>.callback.json`, mode `0600`), never in the config itself. Being signed in is the whole opt-in; there is no config key. `logout` turns it off.
+
+**What callback.net does with the data.** It stores your tokens and nothing else: the rows are the account's identity and its access and refresh tokens, encrypted in transit (TLS) and at rest, readable only with your callback.net login, and never used by the service itself — it holds them so your other installs can read them. The service is provided free of charge, as a convenience for exactly this: syncing your own tokens between your own computers. Use it for that and nothing else; in particular, it is not a place to share accounts with other people, and the pool's per-client keys and routing are the tools for sharing a proxy.
+
+While signed in, every **OAuth** account (Claude and Codex) is kept as one row of your `User/Credential` store on callback.net, encrypted at rest and keyed by the account's identity (provider, account, organization), so each of your installs names the same account the same way. What travels is the identity and the tokens: `priority`, `disabled`, `routing` and the display order stay on each install. API-key accounts and [third-party backends](#third-party-backend-accounts) are not synced — a key does not expire, and a backend credential is not ours to renew.
+
+- **A pass** runs when the server starts, on every reload (`callback login`, `login`, `import` and `callback sync` all trigger one) and once a day. A row with no local account becomes one, so signing in on a new machine brings every account over. A row whose token is newer than the local one — the later `expiresAt`, which a renewal always pushes forward — replaces it. A local account newer than its row updates the row, and one with no row creates it — but only with a token this install just renewed (below).
+- **Only fresh tokens are stored.** A token is written to the store only when the token endpoint has just minted it: a renewal on this install, or a `login` or `import`. A token read from the config at start, or from disk on a reload, may have died while the proxy was down, and one that served a request may still have been revoked since, so neither is ever stored. An account holding one only reads (it adopts newer tokens and follows tombstones); its next renewal writes the row. That renewal is still made under a lock: with no row yet, it first creates one holding only the account's identity and no token, so that two installs started from the same config renew the account once, not twice.
+- **A token refresh** goes through the row's advisory lock, so one install renews and the rest adopt. A refresh rotates the token family, and two installs renewing one account at once would each invalidate the other's copy — which is exactly the "sign in again everywhere" this exists to end. With the lock taken, the row is read first (the lock answers with it): if it holds a token other than this install's, another install renewed or signed in since, and that token is adopted whatever its expiry; the provider is not called. The one exception is a row this install wrote itself with an older token than it holds now, a renewal of its own that never reached the store, which is renewed over rather than taken back. Refused, another install is renewing: a token that is still good (the refresh runs five minutes ahead of expiry) is simply kept, the renewal arrives through the store, and the next request asks again. A token that has already expired, or that upstream just rejected, waits instead, re-reading every 5 seconds for 30 seconds, adopts what the holder stores, and otherwise tries the lock again; a lock that nobody releases times out after 30 seconds. A store that cannot be reached never stops a refresh: the account is renewed without it and stored on the next pass.
+- **A sign-in** (`login`, `import`) is stored right away, over whatever the row held.
+- **An account in error never writes.** Once upstream has rejected an account's token (status `error`, "needs re-login"), what this install holds is dead, so it is never stored — not by a pass, not as a token change — however late its `expiresAt`. It only reads: the moment it goes into error, and at every pass after, a row holding a different token (another install renewed it, or you signed in there) is adopted whatever its expiry, and the account is back in rotation. If instead the row still holds the very refresh token that was rejected, the row is emptied: under its lock, and only if it is unchanged once locked, its refresh token becomes `""`. An empty refresh token means "needs a sign-in": no install adopts it or adds an account from it, and the first install with a working token for that account overwrites it, whatever the expiry.
+- **Removal travels.** `teamclaude remove` (or the TUI, or the MCP endpoint) writes a tombstone into the account's row — `{"_deleted": "<time>"}` — and every other install removes the account at its next pass. A token refresh on an install that has not yet seen the tombstone still goes through, but never writes over it; only an explicit sign-in (`login`, `import`) does, which is how a removed account comes back everywhere. A tombstone older than a week is deleted by whichever pass sees it.
+
+`teamclaude status --json` carries the sync's state under `callbackSync`: the last pass, its error if it failed, how many accounts the store holds, how many tombstones, and how many rows are emptied and waiting for a sign-in (`signInNeeded`).
 
 ## Per-account routing (`routing`)
 
@@ -137,7 +170,7 @@ Besides the CLI there are two more places to set it. In the TUI, **`g`** then **
 
 Routing covers what TeamClaude does with the account's own credential. Two kinds of traffic are outside that, and both keep the fleet path:
 
-- Claude Code's own identity calls (`/api/oauth/*`, `/v1/code/*` and its token refresh) are relayed with the credential of the Claude Code login, never with a pooled account's, so they belong to no account here. That holds even when the login is the same person as a routed account.
+- Claude Code's own identity calls (`/api/oauth/*`, `/v1/code/*`, the claude.ai connector list `/v1/mcp_servers`, the Remote Control bridge's `/v1/environments/*`, `/v1/sessions/*`, `/v2/session_ingress/*` and `/v2/ccr-sessions/*`, and its token refresh) are relayed with the credential of the Claude Code login, never with a pooled account's, so they belong to no account here. That holds even when the login is the same person as a routed account.
 - A sign-in or import that names no account. Which account it belongs to is only known once the profile has been read, so that lookup cannot use a proxy it has not found yet. Pass `--name` (or `--routing`) and it can.
 
 ### The proxy is tested before anything depends on it
@@ -173,15 +206,99 @@ Two fleet features reason about this machine's own exit address, which a routed 
 
 Accounts can also be added, removed and reordered from the TUI settings screen: **`g`** → **Add account** / **Remove account** / **Reorder accounts**.
 
+### Why an account is in `error`
+
+An account leaves rotation as `error` when upstream rejects its refresh token, or answers 401 to a token that has none to refresh with. `teamclaude status` names which, instead of pointing at the logs — `needs a re-login: upstream rejected its refresh token (400) — run: teamclaude login` — and `GET /teamclaude/status` carries the same under `accounts[].errorReason`: `code` (`refresh_rejected` or `credential_rejected`), `detail`, `since` (epoch ms), `remedy`, the login command that brings it back, and `link` (`null` here). It is `null` whenever the account is not in `error`. The TUI names the reason in the status column (`re-login` for those two codes, `on hold` for `account_on_hold`, `refused` for upstream's other account refusals below, `error` for any other) and draws the same line under the account's row.
+
+It also leaves rotation when upstream refuses the account itself ([account refusals](routing.md#account-refusals)). Then `code` is upstream's error code, such as `verification_required` or `account_on_hold`, `detail` is upstream's message, and `link` is the address in that message when it is a plain https link on `claude.ai`, `anthropic.com` (or a subdomain of either) or `platform.claude.com`. Status reads `refused by upstream: <message> — once resolved, run: teamclaude login`: resolve it at the link, then sign in again to bring the account back. A refused account's refresh token failing afterwards does not replace the refusal, and a refusal replaces a dead-token error, since signing in again alone would not bring the account back.
+
+An account Anthropic has put on hold gets its refresh refused with `error_description: "account_on_hold"`. A re-login does not lift that, so it is reported as a refusal like the ones above: `code` is `account_on_hold`, `detail` is Anthropic's own message with the appeal link (`Your account is on hold and can't use Claude Code. View details or appeal: https://claude.ai/restricted`), `link` is that appeal link, and status, the dashboard and `teamclaude switch` say upstream refused the account rather than that it needs a re-login. `remedy` is still `teamclaude login`: the refused token is not sent again, so once the hold is lifted a sign-in puts the account back.
+
+### When a plan lapses
+
+With the [quota probe](quota.md#quota-probe) on, each Anthropic account's OAuth profile is read again at most once an hour. When an account that showed a Claude Max or Pro plan reads as having neither, `teamclaude status` adds a line under it:
+
+```
+Plan     its OAuth profile no longer shows the Claude Max plan (since 2h ago) — renew the plan or disable the account
+```
+
+`GET /teamclaude/status` carries `accounts[].subscriptionLost`: `plan` (`Max` or `Pro`) and `since` (epoch ms, when it was first seen). It clears when the profile shows a plan again or the account gets new tokens (a `teamclaude login`; the next profile read reports the loss again if the plan is still gone), and it is kept across a restart. A failed profile read changes nothing. A change between plans (Max to Pro, or a different Max tier) is logged.
+
+The account is not taken out of rotation for it. The profile is a second-hand view of the plan, and what the account can still serve is decided by upstream's answers to its requests, which the proxy already acts on. Disable the account if you do not want it tried.
+
 ### Signing in again from the TUI
 
-An OAuth account whose refresh token upstream has rejected — typically because the same account was signed in somewhere else, which rotates the token and kills the copy TeamClaude holds — shows as `error` and stays that way until someone signs in again. Press **`l`** on the dashboard: the picker opens on the first account in `error`, and **Enter** opens the provider's sign-in page in your browser (Claude or Codex, by the account's provider). The dashboard stays live while it waits, up to two minutes.
+An OAuth account whose refresh token upstream has rejected — typically because the same account was signed in somewhere else, which rotates the token and kills the copy TeamClaude holds — shows as `re-login` and stays that way until someone signs in again. Press **`l`** on the dashboard: the picker opens on the first account in `error`, and **Enter** opens the login panel for the account's provider (Claude or Codex). The panel works when the server is on another machine, reached over SSH:
+
+- **The link.** The full sign-in URL is drawn under the label, wrapped across lines and starting at the left edge, so you can select it by hand in any terminal. It is also an OSC 8 hyperlink: click it in a terminal that supports them.
+- **The clipboard.** The panel sends the link to your clipboard with OSC 52 when it opens, and again on **`c`**. Your terminal must allow OSC 52 (some, iTerm2 among them, have it off by default). `c` is a key only while the paste field is empty.
+- **The paste field.** After you sign in, paste what the sign-in left you and press **Enter**:
+  - Claude: the code the page shows.
+  - Codex: OpenAI sends the browser to `http://localhost:1455/auth/callback`, which does not load on another machine. Copy that whole address from the browser's address bar and paste it.
+
+  A paste that cannot be used (one from another attempt, or the link itself) is refused with the reason, and you can paste again.
+- **Esc** cancels the sign-in and closes the listener.
+
+On a local terminal a browser also opens on this machine, and the sign-in finishes by itself when you approve it there. Over SSH, or on Linux with no display, no browser is opened. For Codex, connect with `ssh -L 1455:localhost:1455 <host>` and the laptop's browser reaches the server's listener, so the sign-in finishes without the paste. The panel waits up to five minutes, and the proxy keeps serving meanwhile.
+
+The server decides whether its terminal is remote from its own environment (`SSH_CONNECTION` or `SSH_TTY`; on Linux, no `DISPLAY` or `WAYLAND_DISPLAY`). A server that a service started inside tmux, and that you attach to over SSH later, still has the service's environment. It then opens a browser on the host as well, which nobody sees; the link and the paste work as usual. Start such a server with `TEAMCLAUDE_REMOTE=1` to say it is remote (`0` says local). Inside tmux, the clipboard and the link only reach your terminal with the tmux options in [Signing accounts in over SSH](#signing-accounts-in-over-ssh).
 
 The tokens go to the account the browser actually signed in as, matched by identity exactly as `teamclaude login` does — not to whichever row was highlighted. Sign in as a different account and that account is updated (or added) instead, the activity pane says so, and the row you picked still needs its login.
 
-The key needs a browser on the machine running the server, so it is not offered in `teamclaude attach`, and on a headless host `teamclaude login --token` remains the way.
+The sign-in runs in the server's process, so the key is not offered in `teamclaude attach`. You can also sign in on a machine that has a browser: if that install and the server are both signed in to [callback.net](#syncing-accounts-across-machines-callbacknet), run `teamclaude login` there, and the server takes the new token at its next pass (press **R** in its TUI, or run `teamclaude callback sync` on it, to start one now).
 
 **Reorder accounts** sets the order the account list is drawn in — `↑`/`↓` pick an account, `←`/`→` move it up and down, each move saved as you make it. It writes a `displayOrder` on the entry and touches nothing else: an account keeps its place in the `accounts` array, so route pins, session pins and `TC_ACCT` all go on naming the same accounts, and rotation order stays `priority`'s business alone. An account with no `displayOrder` — every account, until the first time you arrange them, and every one added afterwards — lists after the ones that have one, which is where a newly added account appeared anyway. A [third-party backend](#third-party-backend-accounts) served by a local process is infrastructure rather than a seat to rotate between: the TUI keeps those at the end of the list, and the screen leaves them there.
+
+## Signing accounts in over SSH
+
+A login normally ends with the browser sent back to a listener on the machine that started it,
+and the browser on your laptop cannot reach the server's loopback. So over SSH TeamClaude opens
+no browser on the host. It gives you a link to open on the laptop, and you paste the answer back:
+
+- `teamclaude login` prints the link. Paste back the code the page shows after you sign in.
+- `teamclaude login --codex` prints the link. After you sign in, the browser is sent to
+  `http://localhost:1455/auth/callback`, which does not load. Paste that whole address at the
+  prompt.
+- **`l`** in the attached TUI opens a panel with the link (clickable, and sent to your clipboard)
+  and a paste field. See [Signing in again from the TUI](#signing-in-again-from-the-tui).
+
+TeamClaude tells an SSH session from its environment (`SSH_CONNECTION`, `SSH_TTY`), and on Linux
+also treats a missing display (`DISPLAY`, `WAYLAND_DISPLAY`) as remote. A server that a service
+started inside tmux never sees your SSH session: it runs with the service's environment, however
+you attach to it later. It would then open a browser on the host, where nobody sees it. Start it
+with `TEAMCLAUDE_REMOTE=1` to say it is remote (for example `tmux new-session -e TEAMCLAUDE_REMOTE=1 ...`);
+`0` says local whatever the environment shows. `TEAMROUTER_REMOTE` is the same setting.
+
+For Codex, forward the callback port and the sign-in finishes without the paste:
+
+```sh
+ssh -t -L 1455:localhost:1455 <host> 'tmux attach -t teamclaude'
+```
+
+The TUI sends the link to the clipboard (OSC 52) and draws it as a hyperlink (OSC 8). Inside tmux
+neither reaches your terminal by default. Add these lines to `~/.tmux.conf` on the host:
+
+```
+# Accept OSC 52 from applications and pass it on. The default, external,
+# drops an application's clipboard write.
+set -g set-clipboard on
+# Pass OSC 8 hyperlinks on (tmux 3.4 or later). The pattern is matched against
+# your terminal's TERM: xterm* covers xterm-256color and xterm-ghostty, and *
+# covers every terminal.
+set -as terminal-features ',xterm*:hyperlinks'
+```
+
+Then run `tmux source-file ~/.tmux.conf`, and detach and attach again: tmux reads
+`terminal-features` when a client attaches. OSC 52 also needs the `clipboard` feature for your
+terminal; tmux's default `terminal-features` already gives it to `xterm*`. `allow-passthrough on`
+carries the clipboard write too, because the TUI sends it in both forms. Your terminal must allow
+OSC 52 as well; some have it off by default.
+
+You can also sign in on the laptop. If the laptop and the server are both signed in to
+callback.net (`teamclaude callback login` on each), run `teamclaude login` on the laptop. The
+server takes the new token at its next pass, and **R** in its TUI starts one. The laptop's config
+then holds the account too, which is safe: callback.net makes the installs take turns to refresh a
+token. See [Syncing accounts across machines](#syncing-accounts-across-machines-callbacknet).
 
 ## The `id` field
 
@@ -198,7 +315,17 @@ teamclaude login --codex     # browser sign-in, repeat per account
 ```
 
 Add `--no-browser` to print the URL instead of opening one, and `--name` to
-label the account yourself (it defaults to the email on the login).
+label the account yourself (it defaults to the email on the login). Over SSH,
+or on Linux with no display, no browser is opened.
+
+On a terminal you can finish the sign-in from another device. Open the URL
+there and sign in. The browser is then sent to
+`http://localhost:1455/auth/callback`, which does not load on that device:
+copy the whole address from its address bar and paste it at the prompt. With
+`ssh -L 1455:localhost:1455 <host>` the browser reaches the listener instead,
+and the sign-in finishes by itself. If port 1455 is in use (a running
+`codex login` holds it), the paste still works; without a terminal to paste
+into, the login fails, because nothing else can finish it.
 
 To pool a login you already have, or to add one without a browser, point an
 account at the Codex CLI's own credentials file instead — it defaults to
@@ -248,6 +375,18 @@ Two boundaries worth knowing:
   the proxy to read is not a neutral default.
 - `ab.chatgpt.com` is never intercepted. It is OpenAI's telemetry endpoint,
   carries no inference, and there is nothing there to rewrite.
+- On the intercepted `chatgpt.com`, only `/backend-api/codex/*` is pooled.
+  Everything else the CLI sends there — the workspace discovery codex-cli
+  0.156 makes before every turn (`/backend-api/wham/accounts/check`), its
+  plugin, MCP and settings calls — goes through to `chatgpt.com` with the
+  client's own login, untouched. Those calls are not inference and belong to
+  that login; they used to be classified as Anthropic traffic and answered 404
+  by `api.anthropic.com` ([#492](https://github.com/KarpelesLab/teamclaude/issues/492)).
+- The Codex **Responses WebSocket** is refused (`501`). A WebSocket is relayed
+  with the client's own headers, so a turn over it would run on the client's
+  login and book nothing against the pool. Refused, the CLI falls back to
+  HTTPS, where the pool serves it — the cost is its reconnect attempts before
+  it does.
 
 The base-URL route below still works and is the way to pool Codex without MITM.
 
@@ -373,6 +512,67 @@ held to a 10-second budget, because the waiting client's patience for the
 response head is finite and the retry needs the rest of it. Every attempt and outcome is
 logged.
 
+## Claude banked usage-limit resets
+
+Claude sometimes grants an account a **banked usage-limit reset**, shown under
+**Resets** on the claude.ai usage page (for example "Full reset — Expires
+Oct 23"). Spending one clears the account's 5-hour and 7-day windows ahead of
+their own reset, whenever you choose.
+
+The [quota probe](quota.md#quota-probe) reads the count from the same
+zero-spend `/api/oauth/usage` call it already makes. It asks with
+`?cedar_ember=1` and a Claude Code `User-Agent`, because the endpoint only
+includes the reset block for a recent Claude Code client. The count shows up on
+the same surfaces as the
+[Codex reset credits](#free-rate-limit-reset-credits): `RC1` on the TUI row, a
+`Reset` line in `teamclaude status` with when the reset lapses
+(`expires 18d 23h`), and a badge with the date on the dashboard card. A reset
+past its expiry date is dropped from every surface, as is a reading more than
+7 days old.
+
+The probe is off by default, so the count is only as fresh as the last probe:
+`p` in the TUI, or `curl -X POST localhost:3456/teamclaude/probe`, refreshes
+it once.
+
+### Spending a Claude reset automatically
+
+With [`autoRedeemResets`](configuration.md) on — the same switch, and the same
+**g** → **Auto-redeem** toggle, as the Codex credits — a request that no Claude
+account can serve because their windows are spent may spend **one** banked
+reset, at the same moment the Codex redeemer would: selection refuses the
+request before choosing anyone, the redeemer spends a reset, and the request is
+selected again against the account it cleared.
+
+- It spends on the account that would otherwise wait longest for its own
+  windows to reset, since that is where a reset buys the most.
+- Only on an account upstream itself reports **at** a limit, and only when a
+  **weekly** limit (the all-models week or a model family's) is among them — a
+  5-hour wall lifts on its own and is never worth a grant — and only when the
+  grant clears every limit the account is at, since a reset that would leave it
+  blocked buys the request nothing. While upstream reports a reset cooldown,
+  nothing is claimed.
+- Only the grant upstream names as next (`next_grant_id`), exactly as
+  `/limit-reset` in Claude Code does.
+- `accounts[].autoRedeemReset: false` exempts an account, as it does for Codex;
+  so does being disabled, having no organization id, or last reading zero held
+  resets.
+
+After a reset the Claude pool holds off for an hour, so one dry pool costs one
+reset. A claim whose answer never arrived may still have spent the grant: its
+request id is kept and replayed by the next attempt — upstream then answers
+`already_used` instead of spending a second grant — and nothing else is spent
+for 30 minutes. Both holds are saved with the account's quota state, so a
+restart does not lift them. `cooldown`, `not_limited`, `ineligible` and `unavailable` spend
+nothing.
+
+The claim is `POST /api/organizations/<org>/reset_rate_limits` with
+`{ program: "cedar_ember", grant_id, request_id }`, as Claude Code sends it.
+It is not a documented API, so it is worth watching the activity log the first
+time it fires. A fleet that already turned `autoRedeemResets` on for Codex
+credits now spends Claude resets too; exempt an account with
+`autoRedeemReset: false` if that is not wanted. With the switch off — the default — a Claude reset is still
+yours to spend, on the claude.ai usage page or with `/limit-reset`.
+
 ## Third-party backend accounts
 
 Any Anthropic-compatible API can be added as an account alongside your Claude accounts. Give it a higher `priority` value (lower = preferred, so use e.g. `100`) and it will be used as a fallback when all Claude accounts are exhausted.
@@ -396,6 +596,46 @@ Any Anthropic-compatible API can be added as an account alongside your Claude ac
 - **`messageThreads`** — set to `true` when the backend keeps Anthropic message-thread state (a relay that reaches Anthropic does). Off by default for a third-party backend — see below.
 
 Where the provider publishes one, its own balance or quota is shown in `teamclaude status` — see [third-party backend quota](quota.md#third-party-backend-quota).
+
+A [NanoGPT](https://docs.nano-gpt.com/integrations/claude-code) account is the same shape. Its Anthropic-compatible endpoint is `/api/v1/messages`, so the `upstream` is `https://api.nano-gpt.com/api` — Claude Code's SDK appends `/v1/messages` itself, and the `/api/v1` base in NanoGPT's integration page would double it. Claude model names are accepted as they are, so no `modelMap` is needed for Claude; a non-Claude model is named `provider/model`, for example `z-ai/glm-5.3`:
+
+```json
+{
+  "name": "nano-gpt",
+  "type": "oauth",
+  "accessToken": "your-nanogpt-api-key",
+  "upstream": "https://api.nano-gpt.com/api",
+  "priority": 100
+}
+```
+
+`priority: 100` makes it a fallback for **every** model once the Claude accounts are spent — Claude names included, which NanoGPT passes through to Anthropic and bills by its own rules. A [route](routing.md#model-routes) is what sends a session to it on purpose, but a route only restricts who serves the models it matches; it does not keep the account out of ordinary rotation for the rest, so leave the priority high whichever you choose:
+
+```json
+{ "name": "nano", "match": ["z-ai/*", "moonshotai/*", "deepseek/*"], "accounts": ["nano-gpt"] }
+```
+
+Which models a NanoGPT subscription covers, and which are billed from the balance on top, is set by NanoGPT and not published per model; its `Plan` line in `teamclaude status` (see [third-party backend quota](quota.md#third-party-backend-quota)) shows when a request has started to bill the balance.
+
+A [Z.ai GLM Coding Plan](https://docs.z.ai/devpack/tool/claude) is the same shape. Its endpoint serves only its own model names, so map the Claude names your sessions send onto them, and it takes the key as a bearer exactly as Claude Code's `ANTHROPIC_AUTH_TOKEN` would send it:
+
+```json
+{
+  "name": "z.ai",
+  "type": "oauth",
+  "accessToken": "your-z.ai-api-key",
+  "upstream": "https://api.z.ai/api/anthropic",
+  "priority": 100,
+  "modelMap": {
+    "claude-haiku-4-5-20251001": "glm-5.3-flash",
+    "claude-sonnet-5": "glm-5.3",
+    "claude-opus-5": "glm-5.3",
+    "claude-fable-5-1": "glm-5.3"
+  }
+}
+```
+
+Its 5-hour and weekly windows show up in `teamclaude status` (see [third-party backend quota](quota.md#third-party-backend-quota)). `priority: 100` makes it a fallback once the Claude accounts are spent — and then the `modelMap` above rewrites the Claude names onto GLM. A [route](routing.md#model-routes) matching `glm-*` sends a session to it on purpose, but a route only restricts who serves the models it matches; it does not keep the account out of ordinary rotation for the rest, so keep the priority high either way.
 
 Reserve the backend for sessions that explicitly ask for its models with a [route](routing.md#model-routes):
 
@@ -424,7 +664,11 @@ An `upstream` whose host is Anthropic's own is left alone without any flag — a
 
 The effective upstream is what counts. A fleet pointed at a third-party host through the global `upstream` is covered the same way: every account without an `upstream` of its own is refused continues there. (Before 1.1.22 only a per-account `upstream` armed this; a fleet on a third-party global upstream now gets the repair without a setting.)
 
+On Anthropic accounts session-aware routing sends a continue to the account holding its thread (see [Session-aware routing](routing.md#session-aware-routing)).
+
 A relay that forwards to Anthropic does keep thread state, and for it the refusal is pure overhead — the client would re-send a full history each turn for nothing. Declare it with `"messageThreads": true` on the account, or at the top level of the config for the global `upstream`, and continues are forwarded untouched.
+
+Untouched includes the proxy's tool-pair repair, which strips a `tool_use` or `tool_result` left without its counterpart so a compacted or interrupted conversation is not rejected. It reads a body as the whole conversation, and a delta is not one: after a tool call it opens with the `tool_result`, whose `tool_use` is in the thread. Through 1.1.24 the repair stripped that `tool_result`, Anthropic answered `400` (`messages.0: use the top-level 'system' parameter for the initial system prompt`), and every continue that followed a tool call was resent in full. A continue is now left to the upstream that holds its thread; a create, and a body with no thread, are repaired as before.
 
 ### `accounts[].models` is deprecated
 
