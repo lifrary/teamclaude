@@ -581,7 +581,9 @@ export class NestedFieldFinder {
       case 0x2c: { const t = this.stack[this.stack.length - 1]; if (t?.isObj) t.awaitingKey = true; break; }  // ,
       case 0x22: {                                                 // string begins
         const t = this.stack[this.stack.length - 1];
-        if (t?.isObj && t.awaitingKey) this.reading = 'key';
+        // Only a root key or a key of the parent can decide the answer. Reading
+        // every key at every depth cost more than JSON.parse of a 1.3 MB body.
+        if (t?.isObj && t.awaitingKey) this.reading = this.stack.length === 1 || this.#inParent() ? 'key' : null;
         else if (this.#inParent() && t.key === this.childKey) this.reading = 'value';
         else this.reading = null;                                  // uninteresting string: skip bytes
         this.buf = [];

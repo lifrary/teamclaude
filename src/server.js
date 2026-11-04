@@ -4538,8 +4538,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // re-login (#552). Counted are the accounts this request found so and the ones
   // an earlier refresh already benched for it (unrenewedPark).
   if (!account && !(ctx.tried429.size || ctx.tried5xx.size || ctx.tried403.size || ctx.tried401.size || ctx.triedSend.size)) {
-    const reached = ctx.pinnedAccount ? [ctx.pinnedAccount]
-      : accountManager.accounts.filter(a => !isSubscriptionAccount(a) || providerOf(a) === (ctx.provider || DEFAULT_PROVIDER));
+    const reached = (ctx.pinnedAccount ? [ctx.pinnedAccount]
+      : accountManager.accounts.filter(a => !isSubscriptionAccount(a) || providerOf(a) === (ctx.provider || DEFAULT_PROVIDER)))
+      .filter(a => !a.disabled);
     if (reached.length && reached.every(a => ctx.unrenewed?.has(a) || unrenewedPark(a))) {
       for (const a of reached) (ctx.unrenewed ??= new Set()).add(a);
       return respondUnrenewed(res, ctx);
@@ -5097,20 +5098,26 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // x-should-retry says: that 429 is the one rotation exists for, so it keeps
     // the quota path below. Only the windows that path acts on count; an
     // overage status of `rejected` is the normal state of a subscription
-    // without extra usage and says nothing about this request (#555).
+    // without extra usage and says nothing about this request (#555). The
+    // classifier's verdict counts too: a bare top-level rejection and a model
+    // bucket at its threshold carry no per-window status.
+    const classified429 = upstreamRes.status === 429
+      ? classify429(rateLimitHeaders, {
+        model: ctx.model,
+        advisorModel: ctx.advisorModel,
+        switchThreshold: accountManager.switchThreshold,
+      })
+      : 'residual';
     const quotaWindowRejected = ['5h', '7d', '7d_oi'].some(w => rateLimitHeaders[`anthropic-ratelimit-unified-${w}-status`] === 'rejected')
-      || codexSpentWindows(rateLimitHeaders).length > 0;
+      || codexSpentWindows(rateLimitHeaders).length > 0
+      || classified429 !== 'residual';
     const nonRetryable429 = upstreamRes.status === 429 && !quotaWindowRejected
       && upstreamRes.headers.get('x-should-retry')?.trim().toLowerCase() === 'false';
     const spentCodexWindows = upstreamRes.status === 429 ? codexSpentWindows(rateLimitHeaders) : [];
     const response429 = upstreamRes.status !== 429 || nonRetryable429 ? null
       : spentCodexWindows.some(isAccountWideCodexWindow) ? 'account-quota'
         : spentCodexWindows.length ? 'model-quota'
-          : classify429(rateLimitHeaders, {
-            model: ctx.model,
-            advisorModel: ctx.advisorModel,
-            switchThreshold: accountManager.switchThreshold,
-          });
+          : classified429;
     // A non-retryable refusal is about the request, even if it carries incidental
     // quota headers: do not store those as an account-wide quota verdict.
     if (!nonRetryable429) accountManager.updateQuota(account, rateLimitHeaders, ctx.model, upstreamRes.status);

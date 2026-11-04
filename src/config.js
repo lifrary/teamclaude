@@ -284,10 +284,14 @@ function validateTemplateSystem(value) {
       // the known-accepted request shape — and rejecting it here made EVERY
       // canonical-state save fail once 1h-TTL traffic became the template
       // (state file frozen at its pre-TTL write, restarts restoring stale quota).
-      assertAllowed(block.cache_control, new Set(['type', 'ttl']), 'template.system.cache_control');
+      // `scope` ('global') is what Claude Code puts on its static system blocks
+      // when it believes it talks to Anthropic directly (MITM mode).
+      assertAllowed(block.cache_control, new Set(['type', 'ttl', 'scope']), 'template.system.cache_control');
       if (block.cache_control.type !== 'ephemeral') throw new CanonicalStateError('validate template.system.cache_control');
-      if (block.cache_control.ttl !== undefined && typeof block.cache_control.ttl !== 'string') {
-        throw new CanonicalStateError('validate template.system.cache_control');
+      for (const key of ['ttl', 'scope']) {
+        if (block.cache_control[key] !== undefined && typeof block.cache_control[key] !== 'string') {
+          throw new CanonicalStateError('validate template.system.cache_control');
+        }
       }
     }
   }
@@ -372,6 +376,17 @@ function validateClientUsageMap(value, label) {
       }
     }
   }
+}
+
+/**
+ * Whether a captured probe template can go into the state file. The template
+ * comes from live client traffic, and one field the validator does not know
+ * would otherwise fail every state save, quota included, not just the
+ * template's.
+ * @param {unknown} template
+ */
+export function isPersistableTemplate(template) {
+  try { validateTemplate(template); return true; } catch { return false; }
 }
 
 /** @param {unknown} template */

@@ -6,7 +6,7 @@ import { rm } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
 import net from 'node:net';
 import { readFile } from 'node:fs/promises';
-import { loadOrCreateConfig, loadConfig, loadConfigPersistingIds, atomicConfigUpdate, getConfigPath, getServerStatePath, getCrashLogPath, getQuotaSeriesPath, getRekeyPath, writeServerState, readServerState, clearServerState, loadCanonicalState, saveCanonicalState, createCanonicalState, createRekeyRecord, reconcilePendingRekey, rekeyCanonicalState, saveRekeyRecord, formatServerStateFailure } from './config.js';
+import { loadOrCreateConfig, loadConfig, loadConfigPersistingIds, atomicConfigUpdate, getConfigPath, getServerStatePath, getCrashLogPath, getQuotaSeriesPath, getRekeyPath, writeServerState, readServerState, clearServerState, loadCanonicalState, saveCanonicalState, createCanonicalState, isPersistableTemplate, createRekeyRecord, reconcilePendingRekey, rekeyCanonicalState, saveRekeyRecord, formatServerStateFailure } from './config.js';
 import { loadQuotaSeries, saveQuotaSeries } from './quota-series.js';
 import { installCrashHandlers } from './crash-log.js';
 import { AccountManager, QUEUE_DEPTH_CEILING, distributionMode, accountRouting } from './account-manager.js';
@@ -447,8 +447,18 @@ async function serverCommand() {
       .catch(err => console.error(`[TeamClaude] Token sweep failed: ${err.message}`))
       .finally(() => { tokenSweepPromise = null; });
   };
+  let templateDropped = false;
+  // The captured probe template, or null when the state file cannot hold it:
+  // the state is then saved without it rather than not at all.
+  const persistableTemplate = () => {
+    const template = server?.exportProbeTemplate?.() ?? null;
+    if (isPersistableTemplate(template)) return template;
+    if (!templateDropped) console.error('[TeamClaude] The captured probe template has a field the state file does not accept; state is saved without it.');
+    templateDropped = true;
+    return null;
+  };
   const persistQuotaState = async () => {
-    const exported = accountManager.exportCanonicalState(server?.exportProbeTemplate?.() ?? null);
+    const exported = accountManager.exportCanonicalState(persistableTemplate());
     // exportState(), not export(): the state file carries the 15-minute usage
     // slots so the 5h/24h windows resume across a restart (#446).
     await saveCanonicalState(createCanonicalState({
@@ -599,7 +609,7 @@ async function serverCommand() {
     if (!diskConfig) return { added: 0, removed: 0 };
     const { added, removed } = await syncAccountsFromDisk(diskConfig, config, accountManager, {
       migration: stateMigration,
-      template: server?.exportProbeTemplate?.() ?? null,
+      template: persistableTemplate(),
       rekey: options => durableRuntimeRekey({
         ...options, clients: clientUsage.exportState(), usageDimensions: dimensionUsage.exportState(),
       }),

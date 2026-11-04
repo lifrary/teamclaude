@@ -15,6 +15,7 @@ import {
   saveConfig,
   createCanonicalState,
   createRekeyRecord,
+  isPersistableTemplate,
   loadCanonicalState,
   migrateLegacyState,
   reconcilePendingRekey,
@@ -449,6 +450,21 @@ test('canonical validation accepts extended-TTL cache_control on the template', 
   // Still strict: a non-string ttl and unknown/secret-bearing keys stay rejected.
   assert.throws(() => createCanonicalState(state({ type: 'ephemeral', ttl: 3600 })), /Canonical state validate template.system.cache_control/);
   assert.throws(() => createCanonicalState(state({ type: 'ephemeral', ttl: '1h', accessToken: 'secret' })), /Canonical state validate/);
+});
+
+// Same class as the ttl regression: Claude Code puts `scope: 'global'` on its
+// static system blocks when it talks to Anthropic directly (MITM mode).
+test('canonical validation accepts a scoped cache_control, and a template it cannot hold is dropped, not fatal', () => {
+  const template = cacheControl => ({ model: 'claude-test', version: '2023-06-01', beta: null, system: [{ type: 'text', text: 'ping', cache_control: cacheControl }] });
+  const state = cacheControl => ({ accounts: {}, activeAccountId: null, template: template(cacheControl) });
+  assert.doesNotThrow(() => createCanonicalState(state({ type: 'ephemeral', scope: 'global' })));
+  assert.doesNotThrow(() => createCanonicalState(state({ type: 'ephemeral', ttl: '1h', scope: 'global' })));
+  assert.throws(() => createCanonicalState(state({ type: 'ephemeral', scope: { global: true } })), /Canonical state validate template.system.cache_control/);
+
+  assert.equal(isPersistableTemplate(null), true);
+  assert.equal(isPersistableTemplate(template({ type: 'ephemeral', scope: 'global' })), true);
+  assert.equal(isPersistableTemplate(template({ type: 'ephemeral', evict_on_complete: true })), false);
+  assert.equal(isPersistableTemplate(template({ type: 'ephemeral', accessToken: 'secret' })), false);
 });
 
 test('legacy quota wrapper migrates while dropping transient unified status', () => {
